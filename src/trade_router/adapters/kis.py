@@ -25,6 +25,7 @@ from ..models import (
     BrokerCapabilities,
     BuyingPower,
     Capability,
+    CredentialScope,
     Instrument,
     InstrumentId,
     MarketDataVenue,
@@ -135,6 +136,7 @@ class KisAdapter(ProviderAdapterV1):
             provider=cls.provider_id,
             adapter_version=cls.adapter_version,
             environments={ProviderEnvironment.LIVE, ProviderEnvironment.PAPER},
+            credential_scope=CredentialScope.ENVIRONMENT,
             features={
                 Capability.INSTRUMENT_SEARCH,
                 Capability.QUOTE,

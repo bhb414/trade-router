@@ -77,6 +77,9 @@ KIS uses its official live and virtual-trading hosts. NAMUH PLUG uses the offici
 live host `api.nhplug.com:8443` and mock host `moapi.nhplug.com:8443`; OAuth tokens
 are issued by the live authentication host for both environments. N2-branded keys
 can be selected through profile settings without exposing custom credential hosts.
+`BrokerCapabilities.credential_scope` reports whether credentials are absent,
+environment-specific, or shared across a provider's supported environments. KIS
+reports environment-specific credentials; NAMUH reports provider-wide credentials.
 
 Actual live orders are never executed by the test suite.
 

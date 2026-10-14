@@ -25,6 +25,7 @@ from ..models import (
     BrokerCapabilities,
     BuyingPower,
     Capability,
+    CredentialScope,
     InstrumentId,
     MarketDataVenue,
     Order,
@@ -126,6 +127,7 @@ class NamuhAdapter(ProviderAdapterV1):
             provider=cls.provider_id,
             adapter_version=cls.adapter_version,
             environments={ProviderEnvironment.LIVE, ProviderEnvironment.PAPER},
+            credential_scope=CredentialScope.PROVIDER,
             features={
                 Capability.QUOTE,
                 Capability.ORDERBOOK,

@@ -17,6 +17,7 @@ from ..models import (
     BuyingPower,
     Capability,
     ConditionDefinition,
+    CredentialScope,
     Fill,
     Instrument,
     InstrumentId,
@@ -60,6 +61,7 @@ class SimulatedAdapter(ProviderAdapterV1):
             provider=cls.provider_id,
             adapter_version=cls.adapter_version,
             environments={ProviderEnvironment.LIVE, ProviderEnvironment.PAPER},
+            credential_scope=CredentialScope.NONE,
             features={
                 Capability.INSTRUMENT_SEARCH,
                 Capability.QUOTE,

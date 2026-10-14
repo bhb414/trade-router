@@ -15,6 +15,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from ..core.runtime import TradingRuntime
@@ -51,6 +52,25 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
     async def router_error_handler(_: Request, exc: RouterError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code, content=exc.as_body().model_dump(mode="json")
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        _: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        fields = [
+            str(item)
+            for error in exc.errors()
+            for item in error.get("loc", [])[1:]
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "INVALID_REQUEST",
+                "message": "The request contains an invalid or missing field.",
+                "retryable": False,
+                "details": {"fields": fields},
+            },
         )
 
     @app.exception_handler(Exception)

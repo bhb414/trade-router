@@ -9,7 +9,9 @@ from ..models import ProviderEnvironment, RiskLimits, StrategyConfig
 
 
 class ProfileCreate(BaseModel):
-    id: str = Field(min_length=1, max_length=128)
+    id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    )
     provider: str
     environment: ProviderEnvironment
     app_key: str | None = None

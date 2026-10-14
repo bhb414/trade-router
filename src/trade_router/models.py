@@ -27,6 +27,14 @@ class ProviderEnvironment(str, Enum):
     PAPER = "paper"
 
 
+class CredentialScope(str, Enum):
+    """How provider credentials are issued across trading environments."""
+
+    NONE = "none"
+    ENVIRONMENT = "environment"
+    PROVIDER = "provider"
+
+
 class AssetType(str, Enum):
     EQUITY = "EQUITY"
 
@@ -347,6 +355,7 @@ class BrokerCapabilities(RouterModel):
     adapter_version: str
     protocol_version: Literal["1"] = "1"
     environments: set[ProviderEnvironment]
+    credential_scope: CredentialScope = CredentialScope.ENVIRONMENT
     features: set[Capability]
     market_data_venues: set[MarketDataVenue]
     order_routes: set[OrderRoute]

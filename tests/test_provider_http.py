@@ -9,7 +9,12 @@ from trade_router.adapters.base import AdapterContext
 from trade_router.adapters.kis import KisAdapter
 from trade_router.adapters.namuh import NamuhAdapter
 from trade_router.core.time import now_kst
-from trade_router.models import MarketDataVenue, ProfilePublic, ProviderEnvironment
+from trade_router.models import (
+    CredentialScope,
+    MarketDataVenue,
+    ProfilePublic,
+    ProviderEnvironment,
+)
 
 
 def context(
@@ -105,3 +110,9 @@ async def test_namuh_paper_uses_live_oauth_and_mock_rest():
     assert json.loads(request.content) == {
         "Input_0": {"iem_cd": "005930", "market_cd": "UNT"}
     }
+    capabilities = NamuhAdapter.capabilities()
+    assert capabilities.environments == {
+        ProviderEnvironment.LIVE,
+        ProviderEnvironment.PAPER,
+    }
+    assert capabilities.credential_scope == CredentialScope.PROVIDER
