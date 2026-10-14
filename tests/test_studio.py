@@ -36,6 +36,47 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert loaded.json()["source"] == "print('ready')\n"
 
 
+def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    app = create_app(paths)
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "label": "KIS main",
+                "app_key": "test-app-key",
+                "app_secret": "test-app-secret",
+            },
+        )
+        assert connection.status_code == 201
+        connection_payload = connection.json()
+        assert "app_key" not in connection_payload
+        assert "app_secret" not in connection_payload
+
+        account = client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "main account",
+                "connection_id": connection_payload["id"],
+                "account_number": "12345678",
+                "product_code": "01",
+            },
+        )
+        assert account.status_code == 201
+        assert account.json()["masked_account"] == "****5678"
+        assert "account_number" not in account.json()
+
+        stored_text = (paths.config / "settings.json").read_text(encoding="utf-8")
+        stored_secrets = (paths.config / "secrets.dpapi").read_bytes()
+        assert "test-app-secret" not in stored_text
+        assert b"test-app-secret" not in stored_secrets
+
+        status = client.get("/api/status").json()
+        assert status["registered_apis"] == 1
+        assert status["registered_accounts"] == 1
+
+
 def test_strategy_name_cannot_escape_workspace(tmp_path: Path) -> None:
     paths = workspace(tmp_path / "workspace")
     paths.ensure()

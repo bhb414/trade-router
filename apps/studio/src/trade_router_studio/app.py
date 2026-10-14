@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from . import __version__
 from .paths import WorkspacePaths
+from .settings import SettingsError, SettingsStore
 from .strategies import StrategyManager, StrategyNameError
 from .updates import check_for_update
 
@@ -19,9 +20,24 @@ class StrategySource(BaseModel):
     source: str
 
 
+class ConnectionRegistration(BaseModel):
+    provider: str
+    label: str
+    app_key: str
+    app_secret: str
+
+
+class AccountRegistration(BaseModel):
+    alias: str
+    connection_id: str
+    account_number: str
+    product_code: str = ""
+
+
 def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     workspace = paths or WorkspacePaths.discover()
     manager = StrategyManager(workspace)
+    settings = SettingsStore(workspace)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -32,6 +48,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     app = FastAPI(title="Trade Router", version=__version__, lifespan=lifespan)
     app.state.workspace = workspace
     app.state.strategies = manager
+    app.state.settings = settings
 
     static_root = Path(__file__).with_name("static")
     app.mount("/static", StaticFiles(directory=static_root), name="static")
@@ -43,6 +60,8 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     @app.get("/api/status")
     async def status() -> dict[str, object]:
         strategies = manager.list()
+        connections = settings.list_connections()
+        accounts = settings.list_accounts()
         return {
             "version": __version__,
             "workspace": str(workspace.root),
@@ -50,7 +69,61 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             "running": sum(1 for item in strategies if item["running"]),
             "strategy_count": len(strategies),
             "broker_connections": 0,
+            "registered_apis": len(connections),
+            "registered_accounts": len(accounts),
         }
+
+    @app.get("/api/settings/providers")
+    async def provider_schemas() -> list[dict[str, object]]:
+        return settings.providers()
+
+    @app.get("/api/settings/connections")
+    async def list_connections() -> list[dict[str, object]]:
+        return settings.list_connections()
+
+    @app.post("/api/settings/connections", status_code=201)
+    async def register_connection(
+        body: ConnectionRegistration,
+    ) -> dict[str, object]:
+        try:
+            return settings.add_connection(
+                provider=body.provider,
+                label=body.label,
+                app_key=body.app_key,
+                app_secret=body.app_secret,
+            )
+        except SettingsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/settings/connections/{connection_id}", status_code=204)
+    async def delete_connection(connection_id: str) -> None:
+        try:
+            settings.remove_connection(connection_id)
+        except SettingsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/settings/accounts")
+    async def list_accounts() -> list[dict[str, object]]:
+        return settings.list_accounts()
+
+    @app.post("/api/settings/accounts", status_code=201)
+    async def register_account(body: AccountRegistration) -> dict[str, object]:
+        try:
+            return settings.add_account(
+                alias=body.alias,
+                connection_id=body.connection_id,
+                account_number=body.account_number,
+                product_code=body.product_code,
+            )
+        except SettingsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/settings/accounts/{account_id}", status_code=204)
+    async def delete_account(account_id: str) -> None:
+        try:
+            settings.remove_account(account_id)
+        except SettingsError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/strategies")
     async def list_strategies() -> list[dict[str, object]]:

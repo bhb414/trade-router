@@ -17,6 +17,7 @@
       <span id="runtime-status">서버 확인 중</span>
       <span class="separator"></span>
       <span id="connection-status">증권사 연결 0</span>
+      <button class="button" id="settings-button">연결 설정</button>
       <button class="button quiet" id="update-button">업데이트 확인</button>
     </div>
   </header>
@@ -74,6 +75,90 @@
       </div>
     </aside>
   </main>
+
+  <div class="modal-backdrop" id="settings-modal" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <header class="modal-header">
+        <div>
+          <span class="eyebrow">CONNECTIONS</span>
+          <h2 id="settings-title">연결 설정</h2>
+        </div>
+        <button class="modal-close" id="settings-close" aria-label="연결 설정 닫기">×</button>
+      </header>
+
+      <nav class="modal-tabs" aria-label="연결 설정 종류">
+        <button class="modal-tab active" data-settings-tab="apis">API 키</button>
+        <button class="modal-tab" data-settings-tab="accounts">계좌</button>
+      </nav>
+
+      <div class="modal-body">
+        <section class="settings-tab-panel active" data-settings-panel="apis">
+          <div class="settings-intro">
+            <h3>증권사 API 등록</h3>
+            <p>증권사를 선택하면 해당 API에 필요한 키 입력란이 표시됩니다. 비밀정보는 Windows 사용자 암호화 저장소로 보호됩니다.</p>
+          </div>
+          <div class="settings-grid">
+            <form class="settings-form" id="connection-form">
+              <label>
+                <span>증권사</span>
+                <select id="connection-provider" required></select>
+              </label>
+              <label>
+                <span>연결 이름</span>
+                <input id="connection-label" placeholder="예: KIS 주식 API" autocomplete="off" required>
+              </label>
+              <label>
+                <span id="connection-key-label">App Key</span>
+                <input id="connection-key" type="password" autocomplete="off" required>
+              </label>
+              <label>
+                <span id="connection-secret-label">App Secret</span>
+                <input id="connection-secret" type="password" autocomplete="off" required>
+              </label>
+              <button class="button primary settings-submit">API 등록</button>
+            </form>
+            <div class="registered-section">
+              <div class="registered-heading"><strong>등록된 API</strong><span id="connection-count">0개</span></div>
+              <div class="registered-list" id="connection-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-tab-panel" data-settings-panel="accounts">
+          <div class="settings-intro">
+            <h3>거래 계좌 등록</h3>
+            <p>먼저 등록한 API와 실제 거래 계좌를 연결합니다. 화면에는 계좌번호 일부만 표시됩니다.</p>
+          </div>
+          <div class="settings-grid">
+            <form class="settings-form" id="account-form">
+              <label>
+                <span>사용할 API</span>
+                <select id="account-connection" required></select>
+              </label>
+              <label>
+                <span>계좌 별칭</span>
+                <input id="account-alias" placeholder="예: 주식 주계좌" autocomplete="off" required>
+              </label>
+              <label>
+                <span>계좌번호</span>
+                <input id="account-number" inputmode="numeric" autocomplete="off" required>
+              </label>
+              <label id="product-code-field">
+                <span>계좌 상품코드</span>
+                <input id="account-product-code" placeholder="예: 01" autocomplete="off">
+                <small>KIS 계좌번호 뒤의 두 자리 상품코드입니다.</small>
+              </label>
+              <button class="button primary settings-submit">계좌 등록</button>
+            </form>
+            <div class="registered-section">
+              <div class="registered-heading"><strong>등록된 계좌</strong><span id="account-count">0개</span></div>
+              <div class="registered-list" id="account-list"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>

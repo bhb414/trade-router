@@ -55,8 +55,10 @@ class StrategyManager:
             raise StrategyNameError(
                 "Strategy name must be a single valid file name ending in .py."
             )
-        path = (self.paths.strategies / clean).resolve()
-        if path.parent != self.paths.strategies.resolve():
+        path = self.paths.strategies / clean
+        strategy_root = os.path.normcase(os.path.abspath(self.paths.strategies))
+        path_parent = os.path.normcase(os.path.abspath(path.parent))
+        if path_parent != strategy_root:
             raise StrategyNameError("Strategy path is outside the workspace.")
         return path
 

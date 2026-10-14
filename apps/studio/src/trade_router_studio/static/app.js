@@ -2,6 +2,9 @@ const state = {
   selected: null,
   dirty: false,
   strategies: [],
+  providers: [],
+  connections: [],
+  accounts: [],
   logCursor: 0,
   logTimer: null,
 };
@@ -24,6 +27,10 @@ const elements = {
   runtime: document.querySelector("#runtime-status"),
   connections: document.querySelector("#connection-status"),
   workspace: document.querySelector("#workspace-path"),
+  settingsModal: document.querySelector("#settings-modal"),
+  connectionProvider: document.querySelector("#connection-provider"),
+  accountConnection: document.querySelector("#account-connection"),
+  productCodeField: document.querySelector("#product-code-field"),
 };
 
 async function api(path, options = {}) {
@@ -178,12 +185,177 @@ async function refreshStatus() {
     const status = await api("/api/status");
     elements.serverDot.classList.add("online");
     elements.runtime.textContent = `실행 ${status.running} · v${status.version}`;
-    elements.connections.textContent = `증권사 연결 ${status.broker_connections}`;
+    elements.connections.textContent = `API ${status.registered_apis} · 계좌 ${status.registered_accounts}`;
     elements.workspace.textContent = status.workspace;
   } catch (_) {
     elements.serverDot.classList.remove("online");
     elements.runtime.textContent = "서버 연결 끊김";
   }
+}
+
+function activateSettingsTab(tabName) {
+  document.querySelectorAll("[data-settings-tab]").forEach(button => {
+    button.classList.toggle("active", button.dataset.settingsTab === tabName);
+  });
+  document.querySelectorAll("[data-settings-panel]").forEach(panel => {
+    panel.classList.toggle("active", panel.dataset.settingsPanel === tabName);
+  });
+}
+
+function selectedProvider(providerId) {
+  return state.providers.find(provider => provider.id === providerId);
+}
+
+function refreshProviderFields() {
+  const provider = selectedProvider(elements.connectionProvider.value);
+  document.querySelector("#connection-key-label").textContent = provider?.key_label || "App Key";
+  document.querySelector("#connection-secret-label").textContent = provider?.secret_label || "App Secret";
+}
+
+function refreshAccountFields() {
+  const connection = state.connections.find(item => item.id === elements.accountConnection.value);
+  const provider = selectedProvider(connection?.provider);
+  elements.productCodeField.hidden = !provider?.account_product_code;
+  document.querySelector("#account-product-code").required = Boolean(provider?.account_product_code);
+}
+
+function renderConnectionList() {
+  const list = document.querySelector("#connection-list");
+  document.querySelector("#connection-count").textContent = `${state.connections.length}개`;
+  list.replaceChildren();
+  if (!state.connections.length) {
+    const empty = document.createElement("div");
+    empty.className = "registered-empty";
+    empty.textContent = "등록된 API가 없습니다.";
+    list.append(empty);
+    return;
+  }
+  for (const connection of state.connections) {
+    const provider = selectedProvider(connection.provider);
+    const item = document.createElement("div");
+    item.className = "registered-item";
+    const information = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = connection.label;
+    const description = document.createElement("span");
+    description.textContent = `${provider?.name || connection.provider} · 인증정보 저장됨`;
+    information.append(title, description);
+    const remove = document.createElement("button");
+    remove.className = "registered-remove";
+    remove.type = "button";
+    remove.textContent = "삭제";
+    remove.addEventListener("click", () => removeConnection(connection));
+    item.append(information, remove);
+    list.append(item);
+  }
+}
+
+function renderAccountList() {
+  const list = document.querySelector("#account-list");
+  document.querySelector("#account-count").textContent = `${state.accounts.length}개`;
+  list.replaceChildren();
+  if (!state.accounts.length) {
+    const empty = document.createElement("div");
+    empty.className = "registered-empty";
+    empty.textContent = "등록된 계좌가 없습니다.";
+    list.append(empty);
+    return;
+  }
+  for (const account of state.accounts) {
+    const item = document.createElement("div");
+    item.className = "registered-item";
+    const information = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = account.alias;
+    const description = document.createElement("span");
+    const product = account.product_code ? `-${account.product_code}` : "";
+    description.textContent = `${account.connection_label} · ${account.masked_account}${product}`;
+    information.append(title, description);
+    const remove = document.createElement("button");
+    remove.className = "registered-remove";
+    remove.type = "button";
+    remove.textContent = "삭제";
+    remove.addEventListener("click", () => removeAccount(account));
+    item.append(information, remove);
+    list.append(item);
+  }
+}
+
+function renderSettings() {
+  const currentProvider = elements.connectionProvider.value;
+  elements.connectionProvider.replaceChildren();
+  for (const provider of state.providers) {
+    const option = document.createElement("option");
+    option.value = provider.id;
+    option.textContent = provider.name;
+    elements.connectionProvider.append(option);
+  }
+  if (state.providers.some(provider => provider.id === currentProvider)) {
+    elements.connectionProvider.value = currentProvider;
+  }
+
+  const currentConnection = elements.accountConnection.value;
+  elements.accountConnection.replaceChildren();
+  if (!state.connections.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "API를 먼저 등록하세요";
+    elements.accountConnection.append(option);
+  } else {
+    for (const connection of state.connections) {
+      const option = document.createElement("option");
+      option.value = connection.id;
+      option.textContent = `${connection.label} · ${selectedProvider(connection.provider)?.name || connection.provider}`;
+      elements.accountConnection.append(option);
+    }
+    if (state.connections.some(connection => connection.id === currentConnection)) {
+      elements.accountConnection.value = currentConnection;
+    }
+  }
+  document.querySelector("#account-form .settings-submit").disabled = !state.connections.length;
+  refreshProviderFields();
+  refreshAccountFields();
+  renderConnectionList();
+  renderAccountList();
+}
+
+async function loadSettings() {
+  [state.providers, state.connections, state.accounts] = await Promise.all([
+    api("/api/settings/providers"),
+    api("/api/settings/connections"),
+    api("/api/settings/accounts"),
+  ]);
+  renderSettings();
+}
+
+async function openSettings(tabName = "apis") {
+  await loadSettings();
+  activateSettingsTab(tabName);
+  elements.settingsModal.hidden = false;
+  const focusTarget = tabName === "apis" ? elements.connectionProvider : elements.accountConnection;
+  window.setTimeout(() => focusTarget.focus(), 0);
+}
+
+function closeSettings() {
+  elements.settingsModal.hidden = true;
+}
+
+async function removeConnection(connection) {
+  if (!window.confirm(`${connection.label} API 등록을 삭제할까요?`)) return;
+  try {
+    await api(`/api/settings/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" });
+    await Promise.all([loadSettings(), refreshStatus()]);
+    notify("API 등록을 삭제했습니다.");
+  } catch (error) { notify(error.message, true); }
+}
+
+async function removeAccount(account) {
+  if (!window.confirm(`${account.alias} 계좌 등록을 삭제할까요?`)) return;
+  try {
+    await api(`/api/settings/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
+    await Promise.all([loadSettings(), refreshStatus()]);
+    notify("계좌 등록을 삭제했습니다.");
+  } catch (error) { notify(error.message, true); }
 }
 
 function updateLineNumbers() {
@@ -238,8 +410,72 @@ document.querySelector("#update-button").addEventListener("click", async () => {
   } catch (error) { notify(error.message, true); }
   finally { button.disabled = false; button.textContent = "업데이트 확인"; }
 });
+document.querySelector("#settings-button").addEventListener("click", () => {
+  openSettings().catch(error => notify(error.message, true));
+});
+document.querySelector("#settings-close").addEventListener("click", closeSettings);
+elements.settingsModal.addEventListener("click", event => {
+  if (event.target === elements.settingsModal) closeSettings();
+});
+document.querySelectorAll("[data-settings-tab]").forEach(button => {
+  button.addEventListener("click", () => activateSettingsTab(button.dataset.settingsTab));
+});
+elements.connectionProvider.addEventListener("change", refreshProviderFields);
+elements.accountConnection.addEventListener("change", refreshAccountFields);
+
+document.querySelector("#connection-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector(".settings-submit");
+  submit.disabled = true;
+  try {
+    await api("/api/settings/connections", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: elements.connectionProvider.value,
+        label: document.querySelector("#connection-label").value,
+        app_key: document.querySelector("#connection-key").value,
+        app_secret: document.querySelector("#connection-secret").value,
+      }),
+    });
+    document.querySelector("#connection-label").value = "";
+    document.querySelector("#connection-key").value = "";
+    document.querySelector("#connection-secret").value = "";
+    await Promise.all([loadSettings(), refreshStatus()]);
+    notify("API 인증정보를 안전하게 저장했습니다.");
+  } catch (error) { notify(error.message, true); }
+  finally { submit.disabled = false; }
+});
+
+document.querySelector("#account-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector(".settings-submit");
+  submit.disabled = true;
+  try {
+    await api("/api/settings/accounts", {
+      method: "POST",
+      body: JSON.stringify({
+        connection_id: elements.accountConnection.value,
+        alias: document.querySelector("#account-alias").value,
+        account_number: document.querySelector("#account-number").value,
+        product_code: document.querySelector("#account-product-code").value,
+      }),
+    });
+    document.querySelector("#account-alias").value = "";
+    document.querySelector("#account-number").value = "";
+    document.querySelector("#account-product-code").value = "";
+    await Promise.all([loadSettings(), refreshStatus()]);
+    notify("계좌를 등록했습니다.");
+  } catch (error) { notify(error.message, true); }
+  finally { submit.disabled = !state.connections.length; }
+});
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !elements.settingsModal.hidden) {
+    closeSettings();
+    return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
     event.preventDefault();
     if (!elements.save.disabled) saveStrategy().catch(error => notify(error.message, true));

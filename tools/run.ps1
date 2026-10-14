@@ -36,6 +36,6 @@ if ($InstalledHash -ne $ProjectHash) {
 }
 
 Write-Host "Trade Router: http://127.0.0.1:8890"
-Write-Host "Press Ctrl+C or close this window to stop."
+Write-Host "Close this window to stop Trade Router."
 & $VenvPython -m trade_router_studio
 exit $LASTEXITCODE
