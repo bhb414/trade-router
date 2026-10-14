@@ -63,6 +63,7 @@ button:disabled { cursor: default; opacity: .45; }
 .runtime { gap: 9px; color: var(--muted); white-space: nowrap; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #98a2b3; }
 .status-dot.online { background: #22a06b; box-shadow: 0 0 0 3px #e3f5ee; }
+.status-dot.offline { background: #d64555; box-shadow: 0 0 0 3px #fde8eb; }
 .separator { width: 1px; height: 18px; background: var(--line); margin: 0 3px; }
 
 .workspace {

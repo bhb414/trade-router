@@ -35,6 +35,7 @@ const elements = {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
+    cache: "no-store",
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
@@ -183,13 +184,16 @@ async function refreshLogs() {
 async function refreshStatus() {
   try {
     const status = await api("/api/status");
+    elements.serverDot.classList.remove("offline");
     elements.serverDot.classList.add("online");
     elements.runtime.textContent = `실행 ${status.running} · v${status.version}`;
     elements.connections.textContent = `API ${status.registered_apis} · 계좌 ${status.registered_accounts}`;
     elements.workspace.textContent = status.workspace;
   } catch (_) {
     elements.serverDot.classList.remove("online");
+    elements.serverDot.classList.add("offline");
     elements.runtime.textContent = "서버 연결 끊김";
+    elements.connections.textContent = "서버 확인 불가";
   }
 }
 

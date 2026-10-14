@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -49,6 +49,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     app.state.workspace = workspace
     app.state.strategies = manager
     app.state.settings = settings
+
+    @app.middleware("http")
+    async def prevent_api_caching(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
 
     static_root = Path(__file__).with_name("static")
     app.mount("/static", StaticFiles(directory=static_root), name="static")

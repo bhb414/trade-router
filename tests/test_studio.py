@@ -25,6 +25,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
     with TestClient(app) as client:
         status = client.get("/api/status")
         assert status.status_code == 200
+        assert status.headers["cache-control"] == "no-store, max-age=0"
         assert status.json()["strategy_count"] == 1
 
         created = client.put(
