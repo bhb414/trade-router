@@ -28,6 +28,13 @@ app.add_typer(strategy_app, name="strategy")
 console = Console()
 
 
+def _background_python() -> str:
+    if os.name != "nt":
+        return sys.executable
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return pythonw if os.path.exists(pythonw) else sys.executable
+
+
 def _token() -> str:
     return DpapiSecretStore(RouterPaths.discover().secrets).installation_token()
 
@@ -100,7 +107,7 @@ def daemon_start(
         else 0
     )
     process = subprocess.Popen(
-        [sys.executable, "-m", "trade_router.server.run"],
+        [_background_python(), "-m", "trade_router.server.run"],
         stdin=subprocess.DEVNULL,
         stdout=log,
         stderr=log,
