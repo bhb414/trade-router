@@ -42,8 +42,8 @@ from .base import ProviderAdapterV1
 from .utils import source_metadata
 
 
-class FakeAdapter(ProviderAdapterV1):
-    provider_id = "fake"
+class SimulatedAdapter(ProviderAdapterV1):
+    provider_id = "simulated"
     adapter_version = "0.1.0"
 
     def __init__(self, context) -> None:
@@ -331,7 +331,7 @@ class FakeAdapter(ProviderAdapterV1):
                 block_code=None if allowed else "INSUFFICIENT_POSITION",
                 block_reason=None
                 if allowed
-                else "Sell quantity exceeds the fake position.",
+                else "Sell quantity exceeds the simulated position.",
             )
         allowed = buying.max_quantity >= request.quantity
         return OrderPreview(
@@ -354,24 +354,24 @@ class FakeAdapter(ProviderAdapterV1):
         if behavior == "uncertain":
             raise OrderUncertainError(
                 self.provider_id,
-                "Fake broker deliberately lost the order acknowledgement.",
+                "Simulation adapter deliberately lost the order acknowledgement.",
                 correlation_id=uuid4().hex,
             )
         if behavior == "reject":
             status = OrderStatus.REJECTED
-            message = "Fake broker rejected the order."
+            message = "Simulation adapter rejected the order."
             filled = 0
         elif behavior == "ack":
             status = OrderStatus.ACKNOWLEDGED
-            message = "Accepted by fake broker."
+            message = "Accepted by simulation adapter."
             filled = 0
         elif behavior == "partial":
             status = OrderStatus.PARTIALLY_FILLED
-            message = "Partially filled by fake broker."
+            message = "Partially filled by simulation adapter."
             filled = max(1, request.quantity // 2)
         else:
             status = OrderStatus.FILLED
-            message = "Filled by fake broker."
+            message = "Filled by simulation adapter."
             filled = request.quantity
         price = request.price or self._price(request.instrument.code)
         order = Order(
@@ -423,7 +423,7 @@ class FakeAdapter(ProviderAdapterV1):
                 (
                     request.account_alias,
                     Fill(
-                        fill_id=f"fake:{router_order_id}:{filled}",
+                        fill_id=f"simulated:{router_order_id}:{filled}",
                         router_order_id=router_order_id,
                         provider_fill_id=f"FF{len(self._fills) + 1:010d}",
                         instrument=request.instrument,
@@ -441,7 +441,7 @@ class FakeAdapter(ProviderAdapterV1):
     async def cancel_order(self, account_number: str, order: Order) -> Order:
         if order.status not in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
             raise ProviderError(
-                "ORDER_NOT_CANCELLABLE", "The fake order is not cancellable."
+                "ORDER_NOT_CANCELLABLE", "The simulated order is not cancellable."
             )
         updated = order.model_copy(
             update={"status": OrderStatus.CANCELLED, "updated_at": now_kst()}
@@ -459,7 +459,7 @@ class FakeAdapter(ProviderAdapterV1):
     ) -> Order:
         if order.status not in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
             raise ProviderError(
-                "ORDER_NOT_AMENDABLE", "The fake order is not amendable."
+                "ORDER_NOT_AMENDABLE", "The simulated order is not amendable."
             )
         new_quantity = quantity or order.quantity
         if new_quantity < order.filled_quantity:
@@ -490,10 +490,12 @@ class FakeAdapter(ProviderAdapterV1):
         ]
 
     async def list_conditions(self) -> list[ConditionDefinition]:
-        return [ConditionDefinition(id="fake-rising", name="Fake rising stocks")]
+        return [
+            ConditionDefinition(id="simulated-rising", name="Simulated rising stocks")
+        ]
 
     async def run_condition(self, condition_id: str) -> list[Instrument]:
-        if condition_id != "fake-rising":
+        if condition_id != "simulated-rising":
             return []
         return await self.search_instruments("", limit=3)
 

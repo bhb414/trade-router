@@ -19,7 +19,7 @@ async def test_api_requires_installation_token(runtime):
         assert response.json()["status"] == "ready"
 
 
-async def test_fake_quote_and_capabilities(runtime):
+async def test_simulated_quote_and_capabilities(runtime):
     app = create_app(runtime)
     headers = {"authorization": f"Bearer {runtime.api_token}"}
     async with httpx.AsyncClient(
@@ -27,10 +27,18 @@ async def test_fake_quote_and_capabilities(runtime):
     ) as client:
         quote = await client.get(
             "/v1/market/quote",
-            params={"profile": "fake-main", "code": "005930", "venue": "INTEGRATED"},
+            params={
+                "profile": "simulated-main",
+                "code": "005930",
+                "venue": "INTEGRATED",
+            },
             headers=headers,
         )
         assert quote.status_code == 200
-        assert quote.json()["source"]["provider"] == "fake"
+        assert quote.json()["source"]["provider"] == "simulated"
         caps = await client.get("/v1/system/capabilities", headers=headers)
-        assert {item["provider"] for item in caps.json()} == {"fake", "kis", "namuh"}
+        assert {item["provider"] for item in caps.json()} == {
+            "simulated",
+            "kis",
+            "namuh",
+        }

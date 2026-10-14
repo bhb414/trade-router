@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from trade_router.adapters.fake import FakeAdapter
 from trade_router.adapters.kis import KisAdapter
 from trade_router.adapters.namuh import NamuhAdapter
+from trade_router.adapters.simulated import SimulatedAdapter
 from trade_router.models import Capability, MarketDataVenue, OrderRoute
 
 
 def test_all_builtin_adapters_expose_v1_capabilities():
-    for adapter in (FakeAdapter, KisAdapter, NamuhAdapter):
+    for adapter in (SimulatedAdapter, KisAdapter, NamuhAdapter):
         capabilities = adapter.capabilities()
         assert capabilities.protocol_version == "1"
         assert capabilities.provider == adapter.provider_id

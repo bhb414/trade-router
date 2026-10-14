@@ -151,7 +151,7 @@ def status_alias() -> None:
 @profile_app.command("add")
 def profile_add(
     profile_id: str,
-    provider: str = typer.Option(..., help="kis, namuh, or fake"),
+    provider: str = typer.Option(..., help="kis, namuh, or simulated"),
     environment: ProviderEnvironment = typer.Option(ProviderEnvironment.PAPER),
     display_name: str | None = typer.Option(None),
     settings: str = typer.Option("{}", help="Non-secret JSON settings"),
@@ -159,7 +159,7 @@ def profile_add(
     provider = provider.lower()
     app_key: str | None = None
     app_secret: str | None = None
-    if provider != "fake":
+    if provider != "simulated":
         app_key = typer.prompt("App Key", hide_input=True)
         app_secret = typer.prompt("App Secret", hide_input=True)
     try:

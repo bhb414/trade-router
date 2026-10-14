@@ -36,7 +36,7 @@ trade-router = "trade_router.cli:app"
 [project.entry-points."trade_router.providers"]
 kis = "trade_router.adapters.kis:KisAdapter"
 namuh = "trade_router.adapters.namuh:NamuhAdapter"
-fake = "trade_router.adapters.fake:FakeAdapter"
+simulated = "trade_router.adapters.simulated:SimulatedAdapter"
 
 [tool.setuptools.packages.find]
 where = ["src"]

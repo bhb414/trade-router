@@ -9,7 +9,7 @@ use only registered aliases.
 strategy process ─┐
 strategy process ─┼─ HTTP /v1 + WebSocket ─ daemon ─ ProviderAdapterV1 ─ KIS
 CLI / diagnostics ┘                         │          ├─────────────── NAMUH
-                                            │          └─────────────── fake
+                                            │          └─────────────── simulated
                                             ├─ SQLite WAL (non-secrets)
                                             └─ Windows DPAPI (secrets/tokens)
 ```

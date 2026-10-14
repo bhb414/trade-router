@@ -350,9 +350,9 @@ class TradingRuntime:
                 "ENVIRONMENT_UNSUPPORTED",
                 f"Provider '{provider}' does not support '{environment.value}'.",
             )
-        if provider != "fake" and not credentials.get("app_key"):
+        if provider != "simulated" and not credentials.get("app_key"):
             raise RouterError("CREDENTIAL_REQUIRED", "app_key is required.")
-        if provider != "fake" and not credentials.get("app_secret"):
+        if provider != "simulated" and not credentials.get("app_secret"):
             raise RouterError("CREDENTIAL_REQUIRED", "app_secret is required.")
         profile = await self.store.add_profile(
             profile_id=profile_id,
@@ -461,7 +461,7 @@ class TradingRuntime:
                 return existing
             profile = await self.get_profile(profile_id)
             secret = self.secrets.get(f"profile:{profile_id}")
-            if profile.provider != "fake" and not isinstance(secret, dict):
+            if profile.provider != "simulated" and not isinstance(secret, dict):
                 raise RouterError(
                     "PROFILE_SECRET_MISSING",
                     f"Credentials for '{profile_id}' are missing.",
@@ -635,7 +635,7 @@ class TradingRuntime:
                 "LIVE_NOT_ARMED",
                 "Live orders require both the account and strategy to be armed.",
             )
-        # Paper and fake environments also honor explicit arming so test behavior matches live behavior.
+        # Paper and simulated environments also honor explicit arming so test behavior matches live behavior.
         if not account.armed or not strategy.armed:
             raise RouterError(
                 "ORDER_NOT_ARMED", "Both the account and strategy must be armed."

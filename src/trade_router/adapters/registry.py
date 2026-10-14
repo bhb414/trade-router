@@ -15,11 +15,11 @@ class AdapterRegistry:
         self._load_plugins()
 
     def _load_builtins(self) -> None:
-        from .fake import FakeAdapter
         from .kis import KisAdapter
         from .namuh import NamuhAdapter
+        from .simulated import SimulatedAdapter
 
-        for adapter in (FakeAdapter, KisAdapter, NamuhAdapter):
+        for adapter in (SimulatedAdapter, KisAdapter, NamuhAdapter):
             self.register(adapter)
 
     def _load_plugins(self) -> None:

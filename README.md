@@ -3,7 +3,7 @@
 Trade Router is a local, versioned broker gateway and Python SDK for Korean equities.
 It normalizes market data, account queries, cash orders, and real-time events across
 Korea Investment & Securities (KIS), NH Investment & Securities NAMUH PLUG, and a
-deterministic fake broker used for safe development.
+deterministic simulation adapter used for safe development.
 
 The daemon owns credentials, OAuth tokens, rate limits, WebSocket connections,
 idempotency, risk checks, and the durable order ledger. Strategy code only receives
@@ -31,12 +31,12 @@ trade-router daemon status
 Use `TRADE_ROUTER_HOME` to move the runtime directory. By default it is stored in
 the current Windows user's local application-data directory.
 
-## Configure a safe fake account
+## Configure a safe simulation account
 
 ```powershell
-trade-router profile add fake-main --provider fake --environment paper
-trade-router account add paper-main --profile fake-main --account-number PAPER-001
-trade-router strategy register sample --account paper-main --market-data fake-main
+trade-router profile add simulated-main --provider simulated --environment paper
+trade-router account add paper-main --profile simulated-main --account-number PAPER-001
+trade-router strategy register sample --account paper-main --market-data simulated-main
 trade-router account arm paper-main
 trade-router strategy arm sample
 ```
@@ -50,7 +50,7 @@ from trade_router import AsyncTradeRouter, StrategyConfig
 STRATEGY = StrategyConfig(
     id="sample",
     trading_account="paper-main",
-    market_data="fake-main",
+    market_data="simulated-main",
 )
 
 async def main() -> None:
@@ -80,7 +80,7 @@ can be selected through profile settings without exposing custom credential host
 
 Actual live orders are never executed by the test suite.
 
-The default suite uses fake REST/WebSocket behavior. Optional read-only live checks
+The default suite uses simulated REST/WebSocket behavior. Optional read-only live checks
 run when `TRADE_ROUTER_TEST_KIS_APP_KEY` / `_APP_SECRET` or
 `TRADE_ROUTER_TEST_NAMUH_APP_KEY` / `_APP_SECRET` are set. They request only a
 quote, order book, and daily bars; they never call an order endpoint.

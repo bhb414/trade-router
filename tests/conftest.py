@@ -27,15 +27,15 @@ async def runtime(paths: RouterPaths):
     active = TradingRuntime(paths=paths, secret_store=secrets)
     await active.start()
     await active.add_profile(
-        profile_id="fake-main",
-        provider="fake",
+        profile_id="simulated-main",
+        provider="simulated",
         environment=ProviderEnvironment.PAPER,
         credentials={},
         settings={"cash": 10_000_000},
     )
     await active.add_account(
         alias="paper-main",
-        profile_id="fake-main",
+        profile_id="simulated-main",
         account_number="PAPER-001",
         risk=RiskLimits(
             max_order_krw=20_000_000, max_daily_buy_krw=50_000_000, max_open_orders=5
@@ -45,7 +45,7 @@ async def runtime(paths: RouterPaths):
         StrategyConfig(
             id="sample",
             trading_account="paper-main",
-            market_data="fake-main",
+            market_data="simulated-main",
             risk=RiskLimits(
                 max_order_krw=500_000, max_daily_buy_krw=1_000_000, max_open_orders=3
             ),

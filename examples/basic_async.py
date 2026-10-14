@@ -5,7 +5,7 @@ from trade_router import AsyncTradeRouter, StrategyConfig
 STRATEGY = StrategyConfig(
     id="sample",
     trading_account="paper-main",
-    market_data="fake-main",
+    market_data="simulated-main",
 )
 
 

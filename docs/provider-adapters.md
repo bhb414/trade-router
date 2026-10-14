@@ -24,6 +24,6 @@ rate-limiter pool, and the current connection generation. It must:
 - avoid logging credentials, raw account numbers, bearer tokens, and raw request
   bodies.
 
-The built-in adapter contract is checked for `fake`, `kis`, and `namuh`. The fake
+The built-in adapter contract is checked for `simulated`, `kis`, and `namuh`. The simulation
 adapter supports deterministic prices and the `fill`, `ack`, `partial`, `reject`,
 and `uncertain` submission behaviors.

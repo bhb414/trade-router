@@ -25,11 +25,11 @@ def order(
         quantity=quantity,
         route=OrderRoute.AUTO,
         client_order_id=key,
-        provider_options={"fake": {"behavior": behavior}},
+        provider_options={"simulated": {"behavior": behavior}},
     )
 
 
-async def test_order_is_idempotent_and_updates_fake_position(runtime):
+async def test_order_is_idempotent_and_updates_simulated_position(runtime):
     first = await runtime.submit_order(order())
     second = await runtime.submit_order(order())
     assert first.accepted is True
