@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade-router"
+version = "0.1.0"
+description = "Local multi-broker router and Python SDK for Korean equities"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "bhb414"}]
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.9,<3",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "tzdata>=2025.2",
+  "uvicorn>=0.32,<1",
+  "websockets>=14,<17",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.24,<2",
+  "respx>=0.22,<1",
+]
+
+[project.scripts]
+trade-router = "trade_router.cli:app"
+
+[project.entry-points."trade_router.providers"]
+kis = "trade_router.adapters.kis:KisAdapter"
+namuh = "trade_router.adapters.namuh:NamuhAdapter"
+fake = "trade_router.adapters.fake:FakeAdapter"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["live: optional read-only test against a real broker profile"]
