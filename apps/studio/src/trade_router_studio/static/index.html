@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trade Router</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">TR</span>
+      <div><strong>Trade Router</strong><small>로컬 Python 자동매매 작업공간</small></div>
+    </div>
+    <div class="runtime">
+      <span class="status-dot" id="server-dot"></span>
+      <span id="runtime-status">서버 확인 중</span>
+      <span class="separator"></span>
+      <span id="connection-status">증권사 연결 0</span>
+      <button class="button quiet" id="update-button">업데이트 확인</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar panel">
+      <div class="panel-heading">
+        <div><span class="eyebrow">WORKSPACE</span><h1>전략</h1></div>
+        <span class="count" id="strategy-count">0</span>
+      </div>
+      <form class="new-strategy" id="new-strategy-form">
+        <input id="new-strategy-name" autocomplete="off" placeholder="새 전략 이름" aria-label="새 전략 이름">
+        <button class="icon-button" title="전략 추가" aria-label="전략 추가">+</button>
+      </form>
+      <div class="strategy-list" id="strategy-list"></div>
+      <div class="workspace-path">
+        <span>사용자 데이터</span>
+        <code id="workspace-path">확인 중</code>
+      </div>
+    </aside>
+
+    <section class="editor-panel panel">
+      <div class="editor-toolbar">
+        <div class="file-title">
+          <span class="python-badge">PY</span>
+          <strong id="file-name">전략을 선택하세요</strong>
+          <span class="dirty" id="dirty-mark" hidden>저장 안 됨</span>
+        </div>
+        <div class="actions">
+          <button class="button quiet" id="delete-button" disabled>삭제</button>
+          <button class="button" id="save-button" disabled>저장 <kbd>Ctrl S</kbd></button>
+          <button class="button danger" id="stop-button" disabled>중지</button>
+          <button class="button primary" id="run-button" disabled>실행</button>
+        </div>
+      </div>
+      <div class="editor-wrap">
+        <div class="line-column" id="line-numbers">1</div>
+        <textarea id="source-editor" spellcheck="false" aria-label="Python 전략 코드" disabled></textarea>
+      </div>
+      <div class="editor-status">
+        <span id="strategy-state">선택된 전략 없음</span>
+        <span>일반 Python 파일 · UTF-8</span>
+      </div>
+    </section>
+
+    <aside class="logs-panel panel">
+      <div class="panel-heading logs-heading">
+        <div><span class="eyebrow">OUTPUT</span><h2>실행 로그</h2></div>
+        <button class="button quiet compact" id="clear-log-button">화면 지우기</button>
+      </div>
+      <pre id="log-output"><span class="log-muted">전략을 실행하면 여기에 출력됩니다.</span></pre>
+      <div class="hint">
+        <strong>한 프로그램으로 실행됩니다.</strong>
+        이 창에서 시작한 전략은 Trade Router와 함께 종료됩니다.
+      </div>
+    </aside>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

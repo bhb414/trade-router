@@ -3,6 +3,10 @@ __pycache__/
 .venv/
 dist/
 build/
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.coverage
+.idea/
+.vscode/
 

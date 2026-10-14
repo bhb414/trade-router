@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade-router"
+version = "0.1.0"
+description = "Local Python trading workspace with a unified broker API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "tzdata>=2025.2",
+    "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8.3,<9",
+]
+
+[project.scripts]
+trade-router-studio = "trade_router_studio.__main__:main"
+
+[tool.setuptools]
+packages = ["trade_router", "trade_router_studio"]
+package-dir = { trade_router = "packages/router/src/trade_router", trade_router_studio = "apps/studio/src/trade_router_studio" }
+include-package-data = true
+
+[tool.setuptools.package-data]
+trade_router_studio = ["static/*.html", "static/*.css", "static/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
