@@ -7,7 +7,12 @@ import pytest
 from trade_router.core.config import RouterPaths
 from trade_router.core.runtime import TradingRuntime
 from trade_router.core.secrets import MemorySecretStore
-from trade_router.models import ProviderEnvironment, RiskLimits, StrategyConfig
+from trade_router.models import (
+    CredentialUsage,
+    ProviderEnvironment,
+    RiskLimits,
+    StrategyConfig,
+)
 
 
 @pytest.fixture
@@ -29,13 +34,14 @@ async def runtime(paths: RouterPaths):
     await active.add_profile(
         profile_id="simulated-main",
         provider="simulated",
-        environment=ProviderEnvironment.PAPER,
+        usage=CredentialUsage.PAPER,
         credentials={},
         settings={"cash": 10_000_000},
     )
     await active.add_account(
         alias="paper-main",
         profile_id="simulated-main",
+        environment=ProviderEnvironment.PAPER,
         account_number="PAPER-001",
         risk=RiskLimits(
             max_order_krw=20_000_000, max_daily_buy_krw=50_000_000, max_open_orders=5
@@ -46,6 +52,7 @@ async def runtime(paths: RouterPaths):
             id="sample",
             trading_account="paper-main",
             market_data="simulated-main",
+            market_environment=ProviderEnvironment.PAPER,
             risk=RiskLimits(
                 max_order_krw=500_000, max_daily_buy_krw=1_000_000, max_open_orders=3
             ),

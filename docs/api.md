@@ -24,12 +24,18 @@ Main endpoints:
 | discovery | rankings, condition list/run when supported |
 | stream | `/v1/stream` WebSocket |
 
+Profiles store credential `usage` (`live`, `paper`, or `shared`). Account requests
+use the environment saved on the account. Market, discovery, profile-check, and
+stream requests accept an `environment=live|paper` parameter. It is optional for
+single-use profiles and required for `shared` profiles.
+
 For a WebSocket, put the installation token in the `token` query parameter or the
 Authorization header. The first client message is:
 
 ```json
 {
   "profile_id": "kis-main",
+  "environment": "live",
   "subscriptions": [
     {"kind": "QUOTE", "code": "005930", "venue": "INTEGRATED"}
   ]

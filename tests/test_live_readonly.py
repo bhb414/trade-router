@@ -8,7 +8,12 @@ from trade_router.adapters.base import AdapterContext
 from trade_router.adapters.kis import KisAdapter
 from trade_router.adapters.namuh import NamuhAdapter
 from trade_router.core.time import now_kst
-from trade_router.models import MarketDataVenue, ProfilePublic, ProviderEnvironment
+from trade_router.models import (
+    CredentialUsage,
+    MarketDataVenue,
+    ProfilePublic,
+    ProviderEnvironment,
+)
 
 
 def _live_context(provider: str) -> AdapterContext:
@@ -21,12 +26,14 @@ def _live_context(provider: str) -> AdapterContext:
     profile = ProfilePublic(
         id=f"{provider}-readonly",
         provider=provider,
-        environment=ProviderEnvironment.LIVE,
+        usage=CredentialUsage.LIVE,
         created_at=now,
         updated_at=now,
     )
     return AdapterContext(
-        profile=profile, secrets={"app_key": key, "app_secret": secret}
+        profile=profile,
+        environment=ProviderEnvironment.LIVE,
+        secrets={"app_key": key, "app_secret": secret},
     )
 
 

@@ -118,16 +118,16 @@ class KisAdapter(ProviderAdapterV1):
     def __init__(self, context) -> None:
         super().__init__(context)
         self.base_url = _guard_kis_url(
-            str(context.settings.get("rest_url") or _REST[context.profile.environment])
+            str(context.settings.get("rest_url") or _REST[context.environment])
         )
         self.ws_url = _guard_kis_url(
-            str(context.settings.get("ws_url") or _WS[context.profile.environment]),
+            str(context.settings.get("ws_url") or _WS[context.environment]),
             websocket=True,
         )
         self.http = httpx.AsyncClient(
             base_url=self.base_url, timeout=httpx.Timeout(10, connect=5)
         )
-        self._token_lock = asyncio.Lock()
+        self._token_lock = context.credential_lock
         self._approval_lock = asyncio.Lock()
 
     @classmethod
@@ -374,7 +374,7 @@ class KisAdapter(ProviderAdapterV1):
         return {
             "ok": True,
             "provider": self.provider_id,
-            "environment": self.context.profile.environment.value,
+            "environment": self.context.environment.value,
         }
 
     async def search_instruments(
@@ -621,7 +621,7 @@ class KisAdapter(ProviderAdapterV1):
         cano, product = _account_parts(account_number)
         tr_id = (
             "TTTC8434R"
-            if self.context.profile.environment == ProviderEnvironment.LIVE
+            if self.context.environment == ProviderEnvironment.LIVE
             else "VTTC8434R"
         )
         return await self._request(
@@ -698,7 +698,7 @@ class KisAdapter(ProviderAdapterV1):
         cano, product = _account_parts(account_number)
         tr_id = (
             "TTTC8908R"
-            if self.context.profile.environment == ProviderEnvironment.LIVE
+            if self.context.environment == ProviderEnvironment.LIVE
             else "VTTC8908R"
         )
         payload = await self._request(
@@ -816,7 +816,7 @@ class KisAdapter(ProviderAdapterV1):
         self, account_number: str, request: OrderRequest, *, router_order_id: str
     ) -> Order:
         cano, product = _account_parts(account_number)
-        live = self.context.profile.environment == ProviderEnvironment.LIVE
+        live = self.context.environment == ProviderEnvironment.LIVE
         tr_id = (
             ("TTTC0012U" if request.side == OrderSide.BUY else "TTTC0011U")
             if live
@@ -898,7 +898,7 @@ class KisAdapter(ProviderAdapterV1):
         cano, product = _account_parts(account_number)
         tr_id = (
             "TTTC0013U"
-            if self.context.profile.environment == ProviderEnvironment.LIVE
+            if self.context.environment == ProviderEnvironment.LIVE
             else "VTTC0013U"
         )
         await self._request(
@@ -938,7 +938,7 @@ class KisAdapter(ProviderAdapterV1):
         today = now_kst().strftime("%Y%m%d")
         tr_id = (
             "TTTC0081R"
-            if self.context.profile.environment == ProviderEnvironment.LIVE
+            if self.context.environment == ProviderEnvironment.LIVE
             else "VTTC0081R"
         )
         payload = await self._request(

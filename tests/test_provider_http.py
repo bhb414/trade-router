@@ -11,6 +11,7 @@ from trade_router.adapters.namuh import NamuhAdapter
 from trade_router.core.time import now_kst
 from trade_router.models import (
     CredentialScope,
+    CredentialUsage,
     MarketDataVenue,
     ProfilePublic,
     ProviderEnvironment,
@@ -25,10 +26,11 @@ def context(
         profile=ProfilePublic(
             id=f"{provider}-test",
             provider=provider,
-            environment=environment,
+            usage=CredentialUsage(environment.value),
             created_at=now,
             updated_at=now,
         ),
+        environment=environment,
         secrets={"app_key": "test-key", "app_secret": "test-secret"},
         persist_secrets=lambda value: saved.append(dict(value)),
     )

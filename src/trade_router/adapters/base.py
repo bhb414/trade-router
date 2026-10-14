@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable
+from typing import Any
 
 from ..core.limiter import RateLimiterPool
 from ..errors import UnsupportedCapabilityError
@@ -24,6 +25,7 @@ from ..models import (
     OrderRequest,
     Position,
     ProfilePublic,
+    ProviderEnvironment,
     Quote,
     RankingItem,
     StreamEvent,
@@ -34,11 +36,13 @@ from ..models import (
 @dataclass(slots=True)
 class AdapterContext:
     profile: ProfilePublic
+    environment: ProviderEnvironment
     secrets: dict[str, Any]
     connection_generation: int = 1
     settings: dict[str, Any] = field(default_factory=dict)
     persist_secrets: Callable[[dict[str, Any]], None] | None = None
     limiters: RateLimiterPool | None = None
+    credential_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def save_secrets(self) -> None:
         if self.persist_secrets is not None:

@@ -20,7 +20,12 @@ from fastapi.responses import JSONResponse
 
 from ..core.runtime import TradingRuntime
 from ..errors import RouterError
-from ..models import MarketDataVenue, OrderRequest, StreamSubscription
+from ..models import (
+    MarketDataVenue,
+    OrderRequest,
+    ProviderEnvironment,
+    StreamSubscription,
+)
 from ..version import __version__
 from .schemas import (
     AccountCreate,
@@ -141,7 +146,7 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
         return await active.add_profile(
             profile_id=body.id,
             provider=body.provider,
-            environment=body.environment,
+            usage=body.usage,
             credentials=credentials,
             display_name=body.display_name,
             settings=body.settings,
@@ -153,8 +158,10 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
         return None
 
     @app.post("/v1/profiles/{profile_id}/check", dependencies=secured)
-    async def check_profile(profile_id: str):
-        return await active.check_profile(profile_id)
+    async def check_profile(
+        profile_id: str, environment: ProviderEnvironment | None = None
+    ):
+        return await active.check_profile(profile_id, environment)
 
     @app.get("/v1/accounts", dependencies=secured)
     async def list_accounts():
@@ -165,6 +172,7 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
         return await active.add_account(
             alias=body.alias,
             profile_id=body.profile_id,
+            environment=body.environment,
             account_number=body.account_number,
             risk=body.risk,
         )
@@ -219,21 +227,36 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
 
     @app.get("/v1/instruments/search", dependencies=secured)
     async def search_instruments(
-        profile: str, q: str, limit: int = Query(20, ge=1, le=100)
+        profile: str,
+        q: str,
+        limit: int = Query(20, ge=1, le=100),
+        environment: ProviderEnvironment | None = None,
     ):
-        return await active.search_instruments(profile_id=profile, query=q, limit=limit)
+        return await active.search_instruments(
+            profile_id=profile, query=q, limit=limit, environment=environment
+        )
 
     @app.get("/v1/market/quote", dependencies=secured)
     async def quote(
-        profile: str, code: str, venue: MarketDataVenue = MarketDataVenue.INTEGRATED
+        profile: str,
+        code: str,
+        venue: MarketDataVenue = MarketDataVenue.INTEGRATED,
+        environment: ProviderEnvironment | None = None,
     ):
-        return await active.quote(profile_id=profile, code=code, venue=venue)
+        return await active.quote(
+            profile_id=profile, code=code, venue=venue, environment=environment
+        )
 
     @app.get("/v1/market/orderbook", dependencies=secured)
     async def orderbook(
-        profile: str, code: str, venue: MarketDataVenue = MarketDataVenue.INTEGRATED
+        profile: str,
+        code: str,
+        venue: MarketDataVenue = MarketDataVenue.INTEGRATED,
+        environment: ProviderEnvironment | None = None,
     ):
-        return await active.orderbook(profile_id=profile, code=code, venue=venue)
+        return await active.orderbook(
+            profile_id=profile, code=code, venue=venue, environment=environment
+        )
 
     @app.get("/v1/market/bars", dependencies=secured)
     async def bars(
@@ -243,6 +266,7 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
         count: int = Query(100, ge=1, le=1000),
         venue: MarketDataVenue = MarketDataVenue.INTEGRATED,
         until: date | None = None,
+        environment: ProviderEnvironment | None = None,
     ):
         return await active.bars(
             profile_id=profile,
@@ -251,6 +275,7 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
             count=count,
             venue=venue,
             until=until,
+            environment=environment,
         )
 
     @app.post("/v1/orders/preview", dependencies=secured)
@@ -277,18 +302,31 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
         ranking: str,
         market: str = "ALL",
         limit: int = Query(20, ge=1, le=100),
+        environment: ProviderEnvironment | None = None,
     ):
         return await active.rankings(
-            profile_id=profile, ranking=ranking, market=market, limit=limit
+            profile_id=profile,
+            ranking=ranking,
+            market=market,
+            limit=limit,
+            environment=environment,
         )
 
     @app.get("/v1/discovery/conditions", dependencies=secured)
-    async def conditions(profile: str):
-        return await active.conditions(profile_id=profile)
+    async def conditions(
+        profile: str, environment: ProviderEnvironment | None = None
+    ):
+        return await active.conditions(profile_id=profile, environment=environment)
 
     @app.post("/v1/discovery/conditions/{condition_id}/run", dependencies=secured)
-    async def run_condition(condition_id: str, profile: str):
-        return await active.run_condition(profile_id=profile, condition_id=condition_id)
+    async def run_condition(
+        condition_id: str,
+        profile: str,
+        environment: ProviderEnvironment | None = None,
+    ):
+        return await active.run_condition(
+            profile_id=profile, condition_id=condition_id, environment=environment
+        )
 
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket, token: str | None = None):
@@ -306,11 +344,14 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
         profile_id = ""
         try:
             body = StreamRequest.model_validate(await websocket.receive_json())
+            environment = await active.resolve_environment(
+                body.profile_id, body.environment
+            )
             subscriptions = [
                 StreamSubscription.model_validate(item) for item in body.subscriptions
             ]
             profile_id = body.profile_id
-            client = await active.subscribe(profile_id, subscriptions)
+            client = await active.subscribe(profile_id, subscriptions, environment)
             while True:
                 event = await client.queue.get()
                 await websocket.send_json(event.model_dump(mode="json"))
@@ -321,6 +362,6 @@ def create_app(runtime: TradingRuntime | None = None) -> FastAPI:
             await websocket.close(code=4400)
         finally:
             if client is not None:
-                active.unsubscribe(profile_id, client.id)
+                active.unsubscribe(profile_id, client.id, environment)
 
     return app

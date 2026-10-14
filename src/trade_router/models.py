@@ -27,6 +27,14 @@ class ProviderEnvironment(str, Enum):
     PAPER = "paper"
 
 
+class CredentialUsage(str, Enum):
+    """Trading environments in which one saved credential may be used."""
+
+    LIVE = "live"
+    PAPER = "paper"
+    SHARED = "shared"
+
+
 class CredentialScope(str, Enum):
     """How provider credentials are issued across trading environments."""
 
@@ -347,6 +355,7 @@ class StrategyConfig(RouterModel):
     id: str = Field(min_length=1, max_length=128)
     trading_account: str
     market_data: str
+    market_environment: ProviderEnvironment | None = None
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
 
@@ -375,7 +384,7 @@ class BrokerCapabilities(RouterModel):
 class ProfilePublic(RouterModel):
     id: str
     provider: str
-    environment: ProviderEnvironment
+    usage: CredentialUsage
     display_name: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
     secret_configured: bool = False
@@ -388,6 +397,7 @@ class ProfilePublic(RouterModel):
 class AccountPublic(RouterModel):
     alias: str
     profile_id: str
+    environment: ProviderEnvironment
     masked_account: str
     armed: bool
     risk: RiskLimits
@@ -401,6 +411,7 @@ class StrategyPublic(RouterModel):
     id: str
     trading_account: str
     market_data: str
+    market_environment: ProviderEnvironment
     armed: bool
     risk: RiskLimits
     created_at: datetime

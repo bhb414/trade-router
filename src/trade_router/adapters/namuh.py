@@ -107,11 +107,11 @@ class NamuhAdapter(ProviderAdapterV1):
     def __init__(self, context) -> None:
         super().__init__(context)
         self.base_url = _guard_url(
-            str(context.settings.get("rest_url") or _BASE[context.profile.environment])
+            str(context.settings.get("rest_url") or _BASE[context.environment])
         )
         self.auth_url = _guard_url(str(context.settings.get("auth_url") or _AUTH))
         self.ws_url = _guard_url(
-            str(context.settings.get("ws_url") or _WS[context.profile.environment])
+            str(context.settings.get("ws_url") or _WS[context.environment])
         )
         if ("n2plug.com" in self.base_url) != ("n2plug.com" in self.auth_url):
             raise RouterError(
@@ -119,7 +119,7 @@ class NamuhAdapter(ProviderAdapterV1):
                 "NAMUH/N2 REST and OAuth hosts must use the same brand.",
             )
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5))
-        self._token_lock = asyncio.Lock()
+        self._token_lock = context.credential_lock
 
     @classmethod
     def capabilities(cls) -> BrokerCapabilities:
@@ -312,7 +312,7 @@ class NamuhAdapter(ProviderAdapterV1):
         return {
             "ok": True,
             "provider": self.provider_id,
-            "environment": self.context.profile.environment.value,
+            "environment": self.context.environment.value,
         }
 
     async def _quote_row(self, code: str, venue: MarketDataVenue) -> dict[str, Any]:

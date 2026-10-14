@@ -11,6 +11,7 @@ import aiosqlite
 from ..errors import RouterError
 from ..models import (
     AccountPublic,
+    CredentialUsage,
     Fill,
     Order,
     OrderRequest,
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     environment TEXT NOT NULL,
+    usage TEXT NOT NULL DEFAULT 'paper',
     display_name TEXT,
     settings_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE TABLE IF NOT EXISTS accounts (
     alias TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+    environment TEXT NOT NULL DEFAULT 'paper',
     masked_account TEXT NOT NULL,
     armed INTEGER NOT NULL DEFAULT 0,
     risk_json TEXT NOT NULL DEFAULT '{}',
@@ -47,6 +50,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     id TEXT PRIMARY KEY,
     trading_account TEXT NOT NULL REFERENCES accounts(alias) ON DELETE RESTRICT,
     market_data TEXT NOT NULL REFERENCES profiles(id) ON DELETE RESTRICT,
+    market_environment TEXT NOT NULL DEFAULT 'paper',
     armed INTEGER NOT NULL DEFAULT 0,
     risk_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -80,7 +84,7 @@ CREATE TABLE IF NOT EXISTS runtime_meta (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 """
 
 
@@ -94,7 +98,51 @@ class SQLiteStore:
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
+        await self._migrate_environment_usage()
         await self._db.commit()
+
+    async def _migrate_environment_usage(self) -> None:
+        """Add credential usage and request environments to v1 databases."""
+        profile_columns = {
+            row[1]
+            for row in await (
+                await self.db.execute("PRAGMA table_info(profiles)")
+            ).fetchall()
+        }
+        if "usage" not in profile_columns:
+            await self.db.execute("ALTER TABLE profiles ADD COLUMN usage TEXT")
+        await self.db.execute(
+            "UPDATE profiles SET usage=COALESCE(usage, environment, 'paper')"
+        )
+
+        account_columns = {
+            row[1]
+            for row in await (
+                await self.db.execute("PRAGMA table_info(accounts)")
+            ).fetchall()
+        }
+        if "environment" not in account_columns:
+            await self.db.execute("ALTER TABLE accounts ADD COLUMN environment TEXT")
+        await self.db.execute(
+            "UPDATE accounts SET environment=COALESCE(environment, "
+            "(SELECT environment FROM profiles WHERE profiles.id=accounts.profile_id), 'paper')"
+        )
+
+        strategy_columns = {
+            row[1]
+            for row in await (
+                await self.db.execute("PRAGMA table_info(strategies)")
+            ).fetchall()
+        }
+        if "market_environment" not in strategy_columns:
+            await self.db.execute(
+                "ALTER TABLE strategies ADD COLUMN market_environment TEXT"
+            )
+        await self.db.execute(
+            "UPDATE strategies SET market_environment=COALESCE(market_environment, "
+            "(SELECT environment FROM profiles WHERE profiles.id=strategies.market_data), 'paper')"
+        )
+        await self.db.execute("PRAGMA user_version=2")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -112,19 +160,24 @@ class SQLiteStore:
         *,
         profile_id: str,
         provider: str,
-        environment: ProviderEnvironment,
+        usage: CredentialUsage,
         display_name: str | None,
         settings: dict[str, Any],
     ) -> ProfilePublic:
         now = now_kst().isoformat()
         try:
             await self.db.execute(
-                "INSERT INTO profiles(id,provider,environment,display_name,settings_json,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO profiles(id,provider,environment,usage,display_name,settings_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (
                     profile_id,
                     provider,
-                    environment.value,
+                    (
+                        ProviderEnvironment.LIVE
+                        if usage == CredentialUsage.SHARED
+                        else ProviderEnvironment(usage.value)
+                    ).value,
+                    usage.value,
                     display_name,
                     json.dumps(settings),
                     now,
@@ -182,6 +235,7 @@ class SQLiteStore:
         *,
         alias: str,
         profile_id: str,
+        environment: ProviderEnvironment,
         masked_account: str,
         risk: RiskLimits,
     ) -> AccountPublic:
@@ -189,11 +243,12 @@ class SQLiteStore:
         now = now_kst().isoformat()
         try:
             await self.db.execute(
-                "INSERT INTO accounts(alias,profile_id,masked_account,armed,risk_json,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO accounts(alias,profile_id,environment,masked_account,armed,risk_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (
                     alias,
                     profile_id,
+                    environment.value,
                     masked_account,
                     0,
                     risk.model_dump_json(),
@@ -248,6 +303,7 @@ class SQLiteStore:
         strategy_id: str,
         trading_account: str,
         market_data: str,
+        market_environment: ProviderEnvironment,
         risk: RiskLimits,
     ) -> StrategyPublic:
         await self.get_account(trading_account)
@@ -255,12 +311,13 @@ class SQLiteStore:
         now = now_kst().isoformat()
         try:
             await self.db.execute(
-                "INSERT INTO strategies(id,trading_account,market_data,armed,risk_json,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO strategies(id,trading_account,market_data,market_environment,armed,risk_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (
                     strategy_id,
                     trading_account,
                     market_data,
+                    market_environment.value,
                     0,
                     risk.model_dump_json(),
                     now,
@@ -551,7 +608,7 @@ class SQLiteStore:
         return ProfilePublic(
             id=row["id"],
             provider=row["provider"],
-            environment=ProviderEnvironment(row["environment"]),
+            usage=CredentialUsage(row["usage"]),
             display_name=row["display_name"],
             settings=json.loads(row["settings_json"]),
             secret_configured=False,
@@ -564,6 +621,7 @@ class SQLiteStore:
         return AccountPublic(
             alias=row["alias"],
             profile_id=row["profile_id"],
+            environment=ProviderEnvironment(row["environment"]),
             masked_account=row["masked_account"],
             armed=bool(row["armed"]),
             risk=RiskLimits.model_validate_json(row["risk_json"]),
@@ -577,6 +635,7 @@ class SQLiteStore:
             id=row["id"],
             trading_account=row["trading_account"],
             market_data=row["market_data"],
+            market_environment=ProviderEnvironment(row["market_environment"]),
             armed=bool(row["armed"]),
             risk=RiskLimits.model_validate_json(row["risk_json"]),
             created_at=datetime.fromisoformat(row["created_at"]),

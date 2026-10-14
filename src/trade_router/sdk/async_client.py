@@ -29,6 +29,7 @@ from ..models import (
     OrderSubmission,
     OrderType,
     Position,
+    ProviderEnvironment,
     Quote,
     StrategyConfig,
     StrategyPublic,
@@ -61,6 +62,20 @@ class _Service:
     def __init__(self, client: "AsyncTradeRouter") -> None:
         self.client = client
 
+    def market_target(
+        self,
+        profile: str | None,
+        environment: ProviderEnvironment | str | None,
+    ) -> tuple[str, str | None]:
+        chosen = profile or self.client.strategy.market_data
+        selected = (
+            ProviderEnvironment(environment).value if environment is not None else None
+        )
+        if selected is None and chosen == self.client.strategy.market_data:
+            configured = self.client.strategy.market_environment
+            selected = configured.value if configured else None
+        return chosen, selected
+
 
 class SystemService(_Service):
     async def health(self) -> dict[str, Any]:
@@ -85,13 +100,20 @@ class SystemService(_Service):
 
 class InstrumentService(_Service):
     async def search(
-        self, query: str, *, profile: str | None = None, limit: int = 20
+        self,
+        query: str,
+        *,
+        profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
+        limit: int = 20,
     ) -> list[Instrument]:
+        chosen, selected = self.market_target(profile, environment)
         data = await self.client._request(
             "GET",
             "/v1/instruments/search",
             params={
-                "profile": profile or self.client.strategy.market_data,
+                "profile": chosen,
+                "environment": selected,
                 "q": query,
                 "limit": limit,
             },
@@ -106,12 +128,15 @@ class MarketService(_Service):
         code: str,
         venue: MarketDataVenue | str = MarketDataVenue.INTEGRATED,
         profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
     ) -> Quote:
+        chosen, selected = self.market_target(profile, environment)
         data = await self.client._request(
             "GET",
             "/v1/market/quote",
             params={
-                "profile": profile or self.client.strategy.market_data,
+                "profile": chosen,
+                "environment": selected,
                 "code": code,
                 "venue": MarketDataVenue(venue).value,
             },
@@ -124,12 +149,15 @@ class MarketService(_Service):
         code: str,
         venue: MarketDataVenue | str = MarketDataVenue.INTEGRATED,
         profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
     ) -> OrderBook:
+        chosen, selected = self.market_target(profile, environment)
         data = await self.client._request(
             "GET",
             "/v1/market/orderbook",
             params={
-                "profile": profile or self.client.strategy.market_data,
+                "profile": chosen,
+                "environment": selected,
                 "code": code,
                 "venue": MarketDataVenue(venue).value,
             },
@@ -144,10 +172,13 @@ class MarketService(_Service):
         count: int = 100,
         venue: MarketDataVenue | str = MarketDataVenue.INTEGRATED,
         profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
         until: date | None = None,
     ) -> list[Bar]:
+        chosen, selected = self.market_target(profile, environment)
         params: dict[str, Any] = {
-            "profile": profile or self.client.strategy.market_data,
+            "profile": chosen,
+            "environment": selected,
             "code": code,
             "interval": interval,
             "count": count,
@@ -159,9 +190,13 @@ class MarketService(_Service):
         return TypeAdapter(list[Bar]).validate_python(data)
 
     async def stream(
-        self, subscriptions: list[StreamSubscription], *, profile: str | None = None
+        self,
+        subscriptions: list[StreamSubscription],
+        *,
+        profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        chosen = profile or self.client.strategy.market_data
+        chosen, selected = self.market_target(profile, environment)
         ws_url = (
             self.client.base_url.replace("http://", "ws://").replace(
                 "https://", "wss://"
@@ -176,6 +211,7 @@ class MarketService(_Service):
                 .dump_json(
                     {
                         "profile_id": chosen,
+                        "environment": selected,
                         "subscriptions": [
                             item.model_dump(mode="json") for item in subscriptions
                         ],
@@ -392,32 +428,46 @@ class DiscoveryService(_Service):
         market: str = "ALL",
         limit: int = 20,
         profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
     ) -> list[dict[str, Any]]:
+        chosen, selected = self.market_target(profile, environment)
         return await self.client._request(
             "GET",
             "/v1/discovery/rankings",
             params={
-                "profile": profile or self.client.strategy.market_data,
+                "profile": chosen,
+                "environment": selected,
                 "ranking": ranking,
                 "market": market,
                 "limit": limit,
             },
         )
 
-    async def conditions(self, *, profile: str | None = None) -> list[dict[str, Any]]:
+    async def conditions(
+        self,
+        *,
+        profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
+    ) -> list[dict[str, Any]]:
+        chosen, selected = self.market_target(profile, environment)
         return await self.client._request(
             "GET",
             "/v1/discovery/conditions",
-            params={"profile": profile or self.client.strategy.market_data},
+            params={"profile": chosen, "environment": selected},
         )
 
     async def run_condition(
-        self, condition_id: str, *, profile: str | None = None
+        self,
+        condition_id: str,
+        *,
+        profile: str | None = None,
+        environment: ProviderEnvironment | str | None = None,
     ) -> list[Instrument]:
+        chosen, selected = self.market_target(profile, environment)
         data = await self.client._request(
             "POST",
             f"/v1/discovery/conditions/{condition_id}/run",
-            params={"profile": profile or self.client.strategy.market_data},
+            params={"profile": chosen, "environment": selected},
         )
         return TypeAdapter(list[Instrument]).validate_python(data)
 
@@ -452,6 +502,10 @@ class AsyncTradeRouter:
         if (
             saved.trading_account != self.strategy.trading_account
             or saved.market_data != self.strategy.market_data
+            or (
+                self.strategy.market_environment is not None
+                and saved.market_environment != self.strategy.market_environment
+            )
         ):
             raise RouterError(
                 "STRATEGY_CONFIG_MISMATCH",
@@ -474,6 +528,8 @@ class AsyncTradeRouter:
         params: dict[str, Any] | None = None,
         json: Any = None,
     ) -> Any:
+        if params is not None:
+            params = {key: value for key, value in params.items() if value is not None}
         try:
             response = await self._http.request(method, path, params=params, json=json)
         except httpx.RequestError as exc:

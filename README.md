@@ -34,9 +34,9 @@ the current Windows user's local application-data directory.
 ## Configure a safe simulation account
 
 ```powershell
-trade-router profile add simulated-main --provider simulated --environment paper
-trade-router account add paper-main --profile simulated-main --account-number PAPER-001
-trade-router strategy register sample --account paper-main --market-data simulated-main
+trade-router profile add simulated-main --provider simulated --usage paper
+trade-router account add paper-main --profile simulated-main --environment paper
+trade-router strategy register sample --account paper-main --market-data simulated-main --market-environment paper
 trade-router account arm paper-main
 trade-router strategy arm sample
 ```
@@ -51,6 +51,7 @@ STRATEGY = StrategyConfig(
     id="sample",
     trading_account="paper-main",
     market_data="simulated-main",
+    market_environment="paper",
 )
 
 async def main() -> None:
@@ -71,7 +72,7 @@ asyncio.run(main())
 `TradeRouter` provides the same surface for synchronous scripts. The sync wrapper
 must not be invoked from an already-running asyncio event loop.
 
-## Provider environments
+## Credential usage and request environments
 
 KIS uses its official live and virtual-trading hosts. NAMUH PLUG uses the official
 live host `api.nhplug.com:8443` and mock host `moapi.nhplug.com:8443`; OAuth tokens
@@ -80,6 +81,11 @@ can be selected through profile settings without exposing custom credential host
 `BrokerCapabilities.credential_scope` reports whether credentials are absent,
 environment-specific, or shared across a provider's supported environments. KIS
 reports environment-specific credentials; NAMUH reports provider-wide credentials.
+
+A profile records credential **usage**: `live`, `paper`, or `shared`. Accounts and
+strategies separately record the actual request **environment**. A NAMUH `shared`
+profile therefore stores one App Key and App Secret while a linked account or market
+data configuration explicitly selects `live` or `paper`.
 
 Actual live orders are never executed by the test suite.
 
@@ -94,11 +100,11 @@ The CLI prompts for secrets without echoing them. They are written only to the
 current Windows user's DPAPI vault.
 
 ```powershell
-trade-router profile add kis-main --provider kis --environment live
-trade-router account add kis-account --profile kis-main
+trade-router profile add kis-main --provider kis --usage live
+trade-router account add kis-account --profile kis-main --environment live
 
-trade-router profile add nh-paper --provider namuh --environment paper
-trade-router account add nh-paper-account --profile nh-paper
+trade-router profile add nh-main --provider namuh --usage shared
+trade-router account add nh-paper-account --profile nh-main --environment paper
 ```
 
 NAMUH's paper profile uses `moapi.nhplug.com` for API calls and the live OAuth host

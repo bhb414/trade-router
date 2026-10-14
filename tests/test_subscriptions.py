@@ -7,6 +7,7 @@ from trade_router.adapters.simulated import SimulatedAdapter
 from trade_router.core.subscriptions import SubscriptionHub
 from trade_router.core.time import now_kst
 from trade_router.models import (
+    CredentialUsage,
     ProfilePublic,
     ProviderEnvironment,
     StreamKind,
@@ -29,11 +30,17 @@ async def test_identical_local_subscriptions_share_one_provider_stream():
     profile = ProfilePublic(
         id="simulated",
         provider="simulated",
-        environment=ProviderEnvironment.PAPER,
+        usage=CredentialUsage.PAPER,
         created_at=now,
         updated_at=now,
     )
-    adapter = CountingSimulated(AdapterContext(profile=profile, secrets={}))
+    adapter = CountingSimulated(
+        AdapterContext(
+            profile=profile,
+            environment=ProviderEnvironment.PAPER,
+            secrets={},
+        )
+    )
     hub = SubscriptionHub()
     subscription = StreamSubscription(kind=StreamKind.QUOTE, code="005930")
     first = hub.subscribe("simulated", adapter, [subscription])

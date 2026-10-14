@@ -14,7 +14,7 @@ from rich.table import Table
 
 from .core.config import RouterPaths, daemon_base_url
 from .core.secrets import DpapiSecretStore
-from .models import ProviderEnvironment, RiskLimits, StrategyConfig
+from .models import CredentialUsage, ProviderEnvironment, RiskLimits, StrategyConfig
 
 app = typer.Typer(help="Local multi-broker trading router")
 daemon_app = typer.Typer(help="Manage the central daemon")
@@ -159,7 +159,7 @@ def status_alias() -> None:
 def profile_add(
     profile_id: str,
     provider: str = typer.Option(..., help="kis, namuh, or simulated"),
-    environment: ProviderEnvironment = typer.Option(ProviderEnvironment.PAPER),
+    usage: CredentialUsage = typer.Option(CredentialUsage.PAPER),
     display_name: str | None = typer.Option(None),
     settings: str = typer.Option("{}", help="Non-secret JSON settings"),
 ) -> None:
@@ -180,7 +180,7 @@ def profile_add(
             json_body={
                 "id": profile_id,
                 "provider": provider,
-                "environment": environment.value,
+                "usage": usage.value,
                 "app_key": app_key,
                 "app_secret": app_secret,
                 "display_name": display_name,
@@ -193,12 +193,12 @@ def profile_add(
 @profile_app.command("list")
 def profile_list() -> None:
     rows = _request("GET", "/v1/profiles")
-    table = Table("ID", "Provider", "Environment", "Secrets")
+    table = Table("ID", "Provider", "Credential usage", "Secrets")
     for row in rows:
         table.add_row(
             row["id"],
             row["provider"],
-            row["environment"],
+            row["usage"],
             "yes" if row["secret_configured"] else "no",
         )
     console.print(table)
@@ -233,6 +233,7 @@ def _risk(
 def account_add(
     alias: str,
     profile: str = typer.Option(...),
+    environment: ProviderEnvironment | None = typer.Option(None),
     max_order_krw: int | None = None,
     max_daily_buy_krw: int | None = None,
     max_exposure_krw: int | None = None,
@@ -242,6 +243,7 @@ def account_add(
     body = {
         "alias": alias,
         "profile_id": profile,
+        "environment": environment.value if environment else None,
         "account_number": account_number,
         "risk": _risk(
             max_order_krw, max_daily_buy_krw, max_exposure_krw, max_open_orders
@@ -253,11 +255,12 @@ def account_add(
 @account_app.command("list")
 def account_list() -> None:
     rows = _request("GET", "/v1/accounts")
-    table = Table("Alias", "Profile", "Account", "Armed")
+    table = Table("Alias", "Profile", "Environment", "Account", "Armed")
     for row in rows:
         table.add_row(
             row["alias"],
             row["profile_id"],
+            row["environment"],
             row["masked_account"],
             "yes" if row["armed"] else "no",
         )
@@ -279,6 +282,7 @@ def strategy_register(
     strategy_id: str,
     account: str = typer.Option(...),
     market_data: str = typer.Option(...),
+    market_environment: ProviderEnvironment | None = typer.Option(None),
     max_order_krw: int | None = None,
     max_daily_buy_krw: int | None = None,
     max_exposure_krw: int | None = None,
@@ -289,6 +293,9 @@ def strategy_register(
             "id": strategy_id,
             "trading_account": account,
             "market_data": market_data,
+            "market_environment": (
+                market_environment.value if market_environment else None
+            ),
             "risk": _risk(
                 max_order_krw, max_daily_buy_krw, max_exposure_krw, max_open_orders
             ),

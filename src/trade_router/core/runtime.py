@@ -22,6 +22,8 @@ from ..models import (
     BrokerCapabilities,
     Capability,
     ConditionDefinition,
+    CredentialScope,
+    CredentialUsage,
     Fill,
     HealthStatus,
     Instrument,
@@ -103,8 +105,10 @@ class TradingRuntime:
         self.subscriptions = SubscriptionHub()
         self.read_cache: AsyncSingleFlightCache[Any] = AsyncSingleFlightCache()
         self.risk = RiskEngine(self.store)
-        self.adapters: dict[str, ProviderAdapterV1] = {}
-        self.adapter_locks: dict[str, asyncio.Lock] = {}
+        self.adapters: dict[tuple[str, ProviderEnvironment], ProviderAdapterV1] = {}
+        self.adapter_locks: dict[tuple[str, ProviderEnvironment], asyncio.Lock] = {}
+        self.credential_locks: dict[str, asyncio.Lock] = {}
+        self.profile_secrets: dict[str, dict[str, Any]] = {}
         self.started_at = now_kst()
         self.database_ready = False
         self.accepting_orders = False
@@ -143,6 +147,7 @@ class TradingRuntime:
             return_exceptions=True,
         )
         self.adapters.clear()
+        self.profile_secrets.clear()
         await self.limiters.close()
         await self.store.close()
         self.database_ready = False
@@ -318,16 +323,22 @@ class TradingRuntime:
     async def connection_states(self) -> list[dict[str, Any]]:
         states: list[dict[str, Any]] = []
         for profile in await self.list_profiles():
-            adapter = self.adapters.get(profile.id)
+            loaded = {
+                environment.value: adapter
+                for (profile_id, environment), adapter in self.adapters.items()
+                if profile_id == profile.id
+            }
             states.append(
                 {
                     "profile": profile.id,
                     "provider": profile.provider,
-                    "environment": profile.environment.value,
-                    "adapter_loaded": adapter is not None,
-                    "connection_generation": adapter.context.connection_generation
-                    if adapter
-                    else 0,
+                    "usage": profile.usage.value,
+                    "loaded_environments": sorted(loaded),
+                    "adapter_loaded": bool(loaded),
+                    "connection_generation": max(
+                        (item.context.connection_generation for item in loaded.values()),
+                        default=0,
+                    ),
                 }
             )
         return states
@@ -337,7 +348,7 @@ class TradingRuntime:
         *,
         profile_id: str,
         provider: str,
-        environment: ProviderEnvironment,
+        usage: CredentialUsage,
         credentials: dict[str, Any],
         display_name: str | None = None,
         settings: dict[str, Any] | None = None,
@@ -345,10 +356,20 @@ class TradingRuntime:
         reject_secret_settings(settings or {})
         adapter_type = self.registry.get(provider)
         capabilities = adapter_type.capabilities()
-        if environment not in capabilities.environments:
+        requested_environments = (
+            {ProviderEnvironment.LIVE, ProviderEnvironment.PAPER}
+            if usage == CredentialUsage.SHARED
+            else {ProviderEnvironment(usage.value)}
+        )
+        if not requested_environments.issubset(capabilities.environments):
             raise RouterError(
                 "ENVIRONMENT_UNSUPPORTED",
-                f"Provider '{provider}' does not support '{environment.value}'.",
+                f"Provider '{provider}' does not support credential usage '{usage.value}'.",
+            )
+        if usage == CredentialUsage.SHARED and capabilities.credential_scope != CredentialScope.PROVIDER:
+            raise RouterError(
+                "SHARED_CREDENTIAL_UNSUPPORTED",
+                f"Provider '{provider}' does not issue credentials shared by live and paper environments.",
             )
         if provider != "simulated" and not credentials.get("app_key"):
             raise RouterError("CREDENTIAL_REQUIRED", "app_key is required.")
@@ -357,11 +378,12 @@ class TradingRuntime:
         profile = await self.store.add_profile(
             profile_id=profile_id,
             provider=provider,
-            environment=environment,
+            usage=usage,
             display_name=display_name,
             settings=settings or {},
         )
         self.secrets.set(f"profile:{profile_id}", credentials)
+        self.profile_secrets[profile_id] = credentials
         return profile.model_copy(update={"secret_configured": True})
 
     async def list_profiles(self) -> list[ProfilePublic]:
@@ -382,9 +404,16 @@ class TradingRuntime:
         )
 
     async def remove_profile(self, profile_id: str) -> None:
-        adapter = self.adapters.pop(profile_id, None)
-        if adapter:
-            await adapter.close()
+        adapters = [
+            self.adapters.pop(key)
+            for key in list(self.adapters)
+            if key[0] == profile_id
+        ]
+        for key in [key for key in self.adapter_locks if key[0] == profile_id]:
+            self.adapter_locks.pop(key, None)
+        self.credential_locks.pop(profile_id, None)
+        self.profile_secrets.pop(profile_id, None)
+        await asyncio.gather(*(adapter.close() for adapter in adapters), return_exceptions=True)
         await self.store.remove_profile(profile_id)
         self.secrets.delete(f"profile:{profile_id}")
 
@@ -393,12 +422,16 @@ class TradingRuntime:
         *,
         alias: str,
         profile_id: str,
+        environment: ProviderEnvironment | None,
         account_number: str,
         risk: RiskLimits,
     ) -> AccountPublic:
+        profile = await self.get_profile(profile_id)
+        resolved_environment = self._resolve_environment(profile, environment)
         account = await self.store.add_account(
             alias=alias,
             profile_id=profile_id,
+            environment=resolved_environment,
             masked_account=mask_account(account_number),
             risk=risk,
         )
@@ -414,10 +447,15 @@ class TradingRuntime:
         return str(secret["account_number"])
 
     async def add_strategy(self, config: StrategyConfig) -> StrategyPublic:
+        profile = await self.get_profile(config.market_data)
+        market_environment = self._resolve_environment(
+            profile, config.market_environment
+        )
         return await self.store.add_strategy(
             strategy_id=config.id,
             trading_account=config.trading_account,
             market_data=config.market_data,
+            market_environment=market_environment,
             risk=config.risk,
         )
 
@@ -442,6 +480,10 @@ class TradingRuntime:
         if (
             saved.trading_account != config.trading_account
             or saved.market_data != config.market_data
+            or (
+                config.market_environment is not None
+                and saved.market_environment != config.market_environment
+            )
         ):
             raise RouterError(
                 "STRATEGY_CONFIG_MISMATCH",
@@ -450,17 +492,52 @@ class TradingRuntime:
             )
         return saved
 
-    async def get_adapter(self, profile_id: str) -> ProviderAdapterV1:
-        existing = self.adapters.get(profile_id)
+    @staticmethod
+    def _resolve_environment(
+        profile: ProfilePublic, requested: ProviderEnvironment | None
+    ) -> ProviderEnvironment:
+        if profile.usage == CredentialUsage.SHARED:
+            if requested is None:
+                raise RouterError(
+                    "ENVIRONMENT_REQUIRED",
+                    "A shared credential profile requires a live or paper request environment.",
+                    status_code=422,
+                )
+            return requested
+        allowed = ProviderEnvironment(profile.usage.value)
+        if requested is not None and requested != allowed:
+            raise RouterError(
+                "PROFILE_USAGE_MISMATCH",
+                f"Profile '{profile.id}' is for '{profile.usage.value}' credentials.",
+                status_code=422,
+            )
+        return allowed
+
+    async def resolve_environment(
+        self, profile_id: str, requested: ProviderEnvironment | None = None
+    ) -> ProviderEnvironment:
+        return self._resolve_environment(await self.get_profile(profile_id), requested)
+
+    async def get_adapter(
+        self, profile_id: str, environment: ProviderEnvironment | None = None
+    ) -> ProviderAdapterV1:
+        profile = await self.get_profile(profile_id)
+        resolved_environment = self._resolve_environment(profile, environment)
+        key = (profile_id, resolved_environment)
+        existing = self.adapters.get(key)
         if existing:
             return existing
-        lock = self.adapter_locks.setdefault(profile_id, asyncio.Lock())
+        lock = self.adapter_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            existing = self.adapters.get(profile_id)
+            existing = self.adapters.get(key)
             if existing:
                 return existing
-            profile = await self.get_profile(profile_id)
-            secret = self.secrets.get(f"profile:{profile_id}")
+            secret = self.profile_secrets.get(profile_id)
+            if secret is None:
+                stored_secret = self.secrets.get(f"profile:{profile_id}")
+                if isinstance(stored_secret, dict):
+                    secret = stored_secret
+                    self.profile_secrets[profile_id] = secret
             if profile.provider != "simulated" and not isinstance(secret, dict):
                 raise RouterError(
                     "PROFILE_SECRET_MISSING",
@@ -470,6 +547,7 @@ class TradingRuntime:
             adapter = adapter_type(
                 AdapterContext(
                     profile=profile,
+                    environment=resolved_environment,
                     secrets=secret if isinstance(secret, dict) else {},
                     connection_generation=1,
                     settings=profile.settings,
@@ -477,37 +555,67 @@ class TradingRuntime:
                         self.secrets.set(key, value)
                     ),
                     limiters=self.limiters,
+                    credential_lock=self.credential_locks.setdefault(
+                        profile_id, asyncio.Lock()
+                    ),
                 )
             )
-            self.adapters[profile_id] = adapter
+            self.adapters[key] = adapter
             return adapter
 
-    async def check_profile(self, profile_id: str) -> dict[str, Any]:
-        return await (await self.get_adapter(profile_id)).health_check()
+    async def check_profile(
+        self, profile_id: str, environment: ProviderEnvironment | None = None
+    ) -> dict[str, Any]:
+        profile = await self.get_profile(profile_id)
+        if profile.usage == CredentialUsage.SHARED and environment is None:
+            results = {}
+            for item in (ProviderEnvironment.LIVE, ProviderEnvironment.PAPER):
+                results[item.value] = await (
+                    await self.get_adapter(profile_id, item)
+                ).health_check()
+            return {"profile_id": profile_id, "environments": results, "ok": True}
+        return await (
+            await self.get_adapter(profile_id, environment)
+        ).health_check()
 
     async def search_instruments(
-        self, *, profile_id: str, query: str, limit: int = 20
+        self,
+        *,
+        profile_id: str,
+        query: str,
+        limit: int = 20,
+        environment: ProviderEnvironment | None = None,
     ) -> list[Instrument]:
-        adapter = await self.get_adapter(profile_id)
-        key = f"instrument:{profile_id}:{query}:{limit}"
+        adapter = await self.get_adapter(profile_id, environment)
+        key = f"instrument:{profile_id}:{adapter.context.environment.value}:{query}:{limit}"
         return await self.read_cache.get_or_create(
             key, lambda: adapter.search_instruments(query, limit=limit), ttl=30
         )
 
     async def quote(
-        self, *, profile_id: str, code: str, venue: MarketDataVenue
+        self,
+        *,
+        profile_id: str,
+        code: str,
+        venue: MarketDataVenue,
+        environment: ProviderEnvironment | None = None,
     ) -> Quote:
-        adapter = await self.get_adapter(profile_id)
-        key = f"quote:{profile_id}:{venue.value}:{code}"
+        adapter = await self.get_adapter(profile_id, environment)
+        key = f"quote:{profile_id}:{adapter.context.environment.value}:{venue.value}:{code}"
         return await self.read_cache.get_or_create(
             key, lambda: adapter.get_quote(code, venue), ttl=0.3
         )
 
     async def orderbook(
-        self, *, profile_id: str, code: str, venue: MarketDataVenue
+        self,
+        *,
+        profile_id: str,
+        code: str,
+        venue: MarketDataVenue,
+        environment: ProviderEnvironment | None = None,
     ) -> OrderBook:
-        adapter = await self.get_adapter(profile_id)
-        key = f"orderbook:{profile_id}:{venue.value}:{code}"
+        adapter = await self.get_adapter(profile_id, environment)
+        key = f"orderbook:{profile_id}:{adapter.context.environment.value}:{venue.value}:{code}"
         return await self.read_cache.get_or_create(
             key, lambda: adapter.get_orderbook(code, venue), ttl=0.3
         )
@@ -521,13 +629,14 @@ class TradingRuntime:
         count: int,
         venue: MarketDataVenue,
         until: date | None,
+        environment: ProviderEnvironment | None = None,
     ) -> list[Bar]:
-        adapter = await self.get_adapter(profile_id)
+        adapter = await self.get_adapter(profile_id, environment)
         if interval not in adapter.capabilities().bar_intervals:
             raise UnsupportedCapabilityError(
                 adapter.provider_id, f"market.bars.{interval}"
             )
-        key = f"bars:{profile_id}:{venue.value}:{code}:{interval}:{count}:{until}"
+        key = f"bars:{profile_id}:{adapter.context.environment.value}:{venue.value}:{code}:{interval}:{count}:{until}"
         return await self.read_cache.get_or_create(
             key,
             lambda: adapter.get_bars(
@@ -540,7 +649,7 @@ class TradingRuntime:
         self, account_alias: str
     ) -> tuple[AccountPublic, ProviderAdapterV1, str]:
         account = await self.store.get_account(account_alias)
-        adapter = await self.get_adapter(account.profile_id)
+        adapter = await self.get_adapter(account.profile_id, account.environment)
         number = await self.account_number(account_alias)
         return account, adapter, number
 
@@ -590,7 +699,7 @@ class TradingRuntime:
             raise RouterError(
                 "ACCOUNT_BINDING_MISMATCH", "Strategy is not bound to this account."
             )
-        account, adapter, number = await self.account_adapter(request.account_alias)
+        _account, adapter, number = await self.account_adapter(request.account_alias)
         self._validate_adapter_order(adapter, request)
         return await adapter.preview_order(
             number, self._provider_request(adapter, request)
@@ -627,8 +736,7 @@ class TradingRuntime:
                 status_code=409,
             )
         account, adapter, number = await self.account_adapter(request.account_alias)
-        profile = await self.get_profile(account.profile_id)
-        if profile.environment == ProviderEnvironment.LIVE and (
+        if account.environment == ProviderEnvironment.LIVE and (
             not account.armed or not strategy.armed
         ):
             raise RouterError(
@@ -919,29 +1027,50 @@ class TradingRuntime:
         return request.model_copy(update={"provider_options": namespaced})
 
     async def subscribe(
-        self, profile_id: str, subscriptions: list[StreamSubscription]
+        self,
+        profile_id: str,
+        subscriptions: list[StreamSubscription],
+        environment: ProviderEnvironment | None = None,
     ) -> SubscriptionClient:
-        adapter = await self.get_adapter(profile_id)
-        return self.subscriptions.subscribe(profile_id, adapter, subscriptions)
+        adapter = await self.get_adapter(profile_id, environment)
+        key = f"{profile_id}:{adapter.context.environment.value}"
+        return self.subscriptions.subscribe(key, adapter, subscriptions)
 
-    def unsubscribe(self, profile_id: str, client_id: str) -> None:
-        self.subscriptions.unsubscribe(profile_id, client_id)
+    def unsubscribe(
+        self,
+        profile_id: str,
+        client_id: str,
+        environment: ProviderEnvironment,
+    ) -> None:
+        self.subscriptions.unsubscribe(f"{profile_id}:{environment.value}", client_id)
 
     async def rankings(
-        self, *, profile_id: str, ranking: str, market: str = "ALL", limit: int = 20
+        self,
+        *,
+        profile_id: str,
+        ranking: str,
+        market: str = "ALL",
+        limit: int = 20,
+        environment: ProviderEnvironment | None = None,
     ) -> list[RankingItem]:
-        adapter = await self.get_adapter(profile_id)
+        adapter = await self.get_adapter(profile_id, environment)
         adapter.require(Capability.DISCOVERY_RANKINGS)
         return await adapter.rankings(ranking, market=market, limit=limit)
 
-    async def conditions(self, *, profile_id: str) -> list[ConditionDefinition]:
-        adapter = await self.get_adapter(profile_id)
+    async def conditions(
+        self, *, profile_id: str, environment: ProviderEnvironment | None = None
+    ) -> list[ConditionDefinition]:
+        adapter = await self.get_adapter(profile_id, environment)
         adapter.require(Capability.DISCOVERY_CONDITIONS)
         return await adapter.list_conditions()
 
     async def run_condition(
-        self, *, profile_id: str, condition_id: str
+        self,
+        *,
+        profile_id: str,
+        condition_id: str,
+        environment: ProviderEnvironment | None = None,
     ) -> list[Instrument]:
-        adapter = await self.get_adapter(profile_id)
+        adapter = await self.get_adapter(profile_id, environment)
         adapter.require(Capability.DISCOVERY_CONDITIONS)
         return await adapter.run_condition(condition_id)
