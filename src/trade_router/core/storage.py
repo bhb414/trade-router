@@ -174,7 +174,7 @@ class SQLiteStore:
                     provider,
                     (
                         ProviderEnvironment.LIVE
-                        if usage == CredentialUsage.SHARED
+                        if usage in {CredentialUsage.AUTO, CredentialUsage.SHARED}
                         else ProviderEnvironment(usage.value)
                     ).value,
                     usage.value,

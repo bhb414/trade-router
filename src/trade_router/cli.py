@@ -159,7 +159,7 @@ def status_alias() -> None:
 def profile_add(
     profile_id: str,
     provider: str = typer.Option(..., help="kis, namuh, or simulated"),
-    usage: CredentialUsage = typer.Option(CredentialUsage.PAPER),
+    usage: CredentialUsage = typer.Option(CredentialUsage.AUTO),
     display_name: str | None = typer.Option(None),
     settings: str = typer.Option("{}", help="Non-secret JSON settings"),
 ) -> None:

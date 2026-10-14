@@ -28,8 +28,9 @@ class ProviderEnvironment(str, Enum):
 
 
 class CredentialUsage(str, Enum):
-    """Trading environments in which one saved credential may be used."""
+    """How a saved broker credential selects its request environment."""
 
+    AUTO = "auto"
     LIVE = "live"
     PAPER = "paper"
     SHARED = "shared"

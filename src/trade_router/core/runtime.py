@@ -358,7 +358,7 @@ class TradingRuntime:
         capabilities = adapter_type.capabilities()
         requested_environments = (
             {ProviderEnvironment.LIVE, ProviderEnvironment.PAPER}
-            if usage == CredentialUsage.SHARED
+            if usage in {CredentialUsage.AUTO, CredentialUsage.SHARED}
             else {ProviderEnvironment(usage.value)}
         )
         if not requested_environments.issubset(capabilities.environments):
@@ -496,11 +496,11 @@ class TradingRuntime:
     def _resolve_environment(
         profile: ProfilePublic, requested: ProviderEnvironment | None
     ) -> ProviderEnvironment:
-        if profile.usage == CredentialUsage.SHARED:
+        if profile.usage in {CredentialUsage.AUTO, CredentialUsage.SHARED}:
             if requested is None:
                 raise RouterError(
                     "ENVIRONMENT_REQUIRED",
-                    "A shared credential profile requires a live or paper request environment.",
+                    "This broker connection requires a live or paper account type.",
                     status_code=422,
                 )
             return requested
@@ -567,6 +567,12 @@ class TradingRuntime:
         self, profile_id: str, environment: ProviderEnvironment | None = None
     ) -> dict[str, Any]:
         profile = await self.get_profile(profile_id)
+        if profile.usage == CredentialUsage.AUTO and environment is None:
+            raise RouterError(
+                "ENVIRONMENT_REQUIRED",
+                "Register an account type before checking this broker connection.",
+                status_code=422,
+            )
         if profile.usage == CredentialUsage.SHARED and environment is None:
             results = {}
             for item in (ProviderEnvironment.LIVE, ProviderEnvironment.PAPER):

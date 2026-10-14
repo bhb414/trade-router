@@ -31,7 +31,7 @@ class ProfileCreate(BaseModel):
         if self.usage is not None and legacy_usage is not None and self.usage != legacy_usage:
             raise ValueError("usage and legacy environment do not match")
         if self.usage is None:
-            self.usage = legacy_usage or CredentialUsage.PAPER
+            self.usage = legacy_usage or CredentialUsage.AUTO
         return self
 
 

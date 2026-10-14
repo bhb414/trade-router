@@ -72,7 +72,7 @@ asyncio.run(main())
 `TradeRouter` provides the same surface for synchronous scripts. The sync wrapper
 must not be invoked from an already-running asyncio event loop.
 
-## Credential usage and request environments
+## Broker connections and account type
 
 KIS uses its official live and virtual-trading hosts. NAMUH PLUG uses the official
 live host `api.nhplug.com:8443` and mock host `moapi.nhplug.com:8443`; OAuth tokens
@@ -82,10 +82,10 @@ can be selected through profile settings without exposing custom credential host
 environment-specific, or shared across a provider's supported environments. KIS
 reports environment-specific credentials; NAMUH reports provider-wide credentials.
 
-A profile records credential **usage**: `live`, `paper`, or `shared`. Accounts and
-strategies separately record the actual request **environment**. A NAMUH `shared`
-profile therefore stores one App Key and App Secret while a linked account or market
-data configuration explicitly selects `live` or `paper`.
+A profile defaults to `auto`, which defers live or paper routing to the linked account.
+Advanced CLI integrations may still restrict credentials to `live`, `paper`, or
+provider-wide `shared` use. Studio hides that internal distinction: users register a
+broker connection, then select whether each linked account is live or paper.
 
 Actual live orders are never executed by the test suite.
 
@@ -100,10 +100,10 @@ The CLI prompts for secrets without echoing them. They are written only to the
 current Windows user's DPAPI vault.
 
 ```powershell
-trade-router profile add kis-main --provider kis --usage live
+trade-router profile add kis-main --provider kis
 trade-router account add kis-account --profile kis-main --environment live
 
-trade-router profile add nh-main --provider namuh --usage shared
+trade-router profile add nh-main --provider namuh
 trade-router account add nh-paper-account --profile nh-main --environment paper
 ```
 

@@ -61,6 +61,50 @@ async def test_shared_credentials_are_one_profile_with_explicit_request_environm
         await runtime.close()
 
 
+async def test_automatic_credentials_follow_the_account_environment(
+    paths: RouterPaths,
+):
+    runtime = TradingRuntime(paths=paths, secret_store=MemorySecretStore())
+    await runtime.start()
+    try:
+        profile = await runtime.add_profile(
+            profile_id="kis-main",
+            provider="kis",
+            usage=CredentialUsage.AUTO,
+            credentials={"app_key": "key", "app_secret": "secret"},
+        )
+        assert profile.usage == CredentialUsage.AUTO
+
+        with pytest.raises(RouterError) as missing:
+            await runtime.get_adapter("kis-main")
+        assert missing.value.code == "ENVIRONMENT_REQUIRED"
+
+        paper = await runtime.add_account(
+            alias="kis-paper",
+            profile_id="kis-main",
+            environment=ProviderEnvironment.PAPER,
+            account_number="12345678-01",
+            risk=RiskLimits(),
+        )
+        live = await runtime.add_account(
+            alias="kis-live",
+            profile_id="kis-main",
+            environment=ProviderEnvironment.LIVE,
+            account_number="12345678-01",
+            risk=RiskLimits(),
+        )
+        assert paper.environment == ProviderEnvironment.PAPER
+        assert live.environment == ProviderEnvironment.LIVE
+        assert (await runtime.get_adapter("kis-main", paper.environment)).base_url == (
+            "https://openapivts.koreainvestment.com:29443"
+        )
+        assert (await runtime.get_adapter("kis-main", live.environment)).base_url == (
+            "https://openapi.koreainvestment.com:9443"
+        )
+    finally:
+        await runtime.close()
+
+
 async def test_v1_environment_columns_migrate_to_usage_and_request_environment(
     paths: RouterPaths,
 ):
