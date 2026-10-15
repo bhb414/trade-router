@@ -100,7 +100,7 @@
       <div class="strategy-view" id="strategy-view" hidden>
         <div class="editor-toolbar">
           <div class="file-title">
-            <span class="python-badge">PY</span>
+            <span class="python-badge" id="strategy-kind-badge">PY</span>
             <strong id="file-name">전략을 선택하세요</strong>
             <span class="dirty" id="dirty-mark" hidden>저장 안 됨</span>
           </div>
@@ -130,8 +130,8 @@
         </div>
         <nav class="strategy-tabs" aria-label="전략 화면">
           <button class="strategy-tab active" type="button" data-strategy-tab="overview">개요</button>
-          <button class="strategy-tab" type="button" data-strategy-tab="blocks">블록</button>
-          <button class="strategy-tab" type="button" data-strategy-tab="code">코드</button>
+          <button class="strategy-tab" id="strategy-block-tab" type="button" data-strategy-tab="blocks" hidden>블록</button>
+          <button class="strategy-tab" id="strategy-code-tab" type="button" data-strategy-tab="code">코드</button>
         </nav>
         <section class="strategy-overview" id="strategy-overview">
           <div class="strategy-overview-grid">
@@ -178,20 +178,19 @@
             <div>
               <span class="eyebrow">STRUCTURED STRATEGY</span>
               <h3>블록 편집</h3>
-              <p>연결·대상·위험 한도·일정을 블록으로 보고 값을 바꾸면 Python 코드에 바로 반영됩니다.</p>
+              <p>제공된 연결·대상·위험 한도·일정 블록을 조합하고 값을 설정합니다.</p>
             </div>
             <div class="block-editor-actions">
               <span id="block-editor-summary">분석 전</span>
-              <button class="button quiet compact" id="block-code-jump" type="button">코드에서 전체 편집</button>
             </div>
           </header>
           <div class="block-editor-notice" id="block-editor-notice">
-            직접 작성한 함수와 예외 처리 코드는 그대로 보존합니다. 블록으로 표현할 수 없는 로직은 이벤트 블록에서 코드 위치를 열어 편집할 수 있습니다.
+            블록 전략은 이 화면에서 제공하는 블록과 필드만 편집할 수 있습니다. 실행용 코드는 Trade Router가 자동으로 관리합니다.
           </div>
           <div class="block-canvas" id="block-canvas" aria-live="polite"></div>
           <footer class="block-editor-status">
             <span>블록 변경은 아직 초안입니다. 상단의 저장을 눌러 파일에 반영하세요.</span>
-            <span>Python 원본 보존</span>
+            <span>실행 코드 자동 관리</span>
           </footer>
         </section>
         <section class="strategy-code" id="strategy-code" hidden>
@@ -235,9 +234,22 @@
         <button class="modal-close" id="new-strategy-close" type="button" aria-label="새 전략 창 닫기">×</button>
       </header>
       <form class="new-strategy-modal-form" id="new-strategy-form">
+        <fieldset class="strategy-type-picker">
+          <legend>전략 종류</legend>
+          <label class="strategy-type-option">
+            <input type="radio" name="strategy-type" value="script" checked>
+            <span class="strategy-type-icon">PY</span>
+            <span><strong>스크립트</strong><small>Python 코드를 직접 작성하는 전략</small></span>
+          </label>
+          <label class="strategy-type-option">
+            <input type="radio" name="strategy-type" value="block">
+            <span class="strategy-type-icon blocks">▦</span>
+            <span><strong>블록</strong><small>제공된 블록과 필드로만 구성하는 전략</small></span>
+          </label>
+        </fieldset>
         <label for="new-strategy-name">전략명</label>
         <input id="new-strategy-name" autocomplete="off" placeholder="예: 볼린저 돌파" required>
-        <small>화면에는 전략명만 표시되며 파일 확장자는 자동으로 관리합니다.</small>
+        <small>전략 종류는 생성한 뒤 변경할 수 없습니다. 파일 확장자는 자동으로 관리합니다.</small>
         <div class="modal-form-actions">
           <button class="button quiet" id="new-strategy-cancel" type="button">취소</button>
           <button class="button primary" type="submit">생성</button>

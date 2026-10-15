@@ -9,6 +9,7 @@ from decimal import Decimal
 import os
 from pathlib import Path
 import time
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -47,6 +48,7 @@ from .updates import check_for_update, prepare_update
 
 class StrategySource(BaseModel):
     source: str
+    strategy_type: Literal["script", "block"] | None = None
 
 
 class ConnectionRegistration(BaseModel):
@@ -2762,7 +2764,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     @app.put("/api/strategies/{name}")
     async def save_strategy(name: str, body: StrategySource) -> dict[str, object]:
         try:
-            return await manager.save(name, body.source)
+            return await manager.save(
+                name,
+                body.source,
+                strategy_type=body.strategy_type,
+            )
         except StrategyNameError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:

@@ -111,6 +111,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         page = client.get("/")
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text
+        assert 'name="strategy-type" value="script"' in page.text
+        assert 'name="strategy-type" value="block"' in page.text
         assert status.json()["instance_id"]
         assert status.json()["instance_started_at"]
         assert status.json()["strategy_count"] == 2
@@ -127,6 +129,32 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert created.status_code == 200
         loaded = client.get("/api/strategies/my_strategy.py")
         assert loaded.json()["source"] == "print('ready')\n"
+        assert loaded.json()["strategy_type"] == "script"
+
+        block_created = client.put(
+            "/api/strategies/my_blocks.py",
+            json={
+                "source": "print('managed blocks')\n",
+                "strategy_type": "block",
+            },
+        )
+        assert block_created.status_code == 200
+        assert block_created.json()["strategy_type"] == "block"
+        block_loaded = client.get("/api/strategies/my_blocks.py")
+        assert block_loaded.json()["strategy_type"] == "block"
+        assert (
+            app.state.workspace.strategies / "my_blocks.strategy.json"
+        ).is_file()
+        type_change = client.put(
+            "/api/strategies/my_blocks.py",
+            json={"source": "print('changed')\n", "strategy_type": "script"},
+        )
+        assert type_change.status_code == 409
+        deleted = client.delete("/api/strategies/my_blocks.py")
+        assert deleted.status_code == 204
+        assert not (
+            app.state.workspace.strategies / "my_blocks.strategy.json"
+        ).exists()
 
         restart = client.post("/api/system/restart")
         shutdown = client.post("/api/system/shutdown")

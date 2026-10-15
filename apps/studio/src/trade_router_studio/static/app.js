@@ -1,6 +1,7 @@
 const state = {
   view: "dashboard",
   selected: null,
+  strategyType: "script",
   strategyTab: "overview",
   blockSource: null,
   strategySearch: "",
@@ -43,6 +44,9 @@ const elements = {
   editor: document.querySelector("#source-editor"),
   lines: document.querySelector("#line-numbers"),
   fileName: document.querySelector("#file-name"),
+  strategyKindBadge: document.querySelector("#strategy-kind-badge"),
+  blockTab: document.querySelector("#strategy-block-tab"),
+  codeTab: document.querySelector("#strategy-code-tab"),
   dirty: document.querySelector("#dirty-mark"),
   save: document.querySelector("#save-button"),
   run: document.querySelector("#run-button"),
@@ -610,6 +614,7 @@ async function refreshStrategySummary() {
 }
 
 const BLOCK_CONSTANT_META = {
+  STRATEGY_ID: ["general", "전략 ID"],
   TRADING_ACCOUNT: ["connection", "거래 계좌"],
   MARKET_SOURCE: ["connection", "시세 연결"],
   CONDITION_SOURCE: ["connection", "조건검색 연결"],
@@ -624,6 +629,8 @@ const BLOCK_CONSTANT_META = {
   MAX_NEW_BUYS_PER_SCAN: ["risk", "조회당 신규 매수 수"],
   BOLLINGER_PERIOD: ["risk", "볼린저 기간"],
   BOLLINGER_STDDEV: ["risk", "볼린저 표준편차"],
+  BAR_INTERVAL: ["schedule", "봉 주기"],
+  BAR_COUNT: ["risk", "조회 봉 수"],
   TAKE_PROFIT_MULTIPLIER: ["risk", "익절 배수"],
   STOP_LOSS_MULTIPLIER: ["risk", "손절 배수"],
 };
@@ -895,24 +902,13 @@ function formatBlockFieldValue(field, value) {
   return JSON.stringify(String(value));
 }
 
-function jumpToCode(line = 1) {
-  setStrategyTab("code");
-  const lines = elements.editor.value.split("\n");
-  const position = lines.slice(0, Math.max(0, line - 1)).reduce((total, item) => total + item.length + 1, 0);
-  elements.editor.focus();
-  elements.editor.setSelectionRange(position, position);
-  const lineHeight = Number.parseFloat(getComputedStyle(elements.editor).lineHeight) || 21;
-  elements.editor.scrollTop = Math.max(0, (line - 3) * lineHeight);
-  elements.lines.scrollTop = elements.editor.scrollTop;
-}
-
 function applyBlockFieldEdit(fieldId, value) {
   const parsed = parseStrategyBlocks(elements.editor.value);
   const field = [
     ...parsed.fields,
     ...parsed.schedules.flatMap(schedule => schedule.fields),
   ].find(item => item.id === fieldId);
-  if (!field) throw new Error("코드가 변경되어 블록 위치를 다시 찾지 못했습니다. 블록 탭을 다시 열어주세요.");
+  if (!field) throw new Error("블록 구성이 변경되어 필드 위치를 찾지 못했습니다. 블록 화면을 다시 열어주세요.");
   const replacement = formatBlockFieldValue(field, value);
   elements.editor.value = `${elements.editor.value.slice(0, field.start)}${replacement}${elements.editor.value.slice(field.end)}`;
   elements.editor.dispatchEvent(new Event("input"));
@@ -956,7 +952,7 @@ function createBlockFieldControl(field, disabled) {
   return row;
 }
 
-function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [], line }, disabled) {
+function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [] }, disabled) {
   const node = document.createElement("article");
   node.className = `strategy-block-node ${tone}`;
   const heading = document.createElement("div");
@@ -989,14 +985,6 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [],
       flow.append(step);
     });
     node.append(flow);
-  }
-  if (line) {
-    const location = document.createElement("button");
-    location.className = "block-code-location";
-    location.type = "button";
-    location.innerText = `Python 코드 ${line}행 열기  →`;
-    location.addEventListener("click", () => jumpToCode(line));
-    node.append(location);
   }
   return node;
 }
@@ -1031,7 +1019,7 @@ function renderStrategyBlocks() {
   if (!parsed.fields.length && !parsed.schedules.length && !parsed.handlers.length) {
     const empty = document.createElement("div");
     empty.className = "block-empty";
-    empty.textContent = "블록으로 표시할 Strategy 설정이나 이벤트 함수를 찾지 못했습니다.\n코드 탭에서 Strategy 클래스를 작성하면 이곳에 자동으로 나타납니다.";
+    empty.textContent = "표시할 수 있는 블록이 없습니다.\n새 블록 전략을 만들거나 제공되는 설정 블록을 추가해 주세요.";
     elements.blockCanvas.append(empty);
     return;
   }
@@ -1041,7 +1029,7 @@ function renderStrategyBlocks() {
     if (!groups.has(field.category)) groups.set(field.category, []);
     groups.get(field.category).push(field);
   });
-  const settingLane = createBlockLane("설정 블록", "Python 상수와 StrategyConfig의 값을 편집합니다.", parsed.fields.length);
+  const settingLane = createBlockLane("설정 블록", "전략 연결과 실행에 필요한 값을 편집합니다.", parsed.fields.length);
   for (const category of ["connection", "target", "risk", "schedule", "general"]) {
     const categoryFields = groups.get(category);
     if (!categoryFields?.length) continue;
@@ -1052,7 +1040,6 @@ function renderStrategyBlocks() {
       tone: category,
       fields: categoryFields,
       actions: category === "general" ? [description] : [],
-      line: Math.min(...categoryFields.map(field => field.line || 1)),
     }, running));
   }
   elements.blockCanvas.append(settingLane);
@@ -1064,7 +1051,6 @@ function renderStrategyBlocks() {
       meta: schedule.method,
       tone: "schedule",
       fields: schedule.fields,
-      line: schedule.line,
     }, running));
   });
   if (!parsed.schedules.length) {
@@ -1072,14 +1058,13 @@ function renderStrategyBlocks() {
       title: "등록된 일정 없음",
       meta: "on_start",
       tone: "schedule",
-      actions: ["코드에서 ctx.scheduler 일정을 등록하세요"],
-      line: parsed.handlers.find(item => item.name === "on_start")?.line,
+      actions: ["일정 블록을 추가해 주세요"],
     }, running));
   }
   elements.blockCanvas.append(scheduleLane);
 
   if (parsed.handlers.length) {
-    const eventLane = createBlockLane("이벤트 흐름", "사용자 Python 로직은 보존하며 주요 서비스 호출 순서만 요약합니다.", parsed.handlers.length, "events");
+    const eventLane = createBlockLane("이벤트 흐름", "제공된 블록이 실행되는 순서를 보여줍니다.", parsed.handlers.length, "events");
     const eventGrid = document.createElement("div");
     eventGrid.className = "block-event-grid";
     parsed.handlers.forEach(handler => {
@@ -1088,7 +1073,6 @@ function renderStrategyBlocks() {
         meta: handler.name,
         tone: "event",
         actions: handler.actions,
-        line: handler.line,
       }, running));
     });
     eventLane.append(eventGrid);
@@ -1097,6 +1081,10 @@ function renderStrategyBlocks() {
 }
 
 function setStrategyTab(tab) {
+  const allowed = state.strategyType === "block"
+    ? new Set(["overview", "blocks"])
+    : new Set(["overview", "code"]);
+  if (!allowed.has(tab)) tab = state.strategyType === "block" ? "blocks" : "code";
   state.strategyTab = tab;
   document.querySelectorAll("[data-strategy-tab]").forEach(button => {
     button.classList.toggle("active", button.dataset.strategyTab === tab);
@@ -1112,6 +1100,18 @@ function setStrategyTab(tab) {
   }
 }
 
+function configureStrategyTabs() {
+  const isBlock = state.strategyType === "block";
+  elements.blockTab.hidden = !isBlock;
+  elements.codeTab.hidden = isBlock;
+  elements.strategyKindBadge.textContent = isBlock ? "BLK" : "PY";
+  elements.strategyKindBadge.classList.toggle("block", isBlock);
+  elements.editor.setAttribute(
+    "aria-label",
+    isBlock ? "블록 전략 자동 생성 코드" : "Python 전략 코드",
+  );
+}
+
 function showWorkspaceView(view) {
   state.view = view;
   elements.dashboardView.hidden = view !== "dashboard";
@@ -1122,7 +1122,7 @@ function showWorkspaceView(view) {
 function updateControls() {
   const selected = state.view === "strategy" && Boolean(state.selected);
   const running = Boolean(selectedState()?.running);
-  elements.editor.disabled = !selected || running;
+  elements.editor.disabled = !selected || running || state.strategyType === "block";
   document.querySelectorAll(".block-field-control").forEach(control => {
     control.disabled = !selected || running;
   });
@@ -1165,11 +1165,13 @@ function renderStrategies() {
     name.textContent = displayStrategyName(strategy.name);
     const meta = document.createElement("span");
     meta.className = "strategy-meta";
-    meta.textContent = strategy.running
+    const typeLabel = strategy.strategy_type === "block" ? "블록" : "스크립트";
+    const runtimeLabel = strategy.running
       ? "실행 중"
       : strategy.stop_requested
         ? "사용자 중지"
         : strategy.exit_code == null ? "중지됨" : `종료 코드 ${strategy.exit_code}`;
+    meta.textContent = `${typeLabel} · ${runtimeLabel}`;
     text.append(name, meta);
     button.append(indicator, text);
     button.addEventListener("click", () => openStrategy(strategy.name));
@@ -1195,14 +1197,16 @@ async function openStrategy(name) {
   if (state.dirty && !window.confirm("저장하지 않은 변경 사항이 있습니다. 저장하지 않고 다른 전략을 열까요?")) return;
   const payload = await api(`/api/strategies/${encodeURIComponent(name)}`);
   state.selected = name;
+  state.strategyType = payload.strategy_type === "block" ? "block" : "script";
   state.strategySummary = null;
   showWorkspaceView("strategy");
   elements.fileName.textContent = displayStrategyName(name);
+  configureStrategyTabs();
   elements.editor.value = payload.source;
   state.blockSource = null;
   setDirty(false);
   updateLineNumbers();
-  setStrategyTab("overview");
+  setStrategyTab(state.strategyType === "block" ? "blocks" : "overview");
   state.logCursor = 0;
   resetActivity();
   await refreshStrategies();
@@ -1217,6 +1221,7 @@ async function openDashboard() {
   }
   if (state.dirty && !window.confirm("저장하지 않은 변경 사항이 있습니다. 저장하지 않고 대시보드로 이동할까요?")) return;
   state.selected = null;
+  state.strategyType = "script";
   state.strategyPermission = null;
   state.strategySummary = null;
   showWorkspaceView("dashboard");
@@ -1255,7 +1260,10 @@ async function saveStrategy() {
   if (!state.selected) return;
   await api(`/api/strategies/${encodeURIComponent(state.selected)}`, {
     method: "PUT",
-    body: JSON.stringify({ source: elements.editor.value }),
+    body: JSON.stringify({
+      source: elements.editor.value,
+      strategy_type: state.strategyType,
+    }),
   });
   setDirty(false);
   notify("전략을 저장했습니다.");
@@ -1843,32 +1851,8 @@ elements.editor.addEventListener("keydown", event => {
   }
 });
 
-function openNewStrategyModal() {
-  elements.newStrategyModal.hidden = false;
-  const input = document.querySelector("#new-strategy-name");
-  input.value = "";
-  window.setTimeout(() => input.focus(), 0);
-}
-
-function closeNewStrategyModal() {
-  elements.newStrategyModal.hidden = true;
-}
-
-document.querySelector("#new-strategy-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  const input = document.querySelector("#new-strategy-name");
-  const displayName = input.value.trim().replace(/\.py$/i, "");
-  if (!displayName) return;
-  const name = `${displayName}.py`;
-  const strategyId = displayName
-    .normalize("NFKC")
-    .toLocaleLowerCase("ko-KR")
-    .replace(/[^\p{L}\p{N}_-]+/gu, "-")
-    .replace(/^-+|-+$/g, "") || `strategy-${Date.now()}`;
-  try {
-    await api(`/api/strategies/${encodeURIComponent(name)}`, {
-      method: "PUT",
-      body: JSON.stringify({ source: `"""Trade Router 자동매매 전략"""
+function scriptStrategyTemplate(strategyId) {
+  return `"""Trade Router 자동매매 전략"""
 
 from trade_router import Strategy, StrategyConfig
 
@@ -1896,7 +1880,85 @@ class NewStrategy(Strategy):
 
     async def on_stop(self, ctx):
         ctx.log.info("전략을 종료합니다.")
-` }),
+`;
+}
+
+function blockStrategyTemplate(strategyId) {
+  return `"""Trade Router가 관리하는 블록 전략 실행 파일"""
+
+from trade_router import Strategy, StrategyConfig
+
+
+STRATEGY_ID = "${strategyId}"
+TRADING_ACCOUNT = "등록한 계좌 별칭"
+MARKET_SOURCE = "등록한 API 연결 이름"
+SYMBOL = "005930"
+BAR_INTERVAL = "3m"
+BAR_COUNT = 55
+
+
+class ManagedBlockStrategy(Strategy):
+    config = StrategyConfig(
+        id=STRATEGY_ID,
+        trading_account=TRADING_ACCOUNT,
+        market_sources={"primary": MARKET_SOURCE},
+        required_capabilities={"primary": ("quotes", "bars")},
+    )
+
+    async def on_start(self, ctx):
+        ctx.scheduler.on_bar_close(
+            BAR_INTERVAL,
+            schedule_id="regular-bars",
+            between=("09:00", "15:20"),
+        )
+        ctx.log.info("블록 전략을 시작했습니다.")
+
+    async def on_bar(self, ctx, event):
+        bars = await ctx.market.bars(SYMBOL, BAR_INTERVAL, count=BAR_COUNT)
+        if bars:
+            ctx.log.info(f"완성 봉 {len(bars)}개 · 최근 종가 {bars[-1].close}")
+
+    async def on_stop(self, ctx):
+        ctx.log.info("블록 전략을 종료합니다.")
+`;
+}
+
+function openNewStrategyModal() {
+  elements.newStrategyModal.hidden = false;
+  const input = document.querySelector("#new-strategy-name");
+  input.value = "";
+  const scriptType = document.querySelector('input[name="strategy-type"][value="script"]');
+  if (scriptType) scriptType.checked = true;
+  window.setTimeout(() => input.focus(), 0);
+}
+
+function closeNewStrategyModal() {
+  elements.newStrategyModal.hidden = true;
+}
+
+document.querySelector("#new-strategy-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const input = document.querySelector("#new-strategy-name");
+  const strategyType = document.querySelector('input[name="strategy-type"]:checked')?.value === "block"
+    ? "block"
+    : "script";
+  const displayName = input.value.trim().replace(/\.py$/i, "");
+  if (!displayName) return;
+  const name = `${displayName}.py`;
+  const strategyId = displayName
+    .normalize("NFKC")
+    .toLocaleLowerCase("ko-KR")
+    .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+    .replace(/^-+|-+$/g, "") || `strategy-${Date.now()}`;
+  try {
+    await api(`/api/strategies/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        strategy_type: strategyType,
+        source: strategyType === "block"
+          ? blockStrategyTemplate(strategyId)
+          : scriptStrategyTemplate(strategyId),
+      }),
     });
     closeNewStrategyModal();
     await refreshStrategies();
@@ -1933,7 +1995,6 @@ elements.newStrategyModal.addEventListener("click", event => {
 document.querySelectorAll("[data-strategy-tab]").forEach(button => {
   button.addEventListener("click", () => setStrategyTab(button.dataset.strategyTab));
 });
-document.querySelector("#block-code-jump").addEventListener("click", () => jumpToCode(1));
 
 elements.save.addEventListener("click", () => saveStrategy().catch(error => notify(error.message, true)));
 elements.run.addEventListener("click", () => runStrategy().catch(error => notify(error.message, true)));

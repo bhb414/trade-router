@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import json
 import os
 import re
 import sys
@@ -18,6 +19,7 @@ from .sessions import StrategySessionRegistry
 
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_LOG_LINES = 1_000
+STRATEGY_TYPES = {"script", "block"}
 _SAFE_NAME = re.compile(r"^[^\\/:*?\"<>|\x00-\x1f]+\.py$", re.IGNORECASE)
 
 
@@ -108,7 +110,23 @@ class StrategyManager:
             raise FileNotFoundError(name)
         return path.read_text(encoding="utf-8")
 
-    async def save(self, name: str, source: str) -> dict[str, Any]:
+    def strategy_type(self, name: str) -> str:
+        path = self.resolve(name)
+        metadata_path = path.with_suffix(".strategy.json")
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return "script"
+        strategy_type = payload.get("type") if isinstance(payload, dict) else None
+        return strategy_type if strategy_type in STRATEGY_TYPES else "script"
+
+    async def save(
+        self,
+        name: str,
+        source: str,
+        *,
+        strategy_type: str | None = None,
+    ) -> dict[str, Any]:
         encoded = source.encode("utf-8")
         if len(encoded) > MAX_SOURCE_BYTES:
             raise ValueError("Strategy source exceeds 512 KiB.")
@@ -116,9 +134,28 @@ class StrategyManager:
         state = self._states.get(name)
         if state and state.running:
             raise RuntimeError("Stop the strategy before saving it.")
+        existing_type = self.strategy_type(name)
+        requested_type = strategy_type or existing_type
+        if requested_type not in STRATEGY_TYPES:
+            raise ValueError("Strategy type must be script or block.")
+        if path.exists() and strategy_type is not None and requested_type != existing_type:
+            raise RuntimeError("An existing strategy type cannot be changed.")
         temporary = path.with_suffix(".py.tmp")
         temporary.write_bytes(encoded)
         temporary.replace(path)
+        if strategy_type is not None:
+            metadata_path = path.with_suffix(".strategy.json")
+            metadata_temporary = metadata_path.with_suffix(".json.tmp")
+            metadata_temporary.write_text(
+                json.dumps(
+                    {"format": 1, "type": requested_type},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            metadata_temporary.replace(metadata_path)
         return self._describe(name, state)
 
     async def delete(self, name: str) -> None:
@@ -127,6 +164,7 @@ class StrategyManager:
         if state and state.running:
             raise RuntimeError("Stop the strategy before deleting it.")
         path.unlink(missing_ok=True)
+        path.with_suffix(".strategy.json").unlink(missing_ok=True)
         self._states.pop(name, None)
 
     async def start(self, name: str) -> dict[str, Any]:
@@ -296,12 +334,13 @@ class StrategyManager:
             return "error", line
         return "output", line
 
-    @staticmethod
     def _describe(
+        self,
         name: str, state: StrategyProcess | None
     ) -> dict[str, Any]:
         return {
             "name": name,
+            "strategy_type": self.strategy_type(name),
             "running": bool(state and state.running),
             "started_at": state.started_at.isoformat() if state and state.started_at else None,
             "stopped_at": state.stopped_at.isoformat() if state and state.stopped_at else None,
