@@ -48,10 +48,56 @@ function Find-PendingUpdatePath {
         }
     }
 
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return [System.IO.Path]::GetFullPath($candidate)
+    $installedVersion = $null
+    $installedManifestPath = Join-Path $ProjectRoot "release-manifest.json"
+    if (Test-Path -LiteralPath $installedManifestPath -PathType Leaf) {
+        try {
+            $installedManifest = Get-Content -Raw -LiteralPath $installedManifestPath -Encoding utf8 |
+                ConvertFrom-Json
+            $installedVersion = [version]([string]$installedManifest.version)
+        } catch {
+            $installedVersion = $null
         }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            continue
+        }
+        $candidateFull = [System.IO.Path]::GetFullPath($candidate)
+        try {
+            $candidatePending = Get-Content -Raw -LiteralPath $candidateFull -Encoding utf8 |
+                ConvertFrom-Json
+            $candidateInstallRoot = [System.IO.Path]::GetFullPath(
+                [string]$candidatePending.install_root
+            )
+        } catch {
+            if ($candidateFull.StartsWith(
+                ([System.IO.Path]::GetFullPath($InstallUpdatesRoot).TrimEnd('\') + '\'),
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                return $candidateFull
+            }
+            continue
+        }
+        if (-not $candidateInstallRoot.Equals(
+            $ProjectRoot,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            continue
+        }
+        if ($null -ne $installedVersion) {
+            try {
+                $pendingVersion = [version]([string]$candidatePending.version)
+                if ($pendingVersion -le $installedVersion) {
+                    Remove-Item -LiteralPath $candidateFull -Force
+                    continue
+                }
+            } catch {
+                return $candidateFull
+            }
+        }
+        return $candidateFull
     }
     return $null
 }

@@ -257,6 +257,110 @@ def test_launcher_finds_a_store_python_legacy_pending_update(tmp_path: Path) -> 
     assert not pending_path.exists()
 
 
+def test_launcher_ignores_store_pending_for_another_install(tmp_path: Path) -> None:
+    source_launcher = Path(__file__).parents[1] / "tools" / "run.ps1"
+    install = tmp_path / "new-install"
+    tools = install / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(source_launcher, tools / "run.ps1")
+    (install / "run.cmd").write_text("new install", encoding="utf-8")
+    (install / "pyproject.toml").write_text("new install", encoding="utf-8")
+
+    local_app_data = tmp_path / "local-app-data"
+    updates_root = (
+        local_app_data
+        / "Packages"
+        / "PythonSoftwareFoundation.Python.3.12_test"
+        / "LocalCache"
+        / "Local"
+        / "TradeRouter"
+        / "updates"
+    )
+    updates_root.mkdir(parents=True)
+    pending_path = updates_root / "pending-update.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "version": "0.2.0",
+                "install_root": str(tmp_path / "old-install"),
+                "payload_root": str(updates_root / "missing-payload"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    environment = os.environ.copy()
+    environment["LOCALAPPDATA"] = str(local_app_data)
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(tools / "run.ps1"),
+            "-ApplyUpdateOnly",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (install / "run.cmd").read_text(encoding="utf-8") == "new install"
+    assert pending_path.exists()
+
+
+def test_launcher_discards_an_older_pending_version(tmp_path: Path) -> None:
+    source_launcher = Path(__file__).parents[1] / "tools" / "run.ps1"
+    install = tmp_path / "install"
+    tools = install / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(source_launcher, tools / "run.ps1")
+    (install / "run.cmd").write_text("current", encoding="utf-8")
+    (install / "pyproject.toml").write_text("current", encoding="utf-8")
+    (install / "release-manifest.json").write_text(
+        json.dumps({"version": "0.3.0"}), encoding="utf-8"
+    )
+    updates_root = install / ".trade-router-updates"
+    updates_root.mkdir()
+    pending_path = updates_root / "pending-update.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "version": "0.2.0",
+                "install_root": str(install),
+                "payload_root": str(updates_root / "missing-payload"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(tools / "run.ps1"),
+            "-ApplyUpdateOnly",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (install / "run.cmd").read_text(encoding="utf-8") == "current"
+    assert not pending_path.exists()
+
+
 def test_launcher_finds_python_when_py_launcher_is_unavailable(tmp_path: Path) -> None:
     source_launcher = Path(__file__).parents[1] / "tools" / "run.ps1"
     project = tmp_path / "project"
