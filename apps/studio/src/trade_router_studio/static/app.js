@@ -1269,7 +1269,7 @@ function blockFieldOptions(field) {
     ];
   }
   if (field.settingKey === "bar_interval") {
-    return ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d", "1w"]
+    return ["1m", "3m", "5m", "10m", "15m", "30m", "60m", "120m"]
       .map(value => ({ value, label: value }));
   }
   return null;
@@ -1487,14 +1487,17 @@ function createConditionEditor(kind, disabled) {
   const wrap = document.createElement("div");
   wrap.className = "block-condition-editor";
   const rows = state.blockPackage?.settings?.[`${kind}_conditions`] || [];
-  const rightMetrics = [...BLOCK_CONDITION_METRICS, ["value", "직접 값"]];
+  const metrics = kind === "buy"
+    ? BLOCK_CONDITION_METRICS.filter(([key]) => !["average_price", "profit_rate"].includes(key))
+    : BLOCK_CONDITION_METRICS;
+  const rightMetrics = [...metrics, ["value", "직접 값"]];
   rows.forEach((condition, index) => {
     const row = document.createElement("div");
     row.className = "block-condition-row";
     const top = document.createElement("div");
     top.className = "block-condition-expression";
     top.append(
-      conditionSelect(BLOCK_CONDITION_METRICS, condition.left, disabled, value => updateBlockCondition(kind, index, "left", value)),
+      conditionSelect(metrics, condition.left, disabled, value => updateBlockCondition(kind, index, "left", value)),
       conditionSelect(BLOCK_CONDITION_OPERATORS, condition.operator, disabled, value => updateBlockCondition(kind, index, "operator", value)),
       conditionSelect(rightMetrics, condition.right, disabled, value => updateBlockCondition(kind, index, "right", value)),
     );

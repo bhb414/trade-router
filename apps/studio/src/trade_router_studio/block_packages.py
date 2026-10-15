@@ -109,7 +109,7 @@ class ConditionBollingerBlockSettings(BaseModel):
     buy_scan_seconds: int = Field(ge=1, le=86_400)
     buy_start_time: str
     buy_end_time: str
-    bar_interval: str = Field(pattern=r"^[1-9]\d*[smhdw]$", max_length=16)
+    bar_interval: str = Field(max_length=16)
     sell_start_time: str
     sell_end_time: str
     close_time: str
@@ -122,6 +122,19 @@ class ConditionBollingerBlockSettings(BaseModel):
         "buy_start_time", "buy_end_time", "sell_start_time", "sell_end_time",
         "close_time", "close_retry_start", "close_retry_end", "close_confirm_time",
     )(_validate_clock)
+
+    @field_validator("bar_interval")
+    @classmethod
+    def validate_bar_interval(cls, value: str) -> str:
+        candidate = value.strip().lower()
+        if candidate == "1h":
+            candidate = "60m"
+        if not candidate.endswith("m") or not candidate[:-1].isdigit():
+            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉까지 지원합니다.")
+        minutes = int(candidate[:-1])
+        if not 1 <= minutes <= 120:
+            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉까지 지원합니다.")
+        return f"{minutes}m"
 
     @model_validator(mode="after")
     def validate_limits(self) -> "ConditionBollingerBlockSettings":
@@ -142,8 +155,32 @@ class ConditionBollingerBlockSettings(BaseModel):
         self.symbols = list(dict.fromkeys(code.strip().upper() for code in self.symbols if code.strip()))
         if self.target_source == "SYMBOLS" and not self.symbols:
             raise ValueError("At least one symbol is required for a symbol-list source.")
+        position_only_metrics = {"average_price", "profit_rate"}
+        for condition in self.buy_conditions:
+            if condition.left in position_only_metrics or condition.right in position_only_metrics:
+                raise ValueError(
+                    "매수 조건에서는 보유 후에만 생기는 평균 매수가·수익률을 사용할 수 없습니다."
+                )
         if not self.sell_conditions:
             raise ValueError("At least one sell condition must be configured.")
+        required_bars = 1
+        for condition in (*self.buy_conditions, *self.sell_conditions):
+            offset = max(condition.left_offset, condition.right_offset)
+            if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
+                offset += 1
+            uses_bollinger = condition.left.startswith("bollinger_") or condition.right.startswith("bollinger_")
+            required_bars = max(
+                required_bars,
+                offset + (self.bollinger_period if uses_bollinger else 1),
+            )
+        interval_minutes = int(self.bar_interval[:-1])
+        # The KIS minute-history adapter deliberately performs at most twelve
+        # 120-row calls per evaluation so one strategy cannot monopolize the
+        # shared API queue. Reject block settings that can never fit that bound.
+        if required_bars * interval_minutes > 1_440:
+            raise ValueError(
+                "선택한 봉 주기·지표 기간·N봉 전 값에 필요한 이력이 관리형 1회 조회 범위를 초과합니다."
+            )
         return self
 
 

@@ -214,6 +214,8 @@ def _next_after(spec: ScheduleSpec, after: datetime) -> datetime:
 
 def _bar_interval_seconds(value: str) -> int:
     clean = value.strip().lower()
+    if clean == "1h":
+        return 60 * 60
     if clean.endswith("m") and clean[:-1].isdigit():
         minutes = int(clean[:-1])
         if minutes > 0:

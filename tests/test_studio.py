@@ -23,10 +23,13 @@ from trade_router_studio.app import _strategy_performance, create_app
 from trade_router_studio.block_packages import (
     BAR_OBSERVER_TEMPLATE,
     DEFAULT_CONDITION_BOLLINGER_SETTINGS,
+    ConditionBollingerBlockSettings,
     BlockStrategySettings,
     block_package_from_source,
     render_block_strategy,
 )
+from trade_router_studio.connections import _minute_interval
+from trade_router_studio.runtime_scheduler import _bar_interval_seconds
 from trade_router_studio import paths as paths_module
 from trade_router_studio.paths import (
     BLOCK_EXAMPLE_STRATEGY,
@@ -153,6 +156,42 @@ def test_managed_block_compiles_generic_comparisons() -> None:
     assert strategy._required_bar_count((
         {"left": "close", "operator": "CROSS_UP", "right": "bollinger_upper", "left_offset": 0, "right_offset": 0},
     )) == DEFAULT_CONDITION_BOLLINGER_SETTINGS.bollinger_period + 1
+
+
+def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metrics() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["bar_interval"] = "1h"
+    payload["bollinger_period"] = 20
+    normalized = ConditionBollingerBlockSettings.model_validate(payload)
+    assert normalized.bar_interval == "60m"
+    assert _minute_interval("1h") == 60
+    assert _bar_interval_seconds("1h") == 60 * 60
+
+    payload["buy_conditions"] = [
+        {
+            "left": "profit_rate",
+            "operator": "GTE",
+            "right": "value",
+            "value": "1",
+        }
+    ]
+    try:
+        ConditionBollingerBlockSettings.model_validate(payload)
+    except ValueError as exc:
+        assert "평균 매수가·수익률" in str(exc)
+    else:
+        raise AssertionError("Position-only metrics must be rejected in buy conditions.")
+
+
+def test_managed_block_rejects_history_windows_larger_than_the_adapter_bound() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["bar_interval"] = "30m"
+    try:
+        ConditionBollingerBlockSettings.model_validate(payload)
+    except ValueError as exc:
+        assert "1회 조회 범위를 초과" in str(exc)
+    else:
+        raise AssertionError("An unreachable managed history window must be rejected.")
 
 
 def test_legacy_bar_block_package_still_round_trips() -> None:

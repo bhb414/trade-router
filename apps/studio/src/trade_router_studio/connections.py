@@ -3006,6 +3006,8 @@ def _kis_order_time(row: dict[str, Any], fallback_date: date) -> datetime:
 
 def _minute_interval(value: str) -> int:
     clean = value.strip().lower()
+    if clean == "1h":
+        return 60
     if clean.endswith("m") and clean[:-1].isdigit():
         minutes = int(clean[:-1])
         if 1 <= minutes <= 120:
