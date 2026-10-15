@@ -32,6 +32,11 @@ from trade_router import (
 )
 
 from . import __version__
+from .block_packages import (
+    BlockStrategyPackage,
+    block_package_from_source,
+    render_block_strategy,
+)
 from .connections import ConnectionRuntime
 from .event_bus import StrategyEventBus
 from .paths import WorkspacePaths
@@ -2565,6 +2570,49 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Strategy not found.") from exc
+
+    @app.get("/api/strategies/{name}/block-package")
+    async def export_block_strategy(name: str) -> BlockStrategyPackage:
+        try:
+            source = manager.read(name)
+            if manager.strategy_type(name) != "block":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Only block strategies can be exported as a block file.",
+                )
+            display_name = name[:-3] if name.lower().endswith(".py") else name
+            return block_package_from_source(display_name, source)
+        except StrategyNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Strategy not found.") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/strategies/import-block")
+    async def import_block_strategy(
+        package: BlockStrategyPackage,
+    ) -> dict[str, object]:
+        display_name = package.name.strip()
+        if display_name.lower().endswith(".py"):
+            display_name = display_name[:-3].rstrip()
+        name = f"{display_name}.py"
+        try:
+            path = manager.resolve(name)
+            if path.exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail="A strategy with the same name already exists.",
+                )
+            return await manager.save(
+                name,
+                render_block_strategy(package.settings),
+                strategy_type="block",
+            )
+        except StrategyNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/strategies/{name}/summary")
     async def strategy_summary(name: str) -> dict[str, object]:

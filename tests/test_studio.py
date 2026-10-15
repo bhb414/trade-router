@@ -17,7 +17,11 @@ from trade_router import (
     TokenScopeKey,
 )
 from trade_router_studio.app import _strategy_performance, create_app
-from trade_router_studio.paths import LEGACY_EXAMPLE_STRATEGY, WorkspacePaths
+from trade_router_studio.paths import (
+    BLOCK_EXAMPLE_STRATEGY,
+    LEGACY_EXAMPLE_STRATEGY,
+    WorkspacePaths,
+)
 from trade_router_studio.strategies import (
     MAX_LOG_LINES,
     StrategyManager,
@@ -59,6 +63,18 @@ def test_workspace_preserves_a_user_edited_example(tmp_path: Path) -> None:
     paths.ensure()
 
     assert example.read_text(encoding="utf-8") == source
+
+
+def test_workspace_includes_a_managed_block_example(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+
+    paths.ensure()
+
+    block_example = paths.strategies / "블록 예제.py"
+    assert block_example.read_text(encoding="utf-8") == BLOCK_EXAMPLE_STRATEGY
+    assert '"type": "block"' in block_example.with_suffix(
+        ".strategy.json"
+    ).read_text(encoding="utf-8")
 
 
 def test_removing_last_shared_key_alias_removes_its_encrypted_token(
@@ -115,8 +131,37 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'name="strategy-type" value="block"' in page.text
         assert status.json()["instance_id"]
         assert status.json()["instance_started_at"]
-        assert status.json()["strategy_count"] == 2
+        assert status.json()["strategy_count"] == 3
         assert (app.state.workspace.strategies / "kis_condition_bollinger.py").is_file()
+        block_example = client.get(
+            "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py"
+        )
+        assert block_example.status_code == 200
+        assert block_example.json()["strategy_type"] == "block"
+        exported = client.get(
+            "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package"
+        )
+        assert exported.status_code == 200
+        package = exported.json()
+        assert package["kind"] == "trade-router-block-strategy"
+        assert package["template"] == "bar-observer-v1"
+        assert "source" not in package
+        assert package["settings"]["symbol"] == "005930"
+        package["name"] = "가져온 블록 예제"
+        imported = client.post("/api/strategies/import-block", json=package)
+        assert imported.status_code == 200
+        assert imported.json()["strategy_type"] == "block"
+        imported_source = client.get(
+            "/api/strategies/%EA%B0%80%EC%A0%B8%EC%98%A8%20%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py"
+        )
+        assert imported_source.status_code == 200
+        assert "ManagedBlockStrategy" in imported_source.json()["source"]
+        package["source"] = "print('hidden code')"
+        rejected_hidden_source = client.post(
+            "/api/strategies/import-block",
+            json=package,
+        )
+        assert rejected_hidden_source.status_code == 422
         assert status.json()["unresolved_orders"] == 0
         doctor = client.get("/api/system/doctor")
         assert doctor.status_code == 200

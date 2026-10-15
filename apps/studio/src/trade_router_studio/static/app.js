@@ -37,6 +37,8 @@ const elements = {
   strategyBlocks: document.querySelector("#strategy-blocks"),
   blockCanvas: document.querySelector("#block-canvas"),
   blockSummary: document.querySelector("#block-editor-summary"),
+  blockExport: document.querySelector("#block-export-button"),
+  blockImportFile: document.querySelector("#block-import-file"),
   strategyCode: document.querySelector("#strategy-code"),
   strategySearch: document.querySelector("#strategy-search"),
   strategySearchInput: document.querySelector("#strategy-search-input"),
@@ -1123,6 +1125,7 @@ function updateControls() {
   const selected = state.view === "strategy" && Boolean(state.selected);
   const running = Boolean(selectedState()?.running);
   elements.editor.disabled = !selected || running || state.strategyType === "block";
+  elements.blockExport.disabled = !selected || state.strategyType !== "block";
   document.querySelectorAll(".block-field-control").forEach(control => {
     control.disabled = !selected || running;
   });
@@ -1936,6 +1939,45 @@ function closeNewStrategyModal() {
   elements.newStrategyModal.hidden = true;
 }
 
+async function exportBlockStrategy() {
+  if (!state.selected || state.strategyType !== "block") return;
+  if (state.dirty) await saveStrategy();
+  const payload = await api(
+    `/api/strategies/${encodeURIComponent(state.selected)}/block-package`,
+  );
+  const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], {
+    type: "application/json;charset=utf-8",
+  });
+  const link = document.createElement("a");
+  const safeName = displayStrategyName(state.selected).replace(/[\\/:*?"<>|]+/g, "-");
+  link.href = URL.createObjectURL(blob);
+  link.download = `${safeName}.trblock.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
+  notify("블록 전략 파일을 저장했습니다.");
+}
+
+async function importBlockStrategy(file) {
+  if (!file) return;
+  if (file.size > 512 * 1024) throw new Error("블록 전략 파일은 512 KiB 이하여야 합니다.");
+  let payload;
+  try {
+    payload = JSON.parse(await file.text());
+  } catch (_) {
+    throw new Error("블록 전략 파일의 JSON 형식을 확인하세요.");
+  }
+  const result = await api("/api/strategies/import-block", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  closeNewStrategyModal();
+  await refreshStrategies();
+  await openStrategy(result.name);
+  notify("블록 전략을 가져왔습니다. 연결 별칭을 확인한 뒤 저장하세요.");
+}
+
 document.querySelector("#new-strategy-form").addEventListener("submit", async event => {
   event.preventDefault();
   const input = document.querySelector("#new-strategy-name");
@@ -1989,6 +2031,16 @@ elements.strategySearchInput.addEventListener("input", event => {
 document.querySelector("#new-strategy-button").addEventListener("click", openNewStrategyModal);
 document.querySelector("#new-strategy-close").addEventListener("click", closeNewStrategyModal);
 document.querySelector("#new-strategy-cancel").addEventListener("click", closeNewStrategyModal);
+document.querySelector("#block-import-button").addEventListener("click", () => {
+  elements.blockImportFile.value = "";
+  elements.blockImportFile.click();
+});
+elements.blockImportFile.addEventListener("change", event => {
+  importBlockStrategy(event.currentTarget.files?.[0]).catch(error => notify(error.message, true));
+});
+elements.blockExport.addEventListener("click", () => {
+  exportBlockStrategy().catch(error => notify(error.message, true));
+});
 elements.newStrategyModal.addEventListener("click", event => {
   if (event.target === elements.newStrategyModal) closeNewStrategyModal();
 });

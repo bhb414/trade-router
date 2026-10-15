@@ -48,6 +48,55 @@ class ExampleStrategy(Strategy):
 '''
 
 
+BLOCK_EXAMPLE_STRATEGY = '''"""Trade Router가 관리하는 블록 전략 예제 실행 파일."""
+
+from trade_router import Strategy, StrategyConfig
+
+
+STRATEGY_ID = "block-example"
+TRADING_ACCOUNT = "등록한 계좌 별칭"
+MARKET_SOURCE = "등록한 API 연결 이름"
+SYMBOL = "005930"
+BAR_INTERVAL = "3m"
+BAR_COUNT = 55
+
+
+class BlockExampleStrategy(Strategy):
+    config = StrategyConfig(
+        id=STRATEGY_ID,
+        trading_account=TRADING_ACCOUNT,
+        market_sources={"primary": MARKET_SOURCE},
+        required_capabilities={"primary": ("quotes", "bars")},
+    )
+
+    async def on_start(self, ctx):
+        ctx.scheduler.on_bar_close(
+            BAR_INTERVAL,
+            schedule_id="regular-bars",
+            between=("09:00", "15:20"),
+        )
+        ctx.log.info("블록 예제 전략을 시작했습니다.")
+
+    async def on_bar(self, ctx, event):
+        bars = await ctx.market.bars(SYMBOL, BAR_INTERVAL, count=BAR_COUNT)
+        if bars:
+            ctx.log.info(
+                f"{event.schedule_id}: 완성 봉 {len(bars)}개 · "
+                f"최근 종가 {bars[-1].close}"
+            )
+
+    async def on_stop(self, ctx):
+        ctx.log.info("블록 예제 전략을 종료합니다.")
+'''
+
+
+BLOCK_EXAMPLE_METADATA = '''{
+  "format": 1,
+  "type": "block"
+}
+'''
+
+
 LEGACY_EXAMPLE_STRATEGY = '''"""Trade Router strategy example.
 
 This file is a normal Python program. Broker APIs will be injected here as the
@@ -588,3 +637,13 @@ class WorkspacePaths:
                 KIS_CONDITION_BOLLINGER_STRATEGY,
                 encoding="utf-8",
             )
+        block_example = self.strategies / "블록 예제.py"
+        if not block_example.exists():
+            block_example.write_text(BLOCK_EXAMPLE_STRATEGY, encoding="utf-8")
+        block_metadata = block_example.with_suffix(".strategy.json")
+        if (
+            not block_metadata.exists()
+            and block_example.read_text(encoding="utf-8").strip()
+            == BLOCK_EXAMPLE_STRATEGY.strip()
+        ):
+            block_metadata.write_text(BLOCK_EXAMPLE_METADATA, encoding="utf-8")

@@ -182,6 +182,7 @@
             </div>
             <div class="block-editor-actions">
               <span id="block-editor-summary">분석 전</span>
+              <button class="button quiet compact" id="block-export-button" type="button">내보내기</button>
             </div>
           </header>
           <div class="block-editor-notice" id="block-editor-notice">
@@ -247,6 +248,11 @@
             <span><strong>블록</strong><small>제공된 블록과 필드로만 구성하는 전략</small></span>
           </label>
         </fieldset>
+        <div class="block-import-row">
+          <span><strong>받은 블록 전략이 있나요?</strong><small>코드 없이 제공 블록 설정만 가져옵니다.</small></span>
+          <button class="button quiet" id="block-import-button" type="button">블록 파일 가져오기</button>
+          <input id="block-import-file" type="file" accept=".json,.trblock.json,application/json" hidden>
+        </div>
         <label for="new-strategy-name">전략명</label>
         <input id="new-strategy-name" autocomplete="off" placeholder="예: 볼린저 돌파" required>
         <small>전략 종류는 생성한 뒤 변경할 수 없습니다. 파일 확장자는 자동으로 관리합니다.</small>
