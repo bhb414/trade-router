@@ -231,7 +231,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         block_created = client.put(
             "/api/strategies/my_blocks.py",
             json={
-                "source": "print('managed blocks')\n",
+                "source": "print('must be removed')\n" + block_example.json()["source"],
                 "strategy_type": "block",
             },
         )
@@ -239,6 +239,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert block_created.json()["strategy_type"] == "block"
         block_loaded = client.get("/api/strategies/my_blocks.py")
         assert block_loaded.json()["strategy_type"] == "block"
+        assert "must be removed" not in block_loaded.json()["source"]
+        assert "ManagedBlockStrategy" in block_loaded.json()["source"]
         assert (
             app.state.workspace.strategies / "my_blocks.strategy.json"
         ).is_file()
@@ -587,6 +589,108 @@ def test_connection_registration_can_check_authentication_immediately(
 
     assert response.status_code == 201
     assert response.json()["connection_status"]["state"] == "connected"
+
+
+def test_connection_edit_never_returns_or_replaces_api_secrets(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "before",
+                "app_key": "private-app-key",
+                "app_secret": "private-app-secret",
+                "realtime_user_id": "old-hts",
+            },
+        ).json()
+        edited = client.put(
+            f"/api/settings/connections/{connection['id']}",
+            json={"label": "after", "realtime_user_id": "new-hts"},
+        )
+        listed = client.get("/api/settings/connections").json()
+
+    assert edited.status_code == 200
+    assert edited.json()["label"] == "after"
+    assert edited.json()["has_realtime_user_id"] is True
+    assert "app_key" not in edited.json()
+    assert "app_secret" not in edited.json()
+    assert "realtime_user_id" not in edited.json()
+    assert "app_key" not in listed[0]
+    assert "app_secret" not in listed[0]
+    assert app.state.settings.get_credentials(connection["id"]) == {
+        "app_key": "private-app-key",
+        "app_secret": "private-app-secret",
+        "realtime_user_id": "new-hts",
+    }
+
+
+def test_kis_account_accepts_grouped_number_and_edit_preserves_identity(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "account-edit-source",
+                "app_key": "key",
+                "app_secret": "secret",
+            },
+        ).json()
+        created = client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "paper-main",
+                "connection_id": connection["id"],
+                "account_number": "12345678-01",
+            },
+        )
+        edited = client.put(
+            f"/api/settings/accounts/{created.json()['id']}",
+            json={"max_exposure": "150000", "sell_tax_rate": "0.0015"},
+        )
+
+    assert created.status_code == 201
+    assert created.json()["product_code"] == "01"
+    assert app.state.settings.get_account_number(created.json()["id"]) == "12345678"
+    assert edited.status_code == 200
+    assert edited.json()["alias"] == "paper-main"
+    assert edited.json()["risk_limits"]["max_exposure"] == "150000"
+    assert edited.json()["cost_rates"]["sell_tax_rate"] == "0.0015"
+    assert app.state.settings.get_account_number(created.json()["id"]) == "12345678"
+
+
+def test_namuh_account_accepts_three_two_six_grouped_number(tmp_path: Path) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "namuh",
+                "target": "LIVE",
+                "label": "namuh-account-source",
+                "app_key": "key",
+                "app_secret": "secret",
+            },
+        ).json()
+        created = client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "namuh-main",
+                "connection_id": connection["id"],
+                "account_number": "000-00-000000",
+            },
+        )
+
+    assert created.status_code == 201
+    assert created.json()["formatted_masked_account"] == "00*-**-**0000"
+    assert app.state.settings.get_account_number(created.json()["id"]) == "00000000000"
 
 
 def test_strategy_order_toggle_is_available_while_stopped_and_persists(

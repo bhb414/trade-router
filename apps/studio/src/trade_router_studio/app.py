@@ -65,11 +65,28 @@ class ConnectionRegistration(BaseModel):
     realtime_user_id: str = ""
 
 
+class ConnectionUpdate(BaseModel):
+    label: str
+    realtime_user_id: str | None = None
+
+
 class AccountRegistration(BaseModel):
     alias: str
     connection_id: str
     account_number: str
     product_code: str = ""
+    max_order_amount: Decimal | None = Field(default=None, gt=0)
+    max_daily_buy_amount: Decimal | None = Field(default=None, gt=0)
+    max_exposure: Decimal | None = Field(default=None, gt=0)
+    max_open_orders: int | None = Field(default=None, ge=1)
+    buy_commission_rate: Decimal | None = Field(default=None, ge=0)
+    sell_commission_rate: Decimal | None = Field(default=None, ge=0)
+    sell_tax_rate: Decimal | None = Field(default=None, ge=0)
+
+
+class AccountUpdate(BaseModel):
+    account_number: str | None = None
+    product_code: str | None = None
     max_order_amount: Decimal | None = Field(default=None, gt=0)
     max_daily_buy_amount: Decimal | None = Field(default=None, gt=0)
     max_exposure: Decimal | None = Field(default=None, gt=0)
@@ -1059,6 +1076,20 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             settings.remove_connection(connection_id)
         except SettingsError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/settings/connections/{connection_id}")
+    async def update_connection(
+        connection_id: str,
+        body: ConnectionUpdate,
+    ) -> dict[str, object]:
+        try:
+            return settings.update_connection(
+                connection_id,
+                label=body.label,
+                realtime_user_id=body.realtime_user_id,
+            )
+        except SettingsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/settings/connections/{connection_id}/check")
     async def check_connection(connection_id: str) -> dict[str, object]:
@@ -2548,6 +2579,55 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         except SettingsError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.put("/api/settings/accounts/{account_id}")
+    async def update_account(
+        account_id: str,
+        body: AccountUpdate,
+    ) -> dict[str, object]:
+        try:
+            return settings.update_account(
+                account_id,
+                account_number=body.account_number,
+                product_code=body.product_code,
+                risk_limits={
+                    "max_order_amount": (
+                        str(body.max_order_amount)
+                        if body.max_order_amount is not None
+                        else None
+                    ),
+                    "max_daily_buy_amount": (
+                        str(body.max_daily_buy_amount)
+                        if body.max_daily_buy_amount is not None
+                        else None
+                    ),
+                    "max_exposure": (
+                        str(body.max_exposure)
+                        if body.max_exposure is not None
+                        else None
+                    ),
+                    "max_open_orders": body.max_open_orders,
+                },
+                cost_rates={
+                    "buy_commission_rate": (
+                        str(body.buy_commission_rate)
+                        if body.buy_commission_rate is not None
+                        else None
+                    ),
+                    "sell_commission_rate": (
+                        str(body.sell_commission_rate)
+                        if body.sell_commission_rate is not None
+                        else None
+                    ),
+                    "sell_tax_rate": (
+                        str(body.sell_tax_rate)
+                        if body.sell_tax_rate is not None
+                        else None
+                    ),
+                },
+            )
+        except SettingsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.delete("/api/settings/accounts/{account_id}", status_code=204)
     async def delete_account(account_id: str) -> None:
         try:
@@ -2811,10 +2891,31 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
 
     @app.put("/api/strategies/{name}")
     async def save_strategy(name: str, body: StrategySource) -> dict[str, object]:
+        source = body.source
+        try:
+            existing_type = manager.strategy_type(name)
+        except StrategyNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        effective_type = body.strategy_type or existing_type
+        if effective_type == "block":
+            display_name = name[:-3] if name.lower().endswith(".py") else name
+            try:
+                package = block_package_from_source(display_name, source)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "블록 전략은 제공된 블록과 필드로만 저장할 수 있습니다. "
+                        f"{exc}"
+                    ),
+                ) from exc
+            # Block strategies always run the server-owned template.  The browser
+            # only supplies validated settings extracted from its block canvas.
+            source = render_block_strategy(package.settings)
         try:
             return await manager.save(
                 name,
-                body.source,
+                source,
                 strategy_type=body.strategy_type,
             )
         except StrategyNameError as exc:

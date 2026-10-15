@@ -12,6 +12,8 @@ const state = {
   providers: [],
   connections: [],
   accounts: [],
+  selectedConnectionId: null,
+  selectedAccountId: null,
   connectionStatuses: {},
   capabilities: [],
   orderPermissions: [],
@@ -70,6 +72,8 @@ const elements = {
   connections: document.querySelector("#connection-status"),
   workspace: document.querySelector("#workspace-path"),
   settingsModal: document.querySelector("#settings-modal"),
+  serviceDetailModal: document.querySelector("#service-detail-modal"),
+  serviceDetailBody: document.querySelector("#service-detail-body"),
   connectionProvider: document.querySelector("#connection-provider"),
   connectionTarget: document.querySelector("#connection-target"),
   accountConnection: document.querySelector("#account-connection"),
@@ -316,6 +320,68 @@ function serviceEventTarget(event) {
   return values.join(" · ") || event?.source || "—";
 }
 
+function serviceDetailValue(value) {
+  if (value == null || value === "") return "—";
+  if (typeof value === "object") return JSON.stringify(value, null, 2);
+  return String(value);
+}
+
+function openServiceEventDetail(event, service) {
+  document.querySelector("#service-detail-eyebrow").textContent = service.label;
+  document.querySelector("#service-detail-title").textContent = serviceOperationLabel(event.operation);
+  elements.serviceDetailBody.replaceChildren();
+  const summary = document.createElement("div");
+  summary.className = "service-detail-summary";
+  const occurredAt = event.occurred_at ? formatTimestamp(event.occurred_at) : "—";
+  for (const [label, value, className] of [
+    ["처리 시각", occurredAt, ""],
+    ["결과", event.outcome === "error" ? "오류" : "성공", event.outcome === "error" ? "negative" : "positive"],
+    ["대상", serviceEventTarget(event), ""],
+    ["소요 시간", event.duration_ms == null ? "—" : `${formatNumber(event.duration_ms)}ms`, ""],
+    ["전략·호출 주체", event.source || "—", ""],
+    ["기록 번호", event.id == null ? "—" : String(event.id), ""],
+  ]) {
+    const cell = document.createElement("div");
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const content = document.createElement("strong");
+    content.textContent = value;
+    if (className) content.className = className;
+    cell.append(caption, content);
+    summary.append(cell);
+  }
+  const message = document.createElement("p");
+  message.className = "service-detail-message";
+  message.textContent = event.message || "상세 메시지가 없습니다.";
+  const fields = document.createElement("dl");
+  fields.className = "service-detail-fields";
+  const details = Object.entries(event.details || {}).filter(([key]) => key !== "duration_ms");
+  if (!details.length) {
+    const empty = document.createElement("div");
+    empty.className = "service-tab-empty";
+    empty.textContent = "추가 진단 값이 없습니다.";
+    elements.serviceDetailBody.append(summary, message, empty);
+  } else {
+    for (const [key, value] of details) {
+      const row = document.createElement("div");
+      row.className = "service-detail-field";
+      const term = document.createElement("dt");
+      term.textContent = key;
+      const description = document.createElement("dd");
+      description.textContent = serviceDetailValue(value);
+      row.append(term, description);
+      fields.append(row);
+    }
+    elements.serviceDetailBody.append(summary, message, fields);
+  }
+  elements.serviceDetailModal.hidden = false;
+  document.querySelector("#service-detail-close").focus();
+}
+
+function closeServiceEventDetail() {
+  elements.serviceDetailModal.hidden = true;
+}
+
 function renderServiceResultTabs(container, rows, scope) {
   container.replaceChildren();
   const services = (rows || []).filter(result => ["market", "scheduler", "account", "order"].includes(result.id));
@@ -390,6 +456,9 @@ function renderServiceResultTabs(container, rows, scope) {
     const body = document.createElement("tbody");
     for (const event of events) {
       const row = document.createElement("tr");
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-label", `${serviceOperationLabel(event.operation)} 상세 보기`);
       const timestamp = event.occurred_at
         ? new Date(event.occurred_at).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
         : "—";
@@ -407,6 +476,13 @@ function renderServiceResultTabs(container, rows, scope) {
         if (index === 3) cell.className = event.outcome === "error" ? "negative" : "positive";
         row.append(cell);
       }
+      row.addEventListener("click", () => openServiceEventDetail(event, result));
+      row.addEventListener("keydown", keyEvent => {
+        if (keyEvent.key === "Enter" || keyEvent.key === " ") {
+          keyEvent.preventDefault();
+          openServiceEventDetail(event, result);
+        }
+      });
       body.append(row);
     }
     table.append(body);
@@ -1601,8 +1677,142 @@ function refreshProviderFields() {
 function refreshAccountFields() {
   const connection = state.connections.find(item => item.id === elements.accountConnection.value);
   const provider = selectedProvider(connection?.provider);
-  elements.productCodeField.hidden = !provider?.account_product_code;
-  document.querySelector("#account-product-code").required = Boolean(provider?.account_product_code);
+  const format = provider?.account_number_format;
+  const accountNumber = document.querySelector("#account-number");
+  const hint = document.querySelector("#account-number-hint");
+  elements.productCodeField.hidden = true;
+  document.querySelector("#account-product-code").required = false;
+  accountNumber.placeholder = state.selectedAccountId
+    ? `${format?.placeholder || "계좌번호"} · 비워두면 기존 번호 유지`
+    : format?.placeholder || "계좌번호";
+  accountNumber.maxLength = Array.isArray(format?.groups)
+    ? format.groups.reduce((sum, size) => sum + Number(size), 0) + format.groups.length - 1
+    : 32;
+  const providerHint = provider?.id === "kis"
+    ? "8자리 계좌번호와 2자리 상품코드를 함께 입력하면 자동으로 8-2 형식이 적용됩니다."
+    : provider?.id === "namuh"
+      ? "NAMUH 계좌번호는 000-00-000000 형식으로 자동 정리됩니다."
+      : "숫자를 입력하면 증권사 계좌번호 형식을 자동으로 적용합니다.";
+  hint.textContent = state.selectedAccountId
+    ? `${providerHint} 비워두면 저장된 계좌번호를 유지합니다.`
+    : providerHint;
+}
+
+function formatGroupedDigits(value, groups) {
+  if (!Array.isArray(groups) || !groups.length) return value;
+  const total = groups.reduce((sum, size) => sum + Number(size), 0);
+  let digits = String(value || "").replace(/\D/g, "").slice(0, total);
+  const parts = [];
+  for (const size of groups) {
+    if (!digits) break;
+    parts.push(digits.slice(0, size));
+    digits = digits.slice(size);
+  }
+  return parts.join("-");
+}
+
+function formatAccountNumberInput() {
+  const connection = state.connections.find(item => item.id === elements.accountConnection.value);
+  const provider = selectedProvider(connection?.provider);
+  const input = document.querySelector("#account-number");
+  input.value = formatGroupedDigits(input.value, provider?.account_number_format?.groups);
+}
+
+function renderConnectionForm() {
+  const connection = state.connections.find(item => item.id === state.selectedConnectionId);
+  const editing = Boolean(connection);
+  const provider = connection?.provider || elements.connectionProvider.value || state.providers[0]?.id || "";
+  elements.connectionProvider.value = provider;
+  refreshProviderFields();
+  if (connection) elements.connectionTarget.value = connection.target;
+  refreshConnectionRateHint();
+
+  elements.connectionProvider.disabled = editing;
+  elements.connectionTarget.disabled = editing;
+  document.querySelector("#connection-label").value = connection?.label || "";
+  const keyField = document.querySelector("#connection-key-field");
+  const secretField = document.querySelector("#connection-secret-field");
+  const keyInput = document.querySelector("#connection-key");
+  const secretInput = document.querySelector("#connection-secret");
+  keyField.hidden = editing;
+  secretField.hidden = editing;
+  keyInput.required = !editing;
+  secretInput.required = !editing;
+  keyInput.value = "";
+  secretInput.value = "";
+  document.querySelector("#connection-credentials-locked").hidden = !editing;
+  const realtime = document.querySelector("#connection-realtime-user-id");
+  realtime.value = "";
+  realtime.placeholder = editing && connection?.has_realtime_user_id
+    ? "저장됨 · 변경할 때만 새 HTS ID 입력"
+    : "KIS 실시간 주문·체결 통보용";
+  document.querySelector("#connection-realtime-user-hint").textContent = editing
+    ? "비워두면 저장된 HTS ID를 유지합니다. App Key와 App Secret은 새 API로 다시 등록할 때만 변경할 수 있습니다."
+    : "비워두면 시세·호가 WebSocket만 사용하고 주문·체결은 REST로 확인합니다.";
+  document.querySelector("#connection-form-title").textContent = editing ? connection.label : "새 API 등록";
+  document.querySelector("#connection-form-description").textContent = editing
+    ? "연결 이름과 HTS ID를 변경할 수 있습니다. 인증 키는 표시하지 않습니다."
+    : "증권사 인증정보를 새로 저장합니다.";
+  document.querySelector("#connection-submit-button").textContent = editing ? "변경 저장" : "API 등록";
+}
+
+function renderAccountForm() {
+  const account = state.accounts.find(item => item.id === state.selectedAccountId);
+  const editing = Boolean(account);
+  if (account) elements.accountConnection.value = account.connection_id;
+  elements.accountConnection.disabled = editing;
+  const alias = document.querySelector("#account-alias");
+  alias.value = account?.alias || "";
+  alias.disabled = editing;
+  document.querySelector("#account-alias-hint").textContent = editing
+    ? "계좌 별칭은 전략 연결에 사용되므로 변경할 수 없습니다."
+    : "전략에서 사용할 계좌 이름입니다.";
+  const accountNumber = document.querySelector("#account-number");
+  accountNumber.value = "";
+  accountNumber.required = !editing;
+  document.querySelector("#account-product-code").value = "";
+
+  const limits = account?.risk_limits || {};
+  const costs = account?.cost_rates || {};
+  document.querySelector("#account-max-order").value = limits.max_order_amount ?? "";
+  document.querySelector("#account-max-daily-buy").value = limits.max_daily_buy_amount ?? "";
+  document.querySelector("#account-max-exposure").value = limits.max_exposure ?? "";
+  document.querySelector("#account-max-open-orders").value = limits.max_open_orders ?? "";
+  document.querySelector("#account-buy-commission-rate").value = costs.buy_commission_rate ?? "";
+  document.querySelector("#account-sell-commission-rate").value = costs.sell_commission_rate ?? "";
+  document.querySelector("#account-sell-tax-rate").value = costs.sell_tax_rate ?? "";
+  document.querySelector("#account-form-title").textContent = editing ? account.alias : "새 계좌 등록";
+  document.querySelector("#account-form-description").textContent = editing
+    ? `${account.connection_label}에 연결된 계좌의 번호와 위험 한도를 편집합니다.`
+    : "API 연결과 거래 계좌를 연결합니다.";
+  document.querySelector("#account-submit-button").textContent = editing ? "변경 저장" : "계좌 등록";
+  refreshAccountFields();
+}
+
+function selectConnectionForEdit(connection) {
+  state.selectedConnectionId = connection.id;
+  renderConnectionForm();
+  renderConnectionList();
+}
+
+function selectAccountForEdit(account) {
+  state.selectedAccountId = account.id;
+  renderAccountForm();
+  renderAccountList();
+}
+
+function startNewConnection() {
+  state.selectedConnectionId = null;
+  renderConnectionForm();
+  renderConnectionList();
+  document.querySelector("#connection-label").focus();
+}
+
+function startNewAccount() {
+  state.selectedAccountId = null;
+  renderAccountForm();
+  renderAccountList();
+  document.querySelector("#account-alias").focus();
 }
 
 function renderConnectionList() {
@@ -1619,7 +1829,17 @@ function renderConnectionList() {
   for (const connection of state.connections) {
     const provider = selectedProvider(connection.provider);
     const item = document.createElement("div");
-    item.className = "registered-item";
+    item.className = `registered-item${state.selectedConnectionId === connection.id ? " active" : ""}`;
+    item.tabIndex = 0;
+    item.setAttribute("role", "button");
+    item.setAttribute("aria-label", `${connection.label} API 편집`);
+    item.addEventListener("click", () => selectConnectionForEdit(connection));
+    item.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectConnectionForEdit(connection);
+      }
+    });
     const information = document.createElement("div");
     information.className = "registered-copy";
     const title = document.createElement("strong");
@@ -1660,13 +1880,19 @@ function renderConnectionList() {
     check.className = "button quiet compact";
     check.type = "button";
     check.textContent = "연결 확인";
-    check.addEventListener("click", () => checkConnection(connection, check, status));
+    check.addEventListener("click", event => {
+      event.stopPropagation();
+      checkConnection(connection, check, status);
+    });
     information.append(title, description, rateLimitText, capabilityText, status);
     const remove = document.createElement("button");
     remove.className = "registered-remove";
     remove.type = "button";
     remove.textContent = "삭제";
-    remove.addEventListener("click", () => removeConnection(connection));
+    remove.addEventListener("click", event => {
+      event.stopPropagation();
+      removeConnection(connection);
+    });
     actions.append(check, remove);
     item.append(information, actions);
     list.append(item);
@@ -1686,13 +1912,22 @@ function renderAccountList() {
   }
   for (const account of state.accounts) {
     const item = document.createElement("div");
-    item.className = "registered-item";
+    item.className = `registered-item${state.selectedAccountId === account.id ? " active" : ""}`;
+    item.tabIndex = 0;
+    item.setAttribute("role", "button");
+    item.setAttribute("aria-label", `${account.alias} 계좌 편집`);
+    item.addEventListener("click", () => selectAccountForEdit(account));
+    item.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectAccountForEdit(account);
+      }
+    });
     const information = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = account.alias;
     const description = document.createElement("span");
-    const product = account.product_code ? `-${account.product_code}` : "";
-    description.textContent = `${account.connection_label} · ${account.masked_account}${product}`;
+    description.textContent = `${account.connection_label} · ${account.formatted_masked_account || account.masked_account}`;
     const limits = account.risk_limits || {};
     const limitSummary = document.createElement("span");
     const limitParts = [
@@ -1741,12 +1976,18 @@ function renderAccountList() {
     permissionThumb.className = "permission-toggle-thumb";
     permissionTrack.append(permissionThumb);
     permissionButton.append(permissionCopy, permissionTrack);
-    permissionButton.addEventListener("click", () => toggleAccountPermission(account, Boolean(permission?.armed)));
+    permissionButton.addEventListener("click", event => {
+      event.stopPropagation();
+      toggleAccountPermission(account, Boolean(permission?.armed));
+    });
     const remove = document.createElement("button");
     remove.className = "registered-remove";
     remove.type = "button";
     remove.textContent = "삭제";
-    remove.addEventListener("click", () => removeAccount(account));
+    remove.addEventListener("click", event => {
+      event.stopPropagation();
+      removeAccount(account);
+    });
     actions.append(permissionButton, remove);
     item.append(information, actions);
     list.append(item);
@@ -1785,8 +2026,14 @@ function renderSettings() {
     }
   }
   document.querySelector("#account-form .settings-submit").disabled = !state.connections.length;
-  refreshProviderFields();
-  refreshAccountFields();
+  if (state.selectedConnectionId && !state.connections.some(item => item.id === state.selectedConnectionId)) {
+    state.selectedConnectionId = null;
+  }
+  if (state.selectedAccountId && !state.accounts.some(item => item.id === state.selectedAccountId)) {
+    state.selectedAccountId = null;
+  }
+  renderConnectionForm();
+  renderAccountForm();
   renderConnectionList();
   renderAccountList();
 }
@@ -1829,6 +2076,7 @@ async function removeConnection(connection) {
   if (!window.confirm(`${connection.label} API 등록을 삭제할까요?`)) return;
   try {
     await api(`/api/settings/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" });
+    if (state.selectedConnectionId === connection.id) state.selectedConnectionId = null;
     await Promise.all([loadSettings(), refreshStatus()]);
     notify("API 등록을 삭제했습니다.");
   } catch (error) { notify(error.message, true); }
@@ -1860,6 +2108,7 @@ async function removeAccount(account) {
   if (!window.confirm(`${account.alias} 계좌 등록을 삭제할까요?`)) return;
   try {
     await api(`/api/settings/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
+    if (state.selectedAccountId === account.id) state.selectedAccountId = null;
     await Promise.all([loadSettings(), refreshStatus(), refreshDashboard(true)]);
     notify("계좌 등록을 삭제했습니다.");
   } catch (error) { notify(error.message, true); }
@@ -2211,12 +2460,19 @@ document.querySelector("#settings-close").addEventListener("click", closeSetting
 elements.settingsModal.addEventListener("click", event => {
   if (event.target === elements.settingsModal) closeSettings();
 });
+document.querySelector("#service-detail-close").addEventListener("click", closeServiceEventDetail);
+elements.serviceDetailModal.addEventListener("click", event => {
+  if (event.target === elements.serviceDetailModal) closeServiceEventDetail();
+});
 document.querySelectorAll("[data-settings-tab]").forEach(button => {
   button.addEventListener("click", () => activateSettingsTab(button.dataset.settingsTab));
 });
 elements.connectionProvider.addEventListener("change", refreshProviderFields);
 elements.connectionTarget.addEventListener("change", refreshConnectionRateHint);
 elements.accountConnection.addEventListener("change", refreshAccountFields);
+document.querySelector("#account-number").addEventListener("input", formatAccountNumberInput);
+document.querySelector("#new-connection-button").addEventListener("click", startNewConnection);
+document.querySelector("#new-account-button").addEventListener("click", startNewAccount);
 
 document.querySelector("#connection-form").addEventListener("submit", async event => {
   event.preventDefault();
@@ -2224,26 +2480,37 @@ document.querySelector("#connection-form").addEventListener("submit", async even
   const submit = form.querySelector(".settings-submit");
   submit.disabled = true;
   try {
-    const created = await api("/api/settings/connections?check=true", {
-      method: "POST",
-      body: JSON.stringify({
-        provider: elements.connectionProvider.value,
-        target: elements.connectionTarget.value,
-        label: document.querySelector("#connection-label").value,
-        app_key: document.querySelector("#connection-key").value,
-        app_secret: document.querySelector("#connection-secret").value,
-        realtime_user_id: document.querySelector("#connection-realtime-user-id").value,
-      }),
-    });
-    document.querySelector("#connection-label").value = "";
-    document.querySelector("#connection-key").value = "";
-    document.querySelector("#connection-secret").value = "";
-    document.querySelector("#connection-realtime-user-id").value = "";
+    const editing = state.connections.find(item => item.id === state.selectedConnectionId);
+    let result;
+    if (editing) {
+      result = await api(`/api/settings/connections/${encodeURIComponent(editing.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          label: document.querySelector("#connection-label").value,
+          realtime_user_id: document.querySelector("#connection-realtime-user-id").value || null,
+        }),
+      });
+    } else {
+      result = await api("/api/settings/connections?check=true", {
+        method: "POST",
+        body: JSON.stringify({
+          provider: elements.connectionProvider.value,
+          target: elements.connectionTarget.value,
+          label: document.querySelector("#connection-label").value,
+          app_key: document.querySelector("#connection-key").value,
+          app_secret: document.querySelector("#connection-secret").value,
+          realtime_user_id: document.querySelector("#connection-realtime-user-id").value,
+        }),
+      });
+      state.selectedConnectionId = result.id;
+    }
     await Promise.all([loadSettings(), refreshStatus(), refreshDashboard(true)]);
-    if (created.connection_status?.state === "connected") {
+    if (editing) {
+      notify("API 설정을 변경했습니다. 저장된 인증 키는 그대로 유지됩니다.");
+    } else if (result.connection_status?.state === "connected") {
       notify("API를 저장하고 연결까지 확인했습니다.");
     } else {
-      notify(created.connection_status?.message || "API는 저장했지만 연결 확인에 실패했습니다.", true);
+      notify(result.connection_status?.message || "API는 저장했지만 연결 확인에 실패했습니다.", true);
     }
   } catch (error) { notify(error.message, true); }
   finally { submit.disabled = false; }
@@ -2255,39 +2522,46 @@ document.querySelector("#account-form").addEventListener("submit", async event =
   const submit = form.querySelector(".settings-submit");
   submit.disabled = true;
   try {
-    await api("/api/settings/accounts", {
-      method: "POST",
-      body: JSON.stringify({
+    const editing = state.accounts.find(item => item.id === state.selectedAccountId);
+    const payload = {
+      account_number: document.querySelector("#account-number").value || null,
+      product_code: document.querySelector("#account-product-code").value || null,
+      max_order_amount: positiveNumberOrNull("#account-max-order"),
+      max_daily_buy_amount: positiveNumberOrNull("#account-max-daily-buy"),
+      max_exposure: positiveNumberOrNull("#account-max-exposure"),
+      max_open_orders: positiveNumberOrNull("#account-max-open-orders"),
+      buy_commission_rate: positiveNumberOrNull("#account-buy-commission-rate"),
+      sell_commission_rate: positiveNumberOrNull("#account-sell-commission-rate"),
+      sell_tax_rate: positiveNumberOrNull("#account-sell-tax-rate"),
+    };
+    let saved;
+    if (editing) {
+      saved = await api(`/api/settings/accounts/${encodeURIComponent(editing.id)}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+    } else {
+      saved = await api("/api/settings/accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
         connection_id: elements.accountConnection.value,
         alias: document.querySelector("#account-alias").value,
-        account_number: document.querySelector("#account-number").value,
-        product_code: document.querySelector("#account-product-code").value,
-        max_order_amount: positiveNumberOrNull("#account-max-order"),
-        max_daily_buy_amount: positiveNumberOrNull("#account-max-daily-buy"),
-        max_exposure: positiveNumberOrNull("#account-max-exposure"),
-        max_open_orders: positiveNumberOrNull("#account-max-open-orders"),
-        buy_commission_rate: positiveNumberOrNull("#account-buy-commission-rate"),
-        sell_commission_rate: positiveNumberOrNull("#account-sell-commission-rate"),
-        sell_tax_rate: positiveNumberOrNull("#account-sell-tax-rate"),
-      }),
-    });
-    document.querySelector("#account-alias").value = "";
-    document.querySelector("#account-number").value = "";
-    document.querySelector("#account-product-code").value = "";
-    document.querySelector("#account-max-order").value = "";
-    document.querySelector("#account-max-daily-buy").value = "";
-    document.querySelector("#account-max-exposure").value = "";
-    document.querySelector("#account-max-open-orders").value = "";
-    document.querySelector("#account-buy-commission-rate").value = "";
-    document.querySelector("#account-sell-commission-rate").value = "";
-    document.querySelector("#account-sell-tax-rate").value = "";
+        }),
+      });
+      state.selectedAccountId = saved.id;
+    }
     await Promise.all([loadSettings(), refreshStatus(), refreshDashboard(true)]);
-    notify("계좌를 등록했습니다.");
+    notify(editing ? "계좌 설정을 변경했습니다." : "계좌를 등록했습니다.");
   } catch (error) { notify(error.message, true); }
   finally { submit.disabled = !state.connections.length; }
 });
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !elements.serviceDetailModal.hidden) {
+    closeServiceEventDetail();
+    return;
+  }
   if (event.key === "Escape" && !elements.newStrategyModal.hidden) {
     closeNewStrategyModal();
     return;

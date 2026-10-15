@@ -321,39 +321,51 @@
             <p>증권사를 선택하면 해당 API에 필요한 키 입력란이 표시됩니다. 비밀정보는 Windows 사용자 암호화 저장소로 보호됩니다.</p>
           </div>
           <div class="settings-grid">
-            <form class="settings-form" id="connection-form">
-              <label>
-                <span>증권사</span>
-                <select id="connection-provider" required></select>
-              </label>
-              <label>
-                <span>연결 이름</span>
-                <input id="connection-label" placeholder="예: KIS 주식 API" autocomplete="off" required>
-              </label>
-              <label>
-                <span>접속 대상</span>
-                <select id="connection-target" required></select>
-                <small id="connection-rate-limit-hint">고정 호출 한도를 불러오는 중입니다.</small>
-              </label>
-              <label>
-                <span id="connection-key-label">App Key</span>
-                <input id="connection-key" type="password" autocomplete="off" required>
-              </label>
-              <label>
-                <span id="connection-secret-label">App Secret</span>
-                <input id="connection-secret" type="password" autocomplete="off" required>
-              </label>
-              <label id="connection-realtime-user-field">
-                <span>HTS ID</span>
-                <input id="connection-realtime-user-id" autocomplete="off" placeholder="KIS 실시간 주문·체결 통보용">
-                <small>비워두면 시세·호가 WebSocket만 사용하고 주문·체결은 REST로 확인합니다.</small>
-              </label>
-              <button class="button primary settings-submit">API 등록</button>
-            </form>
             <div class="registered-section">
-              <div class="registered-heading"><strong>등록된 API</strong><span id="connection-count">0개</span></div>
+              <div class="registered-heading">
+                <span><strong>등록된 API</strong><small id="connection-count">0개</small></span>
+                <button class="button quiet compact" id="new-connection-button" type="button">새로 등록</button>
+              </div>
               <div class="registered-list" id="connection-list"></div>
             </div>
+            <section class="settings-detail">
+              <header class="settings-detail-heading">
+                <div><strong id="connection-form-title">새 API 등록</strong><span id="connection-form-description">증권사 인증정보를 새로 저장합니다.</span></div>
+              </header>
+              <form class="settings-form" id="connection-form">
+                <label>
+                  <span>증권사</span>
+                  <select id="connection-provider" required></select>
+                </label>
+                <label>
+                  <span>연결 이름</span>
+                  <input id="connection-label" placeholder="예: KIS 주식 API" autocomplete="off" required>
+                </label>
+                <label>
+                  <span>접속 대상</span>
+                  <select id="connection-target" required></select>
+                  <small id="connection-rate-limit-hint">고정 호출 한도를 불러오는 중입니다.</small>
+                </label>
+                <label id="connection-key-field">
+                  <span id="connection-key-label">App Key</span>
+                  <input id="connection-key" type="password" autocomplete="off" required>
+                </label>
+                <label id="connection-secret-field">
+                  <span id="connection-secret-label">App Secret</span>
+                  <input id="connection-secret" type="password" autocomplete="off" required>
+                </label>
+                <div class="credential-locked-notice" id="connection-credentials-locked" hidden>
+                  <strong>인증 키는 보호 중입니다.</strong>
+                  <span>저장된 App Key와 App Secret은 화면에 표시하거나 수정할 수 없습니다.</span>
+                </div>
+                <label id="connection-realtime-user-field">
+                  <span>HTS ID</span>
+                  <input id="connection-realtime-user-id" autocomplete="off" placeholder="KIS 실시간 주문·체결 통보용">
+                  <small id="connection-realtime-user-hint">비워두면 시세·호가 WebSocket만 사용하고 주문·체결은 REST로 확인합니다.</small>
+                </label>
+                <button class="button primary settings-submit" id="connection-submit-button">API 등록</button>
+              </form>
+            </section>
           </div>
         </section>
 
@@ -363,62 +375,81 @@
             <p>먼저 등록한 API와 실제 거래 계좌를 연결합니다. 화면에는 계좌번호 일부만 표시됩니다.</p>
           </div>
           <div class="settings-grid">
-            <form class="settings-form" id="account-form">
-              <label>
-                <span>사용할 API</span>
-                <select id="account-connection" required></select>
-              </label>
-              <label>
-                <span>계좌 별칭</span>
-                <input id="account-alias" placeholder="예: 주식 주계좌" autocomplete="off" required>
-              </label>
-              <label>
-                <span>계좌번호</span>
-                <input id="account-number" inputmode="numeric" autocomplete="off" required>
-              </label>
-              <label id="product-code-field">
-                <span>계좌 상품코드</span>
-                <input id="account-product-code" placeholder="예: 01" autocomplete="off">
-                <small>KIS 계좌번호 뒤의 두 자리 상품코드입니다.</small>
-              </label>
-              <label>
-                <span>계좌 1회 주문 상한 (원)</span>
-                <input id="account-max-order" inputmode="numeric" placeholder="미입력 시 제한 없음">
-              </label>
-              <label>
-                <span>계좌 일일 매수 상한 (원)</span>
-                <input id="account-max-daily-buy" inputmode="numeric" placeholder="미입력 시 제한 없음">
-              </label>
-              <label>
-                <span>계좌 최대 노출액 (원)</span>
-                <input id="account-max-exposure" inputmode="numeric" placeholder="미입력 시 제한 없음">
-              </label>
-              <label>
-                <span>계좌 최대 미체결 주문</span>
-                <input id="account-max-open-orders" inputmode="numeric" placeholder="미입력 시 제한 없음">
-              </label>
-              <label>
-                <span>매수 수수료율</span>
-                <input id="account-buy-commission-rate" inputmode="decimal" placeholder="예: 0.00015">
-              </label>
-              <label>
-                <span>매도 수수료율</span>
-                <input id="account-sell-commission-rate" inputmode="decimal" placeholder="예: 0.00015">
-              </label>
-              <label>
-                <span>매도 세율</span>
-                <input id="account-sell-tax-rate" inputmode="decimal" placeholder="증권사·시장에 맞게 입력">
-                <small>0.0015는 0.15%입니다. 비워두면 손익에 비용 미확정으로 표시합니다.</small>
-              </label>
-              <button class="button primary settings-submit">계좌 등록</button>
-            </form>
             <div class="registered-section">
-              <div class="registered-heading"><strong>등록된 계좌</strong><span id="account-count">0개</span></div>
+              <div class="registered-heading">
+                <span><strong>등록된 계좌</strong><small id="account-count">0개</small></span>
+                <button class="button quiet compact" id="new-account-button" type="button">새로 등록</button>
+              </div>
               <div class="registered-list" id="account-list"></div>
             </div>
+            <section class="settings-detail">
+              <header class="settings-detail-heading">
+                <div><strong id="account-form-title">새 계좌 등록</strong><span id="account-form-description">API 연결과 거래 계좌를 연결합니다.</span></div>
+              </header>
+              <form class="settings-form" id="account-form">
+                <label>
+                  <span>사용할 API</span>
+                  <select id="account-connection" required></select>
+                </label>
+                <label>
+                  <span>계좌 별칭</span>
+                  <input id="account-alias" placeholder="예: 주식 주계좌" autocomplete="off" required>
+                  <small id="account-alias-hint">전략에서 사용할 계좌 이름입니다.</small>
+                </label>
+                <label>
+                  <span>계좌번호</span>
+                  <input id="account-number" inputmode="numeric" autocomplete="off" required>
+                  <small id="account-number-hint">증권사를 선택하면 계좌번호 형식을 자동으로 적용합니다.</small>
+                </label>
+                <label id="product-code-field" hidden>
+                  <span>계좌 상품코드</span>
+                  <input id="account-product-code" placeholder="예: 01" autocomplete="off">
+                </label>
+                <label>
+                  <span>계좌 1회 주문 상한 (원)</span>
+                  <input id="account-max-order" inputmode="numeric" placeholder="미입력 시 제한 없음">
+                </label>
+                <label>
+                  <span>계좌 일일 매수 상한 (원)</span>
+                  <input id="account-max-daily-buy" inputmode="numeric" placeholder="미입력 시 제한 없음">
+                </label>
+                <label>
+                  <span>계좌 최대 노출액 (원)</span>
+                  <input id="account-max-exposure" inputmode="numeric" placeholder="미입력 시 제한 없음">
+                </label>
+                <label>
+                  <span>계좌 최대 미체결 주문</span>
+                  <input id="account-max-open-orders" inputmode="numeric" placeholder="미입력 시 제한 없음">
+                </label>
+                <label>
+                  <span>매수 수수료율</span>
+                  <input id="account-buy-commission-rate" inputmode="decimal" placeholder="예: 0.00015">
+                </label>
+                <label>
+                  <span>매도 수수료율</span>
+                  <input id="account-sell-commission-rate" inputmode="decimal" placeholder="예: 0.00015">
+                </label>
+                <label>
+                  <span>매도 세율</span>
+                  <input id="account-sell-tax-rate" inputmode="decimal" placeholder="증권사·시장에 맞게 입력">
+                  <small>0.0015는 0.15%입니다. 비워두면 손익에 비용 미확정으로 표시합니다.</small>
+                </label>
+                <button class="button primary settings-submit" id="account-submit-button">계좌 등록</button>
+              </form>
+            </section>
           </div>
         </section>
       </div>
+    </section>
+  </div>
+
+  <div class="modal-backdrop compact-modal-backdrop" id="service-detail-modal" hidden>
+    <section class="modal service-detail-modal" role="dialog" aria-modal="true" aria-labelledby="service-detail-title">
+      <header class="modal-header">
+        <div><span class="eyebrow" id="service-detail-eyebrow">SERVICE RESULT</span><h2 id="service-detail-title">처리 결과 상세</h2></div>
+        <button class="modal-close" id="service-detail-close" type="button" aria-label="처리 결과 상세 닫기">×</button>
+      </header>
+      <div class="service-detail-body" id="service-detail-body"></div>
     </section>
   </div>
 

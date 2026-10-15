@@ -24,6 +24,12 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "key_label": "App Key",
         "secret_label": "App Secret",
         "account_product_code": True,
+        "account_number_format": {
+            "kind": "grouped-digits",
+            "groups": [8, 2],
+            "placeholder": "12345678-01",
+            "product_code_embedded": True,
+        },
         "targets": [
             {"id": "PAPER", "name": "모의투자"},
             {"id": "LIVE", "name": "실전"},
@@ -35,6 +41,12 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "key_label": "App Key",
         "secret_label": "App Secret Key",
         "account_product_code": False,
+        "account_number_format": {
+            "kind": "grouped-digits",
+            "groups": [3, 2, 6],
+            "placeholder": "000-00-000000",
+            "product_code_embedded": False,
+        },
         "targets": [
             {"id": "PAPER", "name": "모의투자"},
             {"id": "LIVE", "name": "실전"},
@@ -172,6 +184,11 @@ class SettingsStore:
                 {
                     **connection,
                     "has_credentials": connection["id"] in secrets["connections"],
+                    "has_realtime_user_id": bool(
+                        secrets["connections"].get(connection["id"], {}).get(
+                            "realtime_user_id"
+                        )
+                    ),
                     "rest_rate_limit": rest_rate_limit_profile(
                         str(connection["provider"]),
                         str(connection["target"]),
@@ -278,8 +295,56 @@ class SettingsStore:
             return {
                 **connection,
                 "has_credentials": True,
+                "has_realtime_user_id": bool(realtime_user_id),
                 "rest_rate_limit": rest_rate_limit_profile(provider, target),
                 "websocket_rate_limit": websocket_rate_limit_profile(provider, target),
+            }
+
+    def update_connection(
+        self,
+        connection_id: str,
+        *,
+        label: str,
+        realtime_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update public connection metadata without exposing or replacing keys."""
+
+        label = label.strip()
+        if not label:
+            raise SettingsError("API 연결 이름을 입력하세요.")
+        with self._lock:
+            state = self._load_state()
+            connection = next(
+                (item for item in state["connections"] if item["id"] == connection_id),
+                None,
+            )
+            if connection is None:
+                raise SettingsError("API 연결을 찾을 수 없습니다.")
+            if any(
+                item["id"] != connection_id
+                and item["label"].casefold() == label.casefold()
+                for item in state["connections"]
+            ):
+                raise SettingsError("같은 이름의 API 연결이 이미 있습니다.")
+            connection["label"] = label
+            secrets = self._load_secrets()
+            credentials = secrets["connections"].get(connection_id)
+            if credentials is None:
+                raise SettingsError("저장된 API 인증정보가 없습니다.")
+            if realtime_user_id is not None:
+                credentials["realtime_user_id"] = realtime_user_id.strip()
+                self._write_secrets(secrets)
+            self._write_state(state)
+            return {
+                **connection,
+                "has_credentials": True,
+                "has_realtime_user_id": bool(credentials.get("realtime_user_id")),
+                "rest_rate_limit": rest_rate_limit_profile(
+                    str(connection["provider"]), str(connection["target"])
+                ),
+                "websocket_rate_limit": websocket_rate_limit_profile(
+                    str(connection["provider"]), str(connection["target"])
+                ),
             }
 
     def remove_connection(self, connection_id: str) -> None:
@@ -391,6 +456,11 @@ class SettingsStore:
                         "target": connection.get("target"),
                         "connection_label": connection.get("label", "삭제된 연결"),
                         "masked_account": _mask_account(account_number),
+                        "formatted_masked_account": _format_masked_account(
+                            str(connection.get("provider") or ""),
+                            account_number,
+                            str(account.get("product_code") or ""),
+                        ),
                     }
                 )
             return result
@@ -441,12 +511,8 @@ class SettingsStore:
         cost_rates: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         alias = alias.strip()
-        account_number = "".join(character for character in account_number if character.isalnum())
-        product_code = product_code.strip()
         if not alias:
             raise SettingsError("계좌 별칭을 입력하세요.")
-        if not account_number:
-            raise SettingsError("계좌번호를 입력하세요.")
 
         with self._lock:
             state = self._load_state()
@@ -458,8 +524,9 @@ class SettingsStore:
                 raise SettingsError("등록된 API 연결을 선택하세요.")
             if any(item["alias"].casefold() == alias.casefold() for item in state["accounts"]):
                 raise SettingsError("같은 별칭의 계좌가 이미 있습니다.")
-            if connection["provider"] == "kis" and not product_code:
-                raise SettingsError("KIS 계좌 상품코드를 입력하세요.")
+            account_number, product_code = _normalize_account_identity(
+                str(connection["provider"]), account_number, product_code
+            )
             account = {
                 "id": f"account-{uuid.uuid4().hex[:12]}",
                 "alias": alias,
@@ -488,7 +555,87 @@ class SettingsStore:
                 "target": connection["target"],
                 "connection_label": connection["label"],
                 "masked_account": _mask_account(account_number),
+                "formatted_masked_account": _format_masked_account(
+                    str(connection["provider"]), account_number, account["product_code"]
+                ),
             }
+
+    def update_account(
+        self,
+        reference: str,
+        *,
+        account_number: str | None = None,
+        product_code: str | None = None,
+        risk_limits: dict[str, str | int | None] | None = None,
+        cost_rates: dict[str, str | None] | None = None,
+    ) -> dict[str, Any]:
+        allowed_limits = {
+            "max_order_amount",
+            "max_daily_buy_amount",
+            "max_exposure",
+            "max_open_orders",
+        }
+        allowed_costs = {
+            "buy_commission_rate",
+            "sell_commission_rate",
+            "sell_tax_rate",
+        }
+        if set(risk_limits or {}) - allowed_limits:
+            raise SettingsError("지원하지 않는 계좌 위험 한도 항목이 있습니다.")
+        if set(cost_rates or {}) - allowed_costs:
+            raise SettingsError("지원하지 않는 계좌 비용 항목이 있습니다.")
+        with self._lock:
+            state = self._load_state()
+            account = next(
+                (
+                    item
+                    for item in state["accounts"]
+                    if item["id"] == reference
+                    or item["alias"].casefold() == reference.casefold()
+                ),
+                None,
+            )
+            if account is None:
+                raise SettingsError("거래 계좌를 찾을 수 없습니다.")
+            connection = next(
+                item
+                for item in state["connections"]
+                if item["id"] == account["connection_id"]
+            )
+            secrets = self._load_secrets()
+            saved_secret = secrets["accounts"].get(account["id"])
+            if saved_secret is None:
+                raise SettingsError("저장된 계좌번호가 없습니다.")
+            if account_number is not None and account_number.strip():
+                normalized_number, normalized_product = _normalize_account_identity(
+                    str(connection["provider"]),
+                    account_number,
+                    product_code if product_code is not None else account.get("product_code", ""),
+                )
+                saved_secret["account_number"] = normalized_number
+                account["product_code"] = normalized_product
+                self._write_secrets(secrets)
+            elif product_code is not None and connection["provider"] == "kis":
+                _, normalized_product = _normalize_account_identity(
+                    "kis",
+                    str(saved_secret["account_number"]),
+                    product_code,
+                )
+                account["product_code"] = normalized_product
+            account["risk_limits"] = {
+                key: value
+                for key, value in (risk_limits or {}).items()
+                if value not in {None, ""}
+            }
+            account["cost_rates"] = {
+                key: str(value)
+                for key, value in (cost_rates or {}).items()
+                if value not in {None, ""}
+            }
+            self._write_state(state)
+            return next(
+                item for item in self.list_accounts() if item["id"] == account["id"]
+            )
 
     def update_account_risk_limits(
         self,
@@ -602,6 +749,56 @@ def _mask_account(value: str) -> str:
     if len(value) <= 8:
         return f"{'*' * (len(value) - 4)}{value[-4:]}"
     return f"{value[:2]}{'*' * (len(value) - 6)}{value[-4:]}"
+
+
+def _normalize_account_identity(
+    provider: str,
+    account_number: str,
+    product_code: str = "",
+) -> tuple[str, str]:
+    compact = "".join(
+        character for character in account_number.strip() if character.isalnum()
+    )
+    product = "".join(
+        character for character in product_code.strip() if character.isalnum()
+    )
+    if provider == "kis":
+        if len(compact) == 10:
+            embedded_product = compact[8:]
+            if product and product != embedded_product:
+                raise SettingsError(
+                    "KIS 계좌번호의 상품코드와 별도 상품코드가 다릅니다."
+                )
+            compact, product = compact[:8], embedded_product
+        if len(compact) != 8 or not compact.isdigit():
+            raise SettingsError("KIS 계좌번호는 8자리 숫자로 입력하세요.")
+        if len(product) != 2 or not product.isdigit():
+            raise SettingsError(
+                "KIS 계좌번호는 상품코드를 포함해 12345678-01 형식으로 입력하세요."
+            )
+        return compact, product
+    if provider == "namuh":
+        if len(compact) != 11 or not compact.isdigit():
+            raise SettingsError(
+                "NAMUH 계좌번호는 000-00-000000 형식의 11자리 숫자로 입력하세요."
+            )
+        return compact, ""
+    if not compact:
+        raise SettingsError("계좌번호를 입력하세요.")
+    return compact, ""
+
+
+def _format_masked_account(
+    provider: str,
+    account_number: str,
+    product_code: str = "",
+) -> str:
+    masked = _mask_account(account_number)
+    if provider == "kis" and len(masked) == 8:
+        return f"{masked}-{product_code}" if product_code else masked
+    if provider == "namuh" and len(masked) == 11:
+        return f"{masked[:3]}-{masked[3:5]}-{masked[5:]}"
+    return masked
 
 
 def _connection_scope_identity(provider: str, target: str, app_key: str) -> str:
