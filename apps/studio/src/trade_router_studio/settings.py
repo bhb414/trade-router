@@ -662,6 +662,7 @@ class SettingsStore:
         allowed_limits = {
             "max_order_amount",
             "max_daily_buy_amount",
+            "max_daily_buy_count",
             "max_exposure",
             "max_open_orders",
         }
@@ -775,6 +776,7 @@ class SettingsStore:
         allowed = {
             "max_order_amount",
             "max_daily_buy_amount",
+            "max_daily_buy_count",
             "max_exposure",
             "max_open_orders",
         }

@@ -1013,6 +1013,34 @@ class OrderService:
 
         account_alias = manifest.trading_account
         if request.side is OrderSide.BUY:
+            business_date = datetime.now(SEOUL).date().isoformat()
+            max_daily_count = _optional_int(limits.get("max_daily_buy_count"))
+            if max_daily_count is not None:
+                used_count = self._store.daily_buy_count(
+                    manifest.strategy_id, business_date
+                )
+                if used_count >= max_daily_count:
+                    raise RouterError(
+                        RouterErrorCode.RISK_LIMIT_EXCEEDED,
+                        "전략의 일일 누적 매수횟수 한도를 초과합니다.",
+                        details={"used": used_count, "limit": max_daily_count},
+                    )
+            account_max_daily_count = _optional_int(
+                account_limits.get("max_daily_buy_count")
+            )
+            if account_max_daily_count is not None:
+                account_used_count = self._store.account_daily_buy_count(
+                    account_alias, business_date
+                )
+                if account_used_count >= account_max_daily_count:
+                    raise RouterError(
+                        RouterErrorCode.RISK_LIMIT_EXCEEDED,
+                        "계좌의 일일 누적 매수횟수 한도를 초과합니다.",
+                        details={
+                            "used": account_used_count,
+                            "limit": account_max_daily_count,
+                        },
+                    )
             buying_power = await self._gateway.buying_power(
                 account_alias,
                 request.instrument.code,
@@ -1047,12 +1075,12 @@ class OrderService:
             max_daily = _optional_decimal(limits.get("max_daily_buy_amount"))
             if max_daily is not None:
                 used = self._store.daily_buy_reserved(
-                    manifest.strategy_id, datetime.now(SEOUL).date().isoformat()
+                    manifest.strategy_id, business_date
                 )
                 if used + amount > max_daily:
                     raise RouterError(
                         RouterErrorCode.RISK_LIMIT_EXCEEDED,
-                        "전략의 일일 매수 한도를 초과합니다.",
+                        "전략의 일일 누적 매수금액 한도를 초과합니다.",
                         details={"used": str(used), "requested": str(amount)},
                     )
             account_max_daily = _optional_decimal(
@@ -1060,12 +1088,12 @@ class OrderService:
             )
             if account_max_daily is not None:
                 account_used = self._store.account_daily_buy_reserved(
-                    account_alias, datetime.now(SEOUL).date().isoformat()
+                    account_alias, business_date
                 )
                 if account_used + amount > account_max_daily:
                     raise RouterError(
                         RouterErrorCode.RISK_LIMIT_EXCEEDED,
-                        "계좌의 일일 매수 한도를 초과합니다.",
+                        "계좌의 일일 누적 매수금액 한도를 초과합니다.",
                         details={
                             "used": str(account_used),
                             "requested": str(amount),

@@ -1042,6 +1042,44 @@ class RuntimeStore:
                 total += Decimal(str(request.get("reserved_amount", "0")))
         return total
 
+    def daily_buy_count(self, strategy_id: str, business_date: str) -> int:
+        """Count non-rejected buy submissions for a strategy on a business day."""
+
+        rows = self._fetchall(
+            """
+            SELECT request_json FROM order_ledger
+            WHERE strategy_id = ? AND created_at LIKE ?
+              AND status != ?
+            """,
+            (strategy_id, f"{business_date}%", OrderStatus.REJECTED.value),
+        )
+        return sum(
+            1
+            for row in rows
+            if json.loads(row["request_json"]).get("side") == "BUY"
+        )
+
+    def account_daily_buy_count(
+        self,
+        account_alias: str,
+        business_date: str,
+    ) -> int:
+        """Count non-rejected buy submissions for an account on a business day."""
+
+        rows = self._fetchall(
+            """
+            SELECT request_json FROM order_ledger
+            WHERE account_alias = ? AND created_at LIKE ?
+              AND status != ?
+            """,
+            (account_alias, f"{business_date}%", OrderStatus.REJECTED.value),
+        )
+        return sum(
+            1
+            for row in rows
+            if json.loads(row["request_json"]).get("side") == "BUY"
+        )
+
     def unresolved_for_instrument(
         self,
         *,

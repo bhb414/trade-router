@@ -147,30 +147,19 @@
           </div>
           <section class="strategy-overview-section performance-section">
             <div class="overview-section-heading">
-              <div><h3>전략 성과</h3><p id="overview-cost-basis">이 전략이 Trade Router로 제출한 체결을 기준으로 계산합니다.</p></div>
+              <div><h3>전략 잔고</h3><p id="overview-cost-basis">이 전략이 Trade Router로 제출한 체결을 기준으로 계산합니다.</p></div>
             </div>
-            <div class="strategy-performance-grid">
-              <article><span>추정 손익</span><strong id="overview-estimated-profit">—</strong><small>원</small></article>
-              <article><span>추정 수익률</span><strong id="overview-estimated-return">—</strong><small>%</small></article>
-              <article><span>실현 손익</span><strong id="overview-realized-profit">—</strong><small>원</small></article>
-              <article><span>평가 손익</span><strong id="overview-unrealized-profit">—</strong><small>원</small></article>
-              <article><span>체결 매수액</span><strong id="overview-buy-amount">—</strong><small>원</small></article>
-              <article><span>체결 매도액</span><strong id="overview-sell-amount">—</strong><small>원</small></article>
-              <article><span>수수료</span><strong id="overview-commission">—</strong><small>원</small></article>
-              <article><span>거래세</span><strong id="overview-tax">—</strong><small>원</small></article>
+            <div class="balance-tabs" role="tablist" aria-label="전략 잔고 내용">
+              <button class="balance-tab active" type="button" role="tab" aria-selected="true" data-balance-tab="balance">전략 잔고</button>
+              <button class="balance-tab" type="button" role="tab" aria-selected="false" data-balance-tab="trades">매매기록</button>
             </div>
+            <div id="overview-balance-content"></div>
           </section>
           <section class="strategy-overview-section">
             <div class="overview-section-heading">
               <div><h3>서비스별 결과</h3><p>이 전략이 오늘 사용한 시세·스케줄·계좌·주문 서비스 결과입니다.</p></div>
             </div>
             <div class="service-result-tabs strategy-service-results" id="overview-service-results"></div>
-          </section>
-          <section class="strategy-overview-section">
-            <div class="overview-section-heading">
-              <div><h3>전략 위험 한도</h3><p>주문 전 검사에 실제로 사용하는 값과 현재 사용량입니다.</p></div>
-            </div>
-            <div class="limit-list" id="overview-limit-list"></div>
           </section>
         </section>
         <section class="strategy-blocks" id="strategy-blocks" hidden>
@@ -416,19 +405,23 @@
                   <input id="account-product-code" placeholder="예: 01" autocomplete="off">
                 </label>
                 <label>
-                  <span>계좌 1회 주문 상한 (원)</span>
+                  <span>1회 주문금액 한도 (원)</span>
                   <input id="account-max-order" inputmode="numeric" placeholder="미입력 시 제한 없음">
                 </label>
                 <label>
-                  <span>계좌 일일 매수 상한 (원)</span>
+                  <span>일일 누적 매수금액 한도 (원)</span>
                   <input id="account-max-daily-buy" inputmode="numeric" placeholder="미입력 시 제한 없음">
                 </label>
                 <label>
-                  <span>계좌 최대 노출액 (원)</span>
+                  <span>일일 누적 매수횟수 한도 (회)</span>
+                  <input id="account-max-daily-buy-count" inputmode="numeric" placeholder="미입력 시 제한 없음">
+                </label>
+                <label>
+                  <span>최대 보유 노출액 한도 (원)</span>
                   <input id="account-max-exposure" inputmode="numeric" placeholder="미입력 시 제한 없음">
                 </label>
                 <label>
-                  <span>계좌 최대 미체결 주문</span>
+                  <span>동시 미체결 주문 한도 (건)</span>
                   <input id="account-max-open-orders" inputmode="numeric" placeholder="미입력 시 제한 없음">
                 </label>
                 <label>
@@ -463,6 +456,16 @@
         <button class="modal-close" id="service-detail-close" type="button" aria-label="처리 결과 상세 닫기">×</button>
       </header>
       <div class="service-detail-body" id="service-detail-body"></div>
+    </section>
+  </div>
+
+  <div class="modal-backdrop compact-modal-backdrop" id="account-balance-modal" hidden>
+    <section class="modal account-balance-modal" role="dialog" aria-modal="true" aria-labelledby="account-balance-title">
+      <header class="modal-header">
+        <div><span class="eyebrow">ACCOUNT BALANCE</span><h2 id="account-balance-title">계좌 상세</h2></div>
+        <button class="modal-close" id="account-balance-close" type="button" aria-label="계좌 상세 닫기">×</button>
+      </header>
+      <div class="account-balance-body" id="account-balance-body"></div>
     </section>
   </div>
 

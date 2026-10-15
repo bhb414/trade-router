@@ -44,6 +44,7 @@ const state = {
   openingStrategy: null,
   dashboardServiceTab: "market",
   strategyServiceTab: "market",
+  strategyBalanceTab: "balance",
 };
 
 const elements = {
@@ -93,6 +94,8 @@ const elements = {
   settingsModal: document.querySelector("#settings-modal"),
   serviceDetailModal: document.querySelector("#service-detail-modal"),
   serviceDetailBody: document.querySelector("#service-detail-body"),
+  accountBalanceModal: document.querySelector("#account-balance-modal"),
+  accountBalanceBody: document.querySelector("#account-balance-body"),
   connectionProvider: document.querySelector("#connection-provider"),
   connectionTarget: document.querySelector("#connection-target"),
   accountConnection: document.querySelector("#account-connection"),
@@ -330,12 +333,13 @@ function appendLimitRow(container, label, usage, kind = "money") {
   track.append(fill);
   const value = document.createElement("span");
   value.className = "limit-value";
+  const suffix = kind === "money" ? "원" : kind === "times" ? "회" : "건";
   if (usage?.limit == null) {
     value.textContent = "미설정";
   } else if (usage?.used == null) {
-    value.textContent = `한도 ${formatNumber(usage.limit)}${kind === "money" ? "원" : "건"}`;
+    value.textContent = `한도 ${formatNumber(usage.limit)}${suffix}`;
   } else {
-    value.textContent = `${formatNumber(usage.used)} / ${formatNumber(usage.limit)}${kind === "money" ? "원" : "건"}`;
+    value.textContent = `${formatNumber(usage.used)} / ${formatNumber(usage.limit)}${suffix}`;
   }
   row.append(title, track, value);
   container.append(row);
@@ -590,28 +594,10 @@ function renderStrategyOverview() {
     : "상태 확인 중";
 
   const performance = summary?.performance || {};
-  const performanceFields = [
-    ["#overview-estimated-profit", performance.estimated_profit],
-    ["#overview-realized-profit", performance.realized_profit],
-    ["#overview-unrealized-profit", performance.unrealized_profit],
-    ["#overview-buy-amount", performance.filled_buy_amount],
-    ["#overview-sell-amount", performance.filled_sell_amount],
-    ["#overview-commission", performance.commission],
-    ["#overview-tax", performance.tax],
-  ];
-  for (const [selector, value] of performanceFields) {
-    const element = document.querySelector(selector);
-    element.textContent = formatNumber(value, { signed: selector.includes("profit") });
-    element.className = selector.includes("profit") ? profitClass(value) : "";
-  }
-  const returnElement = document.querySelector("#overview-estimated-return");
-  returnElement.textContent = performance.estimated_return_percent == null
-    ? "—"
-    : Number(performance.estimated_return_percent).toLocaleString("ko-KR", { maximumFractionDigits: 2 });
-  returnElement.className = profitClass(performance.estimated_return_percent);
   document.querySelector("#overview-cost-basis").textContent = performance.costs_complete
     ? "체결 금액에 계좌별 수수료율과 매도 세율을 반영한 순손익입니다."
     : "수수료율 또는 매도 세율이 비어 있어 현재 손익의 비용은 미확정입니다.";
+  renderStrategyBalanceContent();
 
   renderServiceResultTabs(
     document.querySelector("#overview-service-results"),
@@ -619,12 +605,107 @@ function renderStrategyOverview() {
     "strategy"
   );
 
-  const limits = document.querySelector("#overview-limit-list");
-  limits.replaceChildren();
-  appendLimitRow(limits, "1회 주문 (오늘 최고)", summary?.limits?.max_order_amount);
-  appendLimitRow(limits, "오늘 매수 예산", summary?.limits?.max_daily_buy_amount);
-  appendLimitRow(limits, "운용 예산", summary?.limits?.max_exposure);
-  appendLimitRow(limits, "미체결 주문", summary?.limits?.max_open_orders, "count");
+}
+
+function metricCard(label, raw, { unit = "원", signed = false, percent = false } = {}) {
+  const article = document.createElement("article");
+  const caption = document.createElement("span");
+  caption.textContent = label;
+  const value = document.createElement("strong");
+  value.textContent = percent
+    ? raw == null ? "—" : Number(raw).toLocaleString("ko-KR", { maximumFractionDigits: 2 })
+    : formatNumber(raw, { signed });
+  if (signed || percent) value.className = profitClass(raw);
+  const suffix = document.createElement("small");
+  suffix.textContent = unit;
+  article.append(caption, value, suffix);
+  return article;
+}
+
+function dataTable(columns, rows, emptyMessage) {
+  if (!rows.length) {
+    const empty = document.createElement("div");
+    empty.className = "balance-empty";
+    empty.textContent = emptyMessage;
+    return empty;
+  }
+  const wrap = document.createElement("div");
+  wrap.className = "balance-table-wrap";
+  const table = document.createElement("table");
+  table.className = "balance-table";
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  columns.forEach(column => {
+    const cell = document.createElement("th");
+    cell.textContent = column.label;
+    headRow.append(cell);
+  });
+  head.append(headRow);
+  const body = document.createElement("tbody");
+  rows.forEach(row => {
+    const line = document.createElement("tr");
+    columns.forEach(column => {
+      const cell = document.createElement("td");
+      const output = column.render(row);
+      cell.textContent = output?.text ?? String(output ?? "—");
+      if (output?.className) cell.className = output.className;
+      line.append(cell);
+    });
+    body.append(line);
+  });
+  table.append(head, body);
+  wrap.append(table);
+  return wrap;
+}
+
+function positionTable(positions, emptyMessage = "이 전략이 보유한 종목이 없습니다.") {
+  return dataTable([
+    { label: "종목", render: row => row.code || "—" },
+    { label: "보유 / 주문가능", render: row => `${formatNumber(row.quantity)} / ${formatNumber(row.available_quantity)}주` },
+    { label: "평균 매입가", render: row => `${formatNumber(row.average_price)}원` },
+    { label: "현재가", render: row => row.market_price == null ? "—" : `${formatNumber(row.market_price)}원` },
+    { label: "평가금액", render: row => row.market_value == null ? "—" : `${formatNumber(row.market_value)}원` },
+    { label: "평가손익", render: row => ({ text: row.unrealized_profit == null ? "—" : `${formatNumber(row.unrealized_profit, { signed: true })}원`, className: profitClass(row.unrealized_profit) }) },
+    { label: "수익률", render: row => ({ text: row.return_percent == null ? "—" : `${Number(row.return_percent).toLocaleString("ko-KR", { maximumFractionDigits: 2 })}%`, className: profitClass(row.return_percent) }) },
+  ], positions || [], emptyMessage);
+}
+
+function renderStrategyBalanceContent() {
+  const container = document.querySelector("#overview-balance-content");
+  if (!container) return;
+  container.replaceChildren();
+  document.querySelectorAll("[data-balance-tab]").forEach(button => {
+    const active = button.dataset.balanceTab === state.strategyBalanceTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  const summary = state.strategySummary || {};
+  const performance = summary.performance || {};
+  if (state.strategyBalanceTab === "trades") {
+    container.append(dataTable([
+      { label: "시각", render: row => formatTimestamp(row.updated_at || row.created_at) },
+      { label: "종목", render: row => row.code || "—" },
+      { label: "구분", render: row => row.side === "SELL" ? "매도" : "매수" },
+      { label: "주문", render: row => `${row.order_type === "LIMIT" ? "지정가" : "시장가"} ${formatNumber(row.quantity)}주` },
+      { label: "체결", render: row => row.filled_quantity && Number(row.filled_quantity) > 0 ? `${formatNumber(row.filled_quantity)}주 · ${formatNumber(row.average_fill_price)}원` : "—" },
+      { label: "상태", render: row => ({ text: orderStatusPresentation(row.status)[0], className: orderStatusPresentation(row.status)[1] }) },
+      { label: "비용", render: row => `${formatNumber(Number(row.commission || 0) + Number(row.tax || 0))}원` },
+    ], summary.trade_history || [], "이 전략의 매매기록이 없습니다."));
+    return;
+  }
+  const metrics = document.createElement("div");
+  metrics.className = "strategy-performance-grid compact";
+  metrics.append(
+    metricCard("추정 손익", performance.estimated_profit, { signed: true }),
+    metricCard("추정 수익률", performance.estimated_return_percent, { unit: "%", percent: true }),
+    metricCard("실현 손익", performance.realized_profit, { signed: true }),
+    metricCard("평가 손익", performance.unrealized_profit, { signed: true }),
+    metricCard("수수료·세금", Number(performance.commission || 0) + Number(performance.tax || 0)),
+  );
+  const heading = document.createElement("div");
+  heading.className = "balance-subheading";
+  heading.innerHTML = `<strong>보유 종목</strong><span>${performance.positions?.length || 0}종목</span>`;
+  container.append(metrics, heading, positionTable(performance.positions || []));
 }
 
 function renderDashboard() {
@@ -674,6 +755,9 @@ function renderDashboard() {
 function renderDashboardAccount(account) {
   const row = document.createElement("article");
   row.className = "dashboard-account-row";
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  row.setAttribute("aria-label", `${account.alias} 계좌 상세 보기`);
   const heading = document.createElement("div");
   heading.className = "dashboard-row-heading";
   const copy = document.createElement("div");
@@ -686,11 +770,17 @@ function renderDashboardAccount(account) {
     : "주문 차단";
   meta.textContent = `${account.connection_label || account.provider || "API"} · ${target || ""} · ${account.masked_account || ""} · ${permission}`;
   copy.append(name, meta);
+  const statusWrap = document.createElement("div");
+  statusWrap.className = "dashboard-account-status";
   const status = document.createElement("span");
   status.className = `status-pill ${account.state || "unchecked"}`;
   status.textContent = account.state === "ok" ? "정상" : account.state === "unsupported" ? "미지원" : "조회 오류";
   status.title = account.message || "";
-  heading.append(copy, status);
+  const detailHint = document.createElement("span");
+  detailHint.className = "dashboard-detail-hint";
+  detailHint.textContent = "상세 ›";
+  statusWrap.append(status, detailHint);
+  heading.append(copy, statusWrap);
 
   const body = document.createElement("div");
   body.className = "account-dashboard-body";
@@ -711,14 +801,53 @@ function renderDashboardAccount(account) {
     cell.append(caption, value);
     values.append(cell);
   }
-  const limits = document.createElement("div");
-  limits.className = "limit-list";
-  appendLimitRow(limits, "일일 매수", account.limits?.max_daily_buy_amount);
-  appendLimitRow(limits, "보유 노출", account.limits?.max_exposure);
-  appendLimitRow(limits, "미체결", account.limits?.max_open_orders, "count");
-  body.append(values, limits);
+  body.append(values);
   row.append(heading, body);
+  row.addEventListener("click", () => openAccountBalance(account));
+  row.addEventListener("keydown", event => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openAccountBalance(account);
+    }
+  });
   return row;
+}
+
+function openAccountBalance(account) {
+  document.querySelector("#account-balance-title").textContent = account.alias;
+  const body = elements.accountBalanceBody;
+  body.replaceChildren();
+  const target = account.target === "LIVE" ? "실전" : account.target === "PAPER" ? "모의" : account.target;
+  const meta = document.createElement("div");
+  meta.className = "account-modal-meta";
+  meta.textContent = `${account.connection_label || account.provider || "API"} · ${target || ""} · ${account.masked_account || ""} · ${account.message || ""}`;
+  const metrics = document.createElement("div");
+  metrics.className = "strategy-performance-grid account-modal-metrics";
+  metrics.append(
+    metricCard("총 자산", account.total_value),
+    metricCard("예수금", account.cash),
+    metricCard("보유 평가액", account.market_value),
+    metricCard("평가손익", account.unrealized_profit, { signed: true }),
+  );
+  const positionsHeading = document.createElement("div");
+  positionsHeading.className = "balance-subheading";
+  positionsHeading.innerHTML = `<strong>보유 종목</strong><span>${account.position_count || 0}종목</span>`;
+  const limitHeading = document.createElement("div");
+  limitHeading.className = "balance-subheading";
+  limitHeading.innerHTML = "<strong>계좌 주문 한도</strong><span>계좌 설정 기준</span>";
+  const limits = document.createElement("div");
+  limits.className = "limit-list account-modal-limits";
+  appendLimitRow(limits, "1회 주문금액", account.limits?.max_order_amount);
+  appendLimitRow(limits, "일일 누적 매수금액", account.limits?.max_daily_buy_amount);
+  appendLimitRow(limits, "일일 누적 매수횟수", account.limits?.max_daily_buy_count, "times");
+  appendLimitRow(limits, "최대 보유 노출액", account.limits?.max_exposure);
+  appendLimitRow(limits, "동시 미체결 주문", account.limits?.max_open_orders, "count");
+  body.append(meta, metrics, positionsHeading, positionTable(account.positions || [], "이 계좌에 보유 종목이 없습니다."), limitHeading, limits);
+  elements.accountBalanceModal.hidden = false;
+}
+
+function closeAccountBalance() {
+  elements.accountBalanceModal.hidden = true;
 }
 
 function renderDashboardService(service) {
@@ -2573,7 +2702,7 @@ function setStrategyTab(tab) {
   const allowed = state.strategyType === "block"
     ? new Set(["overview", "blocks"])
     : new Set(["overview", "code"]);
-  if (!allowed.has(tab)) tab = state.strategyType === "block" ? "blocks" : "code";
+  if (!allowed.has(tab)) tab = "overview";
   state.strategyTab = tab;
   document.querySelectorAll("[data-strategy-tab]").forEach(button => {
     button.classList.toggle("active", button.dataset.strategyTab === tab);
@@ -2697,7 +2826,11 @@ async function refreshStrategies({ force = false } = {}) {
 }
 
 async function openStrategy(name) {
-  if (name === state.selected && state.view === "strategy") return;
+  if (name === state.selected && state.view === "strategy") {
+    state.strategyBalanceTab = "balance";
+    setStrategyTab("overview");
+    return;
+  }
   if (name === state.openingStrategy) return;
   if (state.dirty && !window.confirm("저장하지 않은 변경 사항이 있습니다. 저장하지 않고 다른 전략을 열까요?")) return;
   const openToken = ++state.strategyOpenToken;
@@ -2719,6 +2852,7 @@ async function openStrategy(name) {
     state.selected = name;
     state.strategyType = strategyType;
     state.strategySummary = null;
+    state.strategyBalanceTab = "balance";
     showWorkspaceView("strategy");
     elements.fileName.textContent = displayStrategyName(name);
     configureStrategyTabs();
@@ -2726,7 +2860,7 @@ async function openStrategy(name) {
     state.blockSource = null;
     setDirty(false);
     updateLineNumbers();
-    setStrategyTab(state.strategyType === "block" ? "blocks" : "overview");
+    setStrategyTab("overview");
     state.logCursor = state.clearedLogCursors[name] || 0;
     resetActivity();
     renderStrategies();
@@ -3072,6 +3206,15 @@ function positiveNumberOrNull(selector) {
   return value ? value : null;
 }
 
+function positiveIntegerOrNull(selector) {
+  const value = positiveNumberOrNull(selector);
+  if (value == null) return null;
+  if (!/^\d+$/.test(value) || Number(value) < 1) {
+    throw new Error("횟수와 주문 건수 한도는 1 이상의 정수로 입력하세요.");
+  }
+  return Number(value);
+}
+
 function formatRateLimits(rest, websocket) {
   const restText = rest
     ? `REST 초당 ${Number(rest.requests_per_second).toLocaleString()}회 · 최소 ${rest.minimum_interval_ms}ms`
@@ -3219,6 +3362,7 @@ function renderAccountForm() {
   const costs = account?.cost_rates || {};
   document.querySelector("#account-max-order").value = limits.max_order_amount ?? "";
   document.querySelector("#account-max-daily-buy").value = limits.max_daily_buy_amount ?? "";
+  document.querySelector("#account-max-daily-buy-count").value = limits.max_daily_buy_count ?? "";
   document.querySelector("#account-max-exposure").value = limits.max_exposure ?? "";
   document.querySelector("#account-max-open-orders").value = limits.max_open_orders ?? "";
   document.querySelector("#account-buy-commission-rate").value = costs.buy_commission_rate ?? "";
@@ -3378,7 +3522,8 @@ function renderAccountList() {
     const limitSummary = document.createElement("span");
     const limitParts = [
       limits.max_order_amount && `1회 ${Number(limits.max_order_amount).toLocaleString()}원`,
-      limits.max_daily_buy_amount && `일일 ${Number(limits.max_daily_buy_amount).toLocaleString()}원`,
+      limits.max_daily_buy_amount && `일일 누적매수액 ${Number(limits.max_daily_buy_amount).toLocaleString()}원`,
+      limits.max_daily_buy_count && `일일 누적매수 ${limits.max_daily_buy_count}회`,
       limits.max_exposure && `노출 ${Number(limits.max_exposure).toLocaleString()}원`,
       limits.max_open_orders && `미체결 ${limits.max_open_orders}건`,
     ].filter(Boolean);
@@ -3830,6 +3975,12 @@ elements.newStrategyModal.addEventListener("click", event => {
 document.querySelectorAll("[data-strategy-tab]").forEach(button => {
   button.addEventListener("click", () => setStrategyTab(button.dataset.strategyTab));
 });
+document.querySelectorAll("[data-balance-tab]").forEach(button => {
+  button.addEventListener("click", () => {
+    state.strategyBalanceTab = button.dataset.balanceTab;
+    renderStrategyBalanceContent();
+  });
+});
 
 elements.save.addEventListener("click", () => saveStrategy().catch(error => notify(error.message, true)));
 elements.run.addEventListener("click", () => runStrategy().catch(error => notify(error.message, true)));
@@ -3931,6 +4082,10 @@ document.querySelector("#service-detail-close").addEventListener("click", closeS
 elements.serviceDetailModal.addEventListener("click", event => {
   if (event.target === elements.serviceDetailModal) closeServiceEventDetail();
 });
+document.querySelector("#account-balance-close").addEventListener("click", closeAccountBalance);
+elements.accountBalanceModal.addEventListener("click", event => {
+  if (event.target === elements.accountBalanceModal) closeAccountBalance();
+});
 document.querySelectorAll("[data-settings-tab]").forEach(button => {
   button.addEventListener("click", () => activateSettingsTab(button.dataset.settingsTab));
 });
@@ -4002,8 +4157,9 @@ document.querySelector("#account-form").addEventListener("submit", async event =
       product_code: document.querySelector("#account-product-code").value || null,
       max_order_amount: positiveNumberOrNull("#account-max-order"),
       max_daily_buy_amount: positiveNumberOrNull("#account-max-daily-buy"),
+      max_daily_buy_count: positiveIntegerOrNull("#account-max-daily-buy-count"),
       max_exposure: positiveNumberOrNull("#account-max-exposure"),
-      max_open_orders: positiveNumberOrNull("#account-max-open-orders"),
+      max_open_orders: positiveIntegerOrNull("#account-max-open-orders"),
       buy_commission_rate: positiveNumberOrNull("#account-buy-commission-rate"),
       sell_commission_rate: positiveNumberOrNull("#account-sell-commission-rate"),
       sell_tax_rate: positiveNumberOrNull("#account-sell-tax-rate"),
@@ -4031,6 +4187,10 @@ document.querySelector("#account-form").addEventListener("submit", async event =
 });
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !elements.accountBalanceModal.hidden) {
+    closeAccountBalance();
+    return;
+  }
   if (event.key === "Escape" && !elements.serviceDetailModal.hidden) {
     closeServiceEventDetail();
     return;

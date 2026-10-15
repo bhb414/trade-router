@@ -196,6 +196,7 @@ StrategyConfig(
     limits=RiskLimits(
         max_order_amount=50_000,
         max_daily_buy_amount=300_000,
+        max_daily_buy_count=10,
         max_open_orders=5,
     ),
 )

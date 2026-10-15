@@ -13,6 +13,7 @@ class RiskLimits:
     max_daily_buy_amount: Decimal | None = None
     max_exposure: Decimal | None = None
     max_open_orders: int | None = None
+    max_daily_buy_count: int | None = None
 
     def __post_init__(self) -> None:
         numeric = (
@@ -22,8 +23,9 @@ class RiskLimits:
         )
         if any(value is not None and value <= 0 for value in numeric):
             raise ValueError("Risk-limit amounts must be positive.")
-        if self.max_open_orders is not None and self.max_open_orders < 1:
-            raise ValueError("Open-order limit must be positive.")
+        counts = (self.max_daily_buy_count, self.max_open_orders)
+        if any(value is not None and value < 1 for value in counts):
+            raise ValueError("Risk-limit counts must be positive.")
 
 
 @dataclass(frozen=True, slots=True)

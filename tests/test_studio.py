@@ -766,6 +766,7 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
                 "account_number": "12345678",
                 "product_code": "01",
                 "max_daily_buy_amount": "100000",
+                "max_daily_buy_count": 4,
                 "max_exposure": "200000",
                 "max_open_orders": 3,
             },
@@ -785,6 +786,12 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
     account = payload["accounts"][0]
     assert account["state"] == "ok"
     assert account["position_count"] == 1
+    assert account["positions"][0]["available_quantity"] == "10"
+    assert account["positions"][0]["market_value"] == "100000"
+    assert account["positions"][0]["unrealized_profit"] == "10000"
+    assert account["positions"][0]["return_percent"] == "11.11"
+    assert account["limits"]["max_daily_buy_count"]["used"] == "0"
+    assert account["limits"]["max_daily_buy_count"]["limit"] == "4"
     assert account["limits"]["max_exposure"]["used"] == "100000"
     assert account["limits"]["max_exposure"]["percent"] == 50.0
     assert payload["services"][0]["state"] == "connected"
@@ -825,6 +832,19 @@ def test_strategy_performance_uses_router_owned_fills_and_current_price() -> Non
     assert result["estimated_return_percent"] == "35.00"
     assert result["matched_sales"] == 1
     assert result["winning_sales"] == 1
+    assert result["positions"] == [
+        {
+            "code": "005930",
+            "quantity": "1",
+            "available_quantity": "1",
+            "average_price": "100",
+            "market_price": "150",
+            "cost_basis": "100",
+            "market_value": "150",
+            "unrealized_profit": "50",
+            "return_percent": "50.00",
+        }
+    ]
     assert result["includes_fees"] is False
 
 
@@ -934,6 +954,7 @@ class SummaryStrategy(Strategy):
         "winning_sales": 0,
         "win_rate": None,
         "unpriced_codes": [],
+        "positions": [],
         "includes_fees": False,
         "commission": "0",
         "tax": "0",
@@ -991,12 +1012,14 @@ def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
                 "product_code": "01",
                 "max_order_amount": "500000",
                 "max_daily_buy_amount": "1000000",
+                "max_daily_buy_count": 7,
                 "max_open_orders": 3,
             },
         )
         assert account.status_code == 201
         assert account.json()["masked_account"] == "****5678"
         assert account.json()["risk_limits"]["max_order_amount"] == "500000"
+        assert account.json()["risk_limits"]["max_daily_buy_count"] == 7
         assert account.json()["risk_limits"]["max_open_orders"] == 3
         assert "account_number" not in account.json()
 

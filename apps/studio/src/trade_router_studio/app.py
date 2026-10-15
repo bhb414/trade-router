@@ -79,6 +79,7 @@ class AccountRegistration(BaseModel):
     product_code: str = ""
     max_order_amount: Decimal | None = Field(default=None, gt=0)
     max_daily_buy_amount: Decimal | None = Field(default=None, gt=0)
+    max_daily_buy_count: int | None = Field(default=None, ge=1)
     max_exposure: Decimal | None = Field(default=None, gt=0)
     max_open_orders: int | None = Field(default=None, ge=1)
     buy_commission_rate: Decimal | None = Field(default=None, ge=0)
@@ -93,6 +94,7 @@ class AccountUpdate(BaseModel):
     product_code: str | None = None
     max_order_amount: Decimal | None = Field(default=None, gt=0)
     max_daily_buy_amount: Decimal | None = Field(default=None, gt=0)
+    max_daily_buy_count: int | None = Field(default=None, ge=1)
     max_exposure: Decimal | None = Field(default=None, gt=0)
     max_open_orders: int | None = Field(default=None, ge=1)
     buy_commission_rate: Decimal | None = Field(default=None, ge=0)
@@ -117,6 +119,7 @@ class StrategyManifestRegistration(BaseModel):
 class StrategyRiskLimitsRegistration(BaseModel):
     max_order_amount: Decimal | None = Field(default=None, gt=0)
     max_daily_buy_amount: Decimal | None = Field(default=None, gt=0)
+    max_daily_buy_count: int | None = Field(default=None, ge=1)
     max_exposure: Decimal | None = Field(default=None, gt=0)
     max_open_orders: int | None = Field(default=None, ge=1)
 
@@ -213,6 +216,7 @@ def _strategy_config_from_source(source: str) -> dict[str, object]:
         "risk_limits": {
             "max_order_amount": None,
             "max_daily_buy_amount": None,
+            "max_daily_buy_count": None,
             "max_exposure": None,
             "max_open_orders": None,
         },
@@ -371,24 +375,90 @@ def _strategy_performance(
         position["quantity"] -= matched
         position["cost"] -= average_cost * matched
 
-    market_prices: dict[str, Decimal] = {}
+    account_positions: dict[str, dict[str, Decimal]] = {}
     for item in (account or {}).get("positions", []) or []:
         if not isinstance(item, dict):
             continue
         code = str(item.get("code") or "")
-        value = item.get("market_price") or item.get("average_price")
-        if code and value not in {None, ""}:
-            market_prices[code] = Decimal(str(value))
+        if not code:
+            continue
+        account_quantity = Decimal(
+            str(item.get("quantity") or positions.get(code, {}).get("quantity") or "0")
+        )
+        account_positions[code] = {
+            "quantity": account_quantity,
+            "available_quantity": Decimal(
+                str(item.get("available_quantity") or account_quantity)
+            ),
+            "average_price": Decimal(str(item.get("average_price") or "0")),
+            "market_price": Decimal(
+                str(item.get("market_price") or item.get("average_price") or "0")
+            ),
+        }
     unrealized = Decimal("0")
     unpriced_codes: list[str] = []
+    position_rows: list[dict[str, object]] = []
+    account_balance_available = account is not None and account.get("state") in {
+        None,
+        "ok",
+    }
     for code, position in positions.items():
         if position["quantity"] <= 0:
             continue
-        market_price = market_prices.get(code)
-        if market_price is None:
-            unpriced_codes.append(code)
+        account_position = account_positions.get(code)
+        quantity = position["quantity"]
+        if account_balance_available:
+            quantity = min(
+                quantity,
+                account_position["quantity"] if account_position else Decimal("0"),
+            )
+        if quantity <= 0:
             continue
-        unrealized += market_price * position["quantity"] - position["cost"]
+        average_cost = position["cost"] / position["quantity"]
+        market_price = (
+            account_position["market_price"] if account_position else Decimal("0")
+        )
+        if market_price <= 0:
+            unpriced_codes.append(code)
+            market_price_value: str | None = None
+            market_value: Decimal | None = None
+            position_profit: Decimal | None = None
+            position_return: Decimal | None = None
+        else:
+            market_price_value = str(market_price)
+            market_value = market_price * quantity
+            position_cost = average_cost * quantity
+            position_profit = market_value - position_cost
+            unrealized += position_profit
+            position_return = (
+                position_profit / position_cost * Decimal("100")
+                if position_cost > 0
+                else None
+            )
+        available = (
+            min(quantity, account_position["available_quantity"])
+            if account_position
+            else quantity
+        )
+        position_rows.append(
+            {
+                "code": code,
+                "quantity": str(quantity),
+                "available_quantity": str(available),
+                "average_price": str(average_cost),
+                "market_price": market_price_value,
+                "cost_basis": str(average_cost * quantity),
+                "market_value": str(market_value) if market_value is not None else None,
+                "unrealized_profit": (
+                    str(position_profit) if position_profit is not None else None
+                ),
+                "return_percent": (
+                    str(position_return.quantize(Decimal("0.01")))
+                    if position_return is not None
+                    else None
+                ),
+            }
+        )
 
     total_profit = realized + unrealized
     return_rate = (
@@ -416,9 +486,40 @@ def _strategy_performance(
             else None
         ),
         "unpriced_codes": unpriced_codes,
+        "positions": position_rows,
         "includes_fees": bool(cost_flags) and all(cost_flags),
         "costs_complete": bool(cost_flags) and all(cost_flags),
     }
+
+
+def _strategy_trade_history(
+    orders: list[dict[str, object]],
+    *,
+    limit: int = 200,
+) -> list[dict[str, object]]:
+    """Return presentation-safe strategy order history without provider secrets."""
+
+    rows: list[dict[str, object]] = []
+    for row in orders[:limit]:
+        request = dict(row.get("request") or {})
+        rows.append(
+            {
+                "id": row.get("id"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "code": request.get("code"),
+                "side": request.get("side"),
+                "order_type": request.get("order_type"),
+                "quantity": request.get("quantity"),
+                "filled_quantity": row.get("filled_quantity"),
+                "average_fill_price": row.get("average_fill_price"),
+                "status": row.get("status"),
+                "commission": row.get("commission"),
+                "tax": row.get("tax"),
+                "message": row.get("message"),
+            }
+        )
+    return rows
 
 
 def _unfilled_buy_reservations(rows: list[dict[str, object]]) -> Decimal:
@@ -719,10 +820,39 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                                     {
                                         "code": position.instrument.code,
                                         "quantity": str(position.quantity),
+                                        "available_quantity": str(position.available_quantity),
                                         "average_price": str(position.average_price),
                                         "market_price": (
                                             str(position.market_price)
                                             if position.market_price is not None
+                                            else None
+                                        ),
+                                        "cost_basis": str(
+                                            position.quantity * position.average_price
+                                        ),
+                                        "market_value": str(
+                                            position.quantity
+                                            * (position.market_price or position.average_price)
+                                        ),
+                                        "unrealized_profit": str(
+                                            position.quantity
+                                            * (
+                                                (position.market_price or position.average_price)
+                                                - position.average_price
+                                            )
+                                        ),
+                                        "return_percent": (
+                                            str(
+                                                (
+                                                    (
+                                                        (position.market_price or position.average_price)
+                                                        - position.average_price
+                                                    )
+                                                    / position.average_price
+                                                    * Decimal("100")
+                                                ).quantize(Decimal("0.01"))
+                                            )
+                                            if position.average_price > 0
                                             else None
                                         ),
                                     }
@@ -745,6 +875,10 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                                 "max_daily_buy_amount": _usage_value(
                                     journal().account_daily_buy_reserved(alias, business_date),
                                     limits.get("max_daily_buy_amount"),
+                                ),
+                                "max_daily_buy_count": _usage_value(
+                                    journal().account_daily_buy_count(alias, business_date),
+                                    limits.get("max_daily_buy_count"),
                                 ),
                                 "max_exposure": _usage_value(
                                     market_value if balance is not None else None,
@@ -2649,6 +2783,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                         if body.max_daily_buy_amount is not None
                         else None
                     ),
+                    "max_daily_buy_count": body.max_daily_buy_count,
                     "max_exposure": (
                         str(body.max_exposure)
                         if body.max_exposure is not None
@@ -2725,6 +2860,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                         if body.max_daily_buy_amount is not None
                         else None
                     ),
+                    "max_daily_buy_count": body.max_daily_buy_count,
                     "max_exposure": (
                         str(body.max_exposure)
                         if body.max_exposure is not None
@@ -3007,12 +3143,19 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 "unresolved": len(unresolved),
             },
             "performance": _strategy_performance(orders, account),
+            "trade_history": _strategy_trade_history(orders),
             "limits": {
                 "max_order_amount": _usage_value(
                     largest_order, risk_limits.get("max_order_amount")
                 ),
                 "max_daily_buy_amount": _usage_value(
                     daily_buy, risk_limits.get("max_daily_buy_amount")
+                ),
+                "max_daily_buy_count": _usage_value(
+                    journal().daily_buy_count(str(strategy_id), business_date)
+                    if strategy_id
+                    else 0,
+                    risk_limits.get("max_daily_buy_count"),
                 ),
                 "max_exposure": _usage_value(
                     strategy_exposure, risk_limits.get("max_exposure")

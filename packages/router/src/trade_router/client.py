@@ -1165,6 +1165,7 @@ class RuntimeClient:
                         if config.limits.max_daily_buy_amount is not None
                         else None
                     ),
+                    "max_daily_buy_count": config.limits.max_daily_buy_count,
                     "max_exposure": (
                         str(config.limits.max_exposure)
                         if config.limits.max_exposure is not None

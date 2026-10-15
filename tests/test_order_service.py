@@ -366,6 +366,67 @@ def test_order_pipeline_blocks_limits_and_unknown_resubmission(tmp_path: Path) -
     asyncio.run(run())
 
 
+def test_daily_buy_count_limits_block_before_another_submission(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "daily-count.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_daily_buy_count=1),
+                request=market_buy("first-buy"),
+            )
+            second = OrderRequest(
+                instrument=InstrumentId("000660"),
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("1"),
+                client_order_id="second-buy",
+                route=OrderRoute.AUTO,
+            )
+            try:
+                await service.submit(
+                    strategy_name="strategy.py",
+                    manifest=manifest(max_daily_buy_count=1),
+                    request=second,
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.RISK_LIMIT_EXCEEDED
+                assert "일일 누적 매수횟수" in exc.message
+            else:
+                raise AssertionError("daily buy count limit did not block the order")
+            assert gateway.submissions == 1
+
+            gateway.account_limits = {"max_daily_buy_count": 1}
+            account_limited_manifest = StrategyManifest(
+                strategy_id="second-strategy",
+                trading_account="broker-account",
+                market_sources={"primary": "market-source"},
+                required_capabilities={},
+                risk_limits={},
+            )
+            service.arm_strategy("second-strategy")
+            try:
+                await service.submit(
+                    strategy_name="second.py",
+                    manifest=account_limited_manifest,
+                    request=second,
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.RISK_LIMIT_EXCEEDED
+                assert "계좌" in exc.message
+            else:
+                raise AssertionError("account daily buy count limit did not block the order")
+            assert gateway.submissions == 1
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
 def test_external_open_order_blocks_same_account_symbol(tmp_path: Path) -> None:
     async def run() -> None:
         store = RuntimeStore(tmp_path / "external-open.sqlite3")
