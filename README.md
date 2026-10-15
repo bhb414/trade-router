@@ -273,7 +273,11 @@ trade-router-v0.1.0-windows.zip.sha256
 ```
 
 처음 받는 사용자는 ZIP을 원하는 폴더에 풀고 `run.cmd`를 실행합니다. Python 3.11
-이상이 필요하며 첫 실행에서 해당 폴더의 `.venv`만 자동으로 준비합니다. API 키,
+이상이 필요하며 첫 실행에서 해당 폴더의 `.venv`만 자동으로 준비합니다. 실행기는
+`python`, `python3`, `py -3`뿐 아니라 Windows에 등록된 Python과 일반 설치 폴더도
+찾으므로 PATH 등록은 필수가 아닙니다. Python Install Manager가 Windows 정책에 막히면
+[Python 3.12.10 공식 페이지](https://www.python.org/downloads/release/python-31210/)의
+**Windows installer (64-bit)** `.exe`를 사용할 수 있습니다. API 키,
 계좌, 전략, 주문 원장과 로그는 `%LOCALAPPDATA%\TradeRouter`에 저장되므로 프로그램
 폴더를 업데이트해도 유지됩니다.
 

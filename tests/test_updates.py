@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import trade_router_studio.updates as updates
@@ -170,3 +171,45 @@ def test_launcher_applies_pending_update_without_touching_user_data(tmp_path: Pa
     assert (install / "pyproject.toml").read_bytes() == new_project
     assert user_marker.read_text(encoding="utf-8") == "preserve"
     assert not pending_path.exists()
+
+
+def test_launcher_finds_python_when_py_launcher_is_unavailable(tmp_path: Path) -> None:
+    source_launcher = Path(__file__).parents[1] / "tools" / "run.ps1"
+    project = tmp_path / "project"
+    tools = project / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(source_launcher, tools / "run.ps1")
+
+    command_directory = tmp_path / "commands"
+    command_directory.mkdir()
+    python_command = command_directory / "python.cmd"
+    python_command.write_text(
+        f'@echo off\n"{sys.executable}" %*\n',
+        encoding="ascii",
+    )
+
+    powershell = shutil.which("powershell.exe")
+    assert powershell is not None
+    environment = os.environ.copy()
+    environment["PATH"] = str(command_directory)
+    environment.pop("TRADE_ROUTER_PYTHON", None)
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(tools / "run.ps1"),
+            "-CheckPythonOnly",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "python"

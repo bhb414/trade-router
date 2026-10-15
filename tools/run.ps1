@@ -1,5 +1,6 @@
 param(
-    [switch]$ApplyUpdateOnly
+    [switch]$ApplyUpdateOnly,
+    [switch]$CheckPythonOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,6 +103,138 @@ function Apply-PendingUpdate {
     Write-Host "Trade Router v$($pending.version) update applied."
 }
 
+function Test-PythonCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$PrefixArguments = @()
+    )
+    try {
+        $probeArguments = @($PrefixArguments) + @(
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+        )
+        & $FilePath @probeArguments *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Find-CompatiblePython {
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($env:TRADE_ROUTER_PYTHON)) {
+        $candidates.Add([pscustomobject]@{
+            FilePath = $env:TRADE_ROUTER_PYTHON
+            PrefixArguments = @()
+            DisplayName = $env:TRADE_ROUTER_PYTHON
+        })
+    }
+
+    foreach ($candidate in @(
+        @{ Name = "python"; PrefixArguments = @() },
+        @{ Name = "python3"; PrefixArguments = @() },
+        @{ Name = "python3.13"; PrefixArguments = @() },
+        @{ Name = "python3.12"; PrefixArguments = @() },
+        @{ Name = "python3.11"; PrefixArguments = @() },
+        @{ Name = "py"; PrefixArguments = @("-3") }
+    )) {
+        $command = Get-Command $candidate.Name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $command) {
+            continue
+        }
+        $displayName = if ($candidate.PrefixArguments.Count -gt 0) {
+            "$($candidate.Name) $($candidate.PrefixArguments -join ' ')"
+        } else {
+            $candidate.Name
+        }
+        $candidates.Add([pscustomobject]@{
+            FilePath = $command.Source
+            PrefixArguments = @($candidate.PrefixArguments)
+            DisplayName = $displayName
+        })
+    }
+
+    foreach ($registryRoot in @(
+        "HKCU:\Software\Python\PythonCore",
+        "HKLM:\Software\Python\PythonCore",
+        "HKLM:\Software\WOW6432Node\Python\PythonCore"
+    )) {
+        if (-not (Test-Path -LiteralPath $registryRoot)) {
+            continue
+        }
+        try {
+            $versions = Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop |
+                Sort-Object -Property PSChildName -Descending
+            foreach ($version in $versions) {
+                $installKeyPath = Join-Path $version.PSPath "InstallPath"
+                if (-not (Test-Path -LiteralPath $installKeyPath)) {
+                    continue
+                }
+                $installKey = Get-Item -LiteralPath $installKeyPath -ErrorAction Stop
+                $executablePath = [string]$installKey.GetValue("ExecutablePath", "")
+                if ([string]::IsNullOrWhiteSpace($executablePath)) {
+                    $installDirectory = [string]$installKey.GetValue("", "")
+                    if (-not [string]::IsNullOrWhiteSpace($installDirectory)) {
+                        $executablePath = Join-Path $installDirectory "python.exe"
+                    }
+                }
+                if (Test-Path -LiteralPath $executablePath -PathType Leaf) {
+                    $candidates.Add([pscustomobject]@{
+                        FilePath = $executablePath
+                        PrefixArguments = @()
+                        DisplayName = "Python $($version.PSChildName)"
+                    })
+                }
+            }
+        } catch {
+            # A protected or incomplete registry entry must not block other candidates.
+        }
+    }
+
+    $pythonPatterns = [System.Collections.Generic.List[string]]::new()
+    if ($env:LOCALAPPDATA) {
+        $pythonPatterns.Add((Join-Path $env:LOCALAPPDATA "Programs\Python\Python*\python.exe"))
+    }
+    if ($env:ProgramFiles) {
+        $pythonPatterns.Add((Join-Path $env:ProgramFiles "Python*\python.exe"))
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $pythonPatterns.Add((Join-Path ${env:ProgramFiles(x86)} "Python*\python.exe"))
+    }
+    if ($env:USERPROFILE) {
+        $pythonPatterns.Add((Join-Path $env:USERPROFILE "scoop\apps\python\current\python.exe"))
+        $pythonPatterns.Add((Join-Path $env:USERPROFILE "miniconda3\python.exe"))
+        $pythonPatterns.Add((Join-Path $env:USERPROFILE "anaconda3\python.exe"))
+    }
+    foreach ($pattern in $pythonPatterns) {
+        foreach ($pythonFile in @(Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue |
+            Sort-Object -Property FullName -Descending)) {
+            $candidates.Add([pscustomobject]@{
+                FilePath = $pythonFile.FullName
+                PrefixArguments = @()
+                DisplayName = $pythonFile.FullName
+            })
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-PythonCandidate `
+            -FilePath $candidate.FilePath `
+            -PrefixArguments $candidate.PrefixArguments) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Get-PythonRequirementMessage {
+    return @"
+Python 3.11 or later was not found.
+Install Python from https://www.python.org/downloads/windows/ and enable
+"Add python.exe to PATH" during setup, then close this window and run run.cmd again.
+"@
+}
+
 function Ensure-ProjectEnvironment {
     $venvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     $markerPath = Join-Path $ProjectRoot ".venv\trade-router-project.hash"
@@ -117,9 +250,19 @@ function Ensure-ProjectEnvironment {
 
     if (-not (Test-Path -LiteralPath $venvPython)) {
         Write-Host "Preparing the local Python environment..."
-        & py -3 -m venv (Join-Path $ProjectRoot ".venv")
+        $python = Find-CompatiblePython
+        if ($null -eq $python) {
+            throw (Get-PythonRequirementMessage)
+        }
+        Write-Host "Using $($python.DisplayName) to create the local environment."
+        $venvArguments = @($python.PrefixArguments) + @(
+            "-m",
+            "venv",
+            (Join-Path $ProjectRoot ".venv")
+        )
+        & $python.FilePath @venvArguments
         if ($LASTEXITCODE -ne 0) {
-            throw "Python 3.11 or later is required."
+            throw "Python was found, but the local environment could not be created."
         }
     }
 
@@ -139,31 +282,47 @@ function Ensure-ProjectEnvironment {
     return $venvPython
 }
 
-if ($ApplyUpdateOnly) {
-    Apply-PendingUpdate
-    exit 0
-}
+try {
+    if ($CheckPythonOnly) {
+        $python = Find-CompatiblePython
+        if ($null -eq $python) {
+            throw (Get-PythonRequirementMessage)
+        }
+        Write-Output $python.DisplayName
+        exit 0
+    }
 
-$skipBrowser = $false
-while ($true) {
-    Apply-PendingUpdate
-    $venvPython = Ensure-ProjectEnvironment
-    Write-Host "Trade Router: http://127.0.0.1:8890"
-    Write-Host "Close this window to stop Trade Router."
-    if ($skipBrowser) {
-        & $venvPython -m trade_router_studio --no-browser
-    } else {
-        & $venvPython -m trade_router_studio
+    if ($ApplyUpdateOnly) {
+        Apply-PendingUpdate
+        exit 0
     }
-    $routerExitCode = $LASTEXITCODE
-    if ($routerExitCode -eq 75) {
-        Write-Host "Restarting Trade Router..."
-        $skipBrowser = $true
-        continue
+
+    $skipBrowser = $false
+    while ($true) {
+        Apply-PendingUpdate
+        $venvPython = Ensure-ProjectEnvironment
+        Write-Host "Trade Router: http://127.0.0.1:8890"
+        Write-Host "Close this window to stop Trade Router."
+        if ($skipBrowser) {
+            & $venvPython -m trade_router_studio --no-browser
+        } else {
+            & $venvPython -m trade_router_studio
+        }
+        $routerExitCode = $LASTEXITCODE
+        if ($routerExitCode -eq 75) {
+            Write-Host "Restarting Trade Router..."
+            $skipBrowser = $true
+            continue
+        }
+        if ($routerExitCode -eq 76) {
+            $skipBrowser = $true
+            continue
+        }
+        exit $routerExitCode
     }
-    if ($routerExitCode -eq 76) {
-        $skipBrowser = $true
-        continue
-    }
-    exit $routerExitCode
+} catch {
+    Write-Host ""
+    Write-Host "Trade Router could not start." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
 }
