@@ -752,6 +752,7 @@ const BLOCK_CONSTANT_META = {
   TRADING_ACCOUNT: ["connection", "거래 계좌"],
   MARKET_SOURCE: ["connection", "시세 연결"],
   CONDITION_SOURCE: ["connection", "종목·시세 데이터 연결"],
+  MARKET_VENUE: ["connection", "시세·봉 시장"],
   TARGET_SOURCE: ["target", "종목 데이터 방식"],
   HTS_USER_ID: ["connection", "HTS 사용자 ID"],
   CONDITION_ID: ["target", "조건식 ID"],
@@ -1248,6 +1249,13 @@ function blockFieldOptions(field) {
   }
   if (field.settingKey === "ranking_venue") {
     return ["KRX", "NXT", "INTEGRATED"].map(value => ({ value, label: value }));
+  }
+  if (field.settingKey === "market_venue") {
+    return [
+      { value: "KRX", label: "KRX" },
+      { value: "NXT", label: "NXT" },
+      { value: "INTEGRATED", label: "통합" },
+    ];
   }
   if (field.settingKey === "ranking_market") {
     return [
@@ -2046,7 +2054,7 @@ function renderConditionBollingerBlocks(parsed, running) {
 
   const nodes = [
     { id: "connection", title: "전략 연결", meta: "계좌 · API", tone: "connection", width: 330,
-      fields: take("strategy_id", "trading_account", "condition_source", "route") },
+      fields: take("strategy_id", "trading_account", "condition_source", "market_venue", "route") },
     { id: "target", title: targetLabels[settings.target_source] || "종목 데이터", meta: settings.target_source === "HTS_CONDITION"
       ? (state.blockConditionError ? "조회 실패" : `${state.blockConditions.length}개 조건식`) : "재사용 가능", tone: "target", width: 330,
       fields: targetFields, actions: ["조회 결과를 종목 목록으로 전달"] },
@@ -3234,6 +3242,7 @@ BLOCK_TEMPLATE = "condition-bollinger-v1"
 STRATEGY_ID = "${strategyId}"
 TRADING_ACCOUNT = "등록한 계좌 별칭"
 CONDITION_SOURCE = "등록한 KIS 실전 API 이름"
+MARKET_VENUE = "KRX"
 HTS_USER_ID = "등록한 HTS ID"
 CONDITION_ID = "1"
 EXPECTED_CONDITION_NAME = ""

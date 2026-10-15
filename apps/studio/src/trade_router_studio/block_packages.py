@@ -77,6 +77,7 @@ class ConditionBollingerBlockSettings(BaseModel):
     strategy_id: str = Field(min_length=1, max_length=128)
     trading_account: str = Field(min_length=1, max_length=128)
     condition_source: str = Field(min_length=1, max_length=128)
+    market_venue: Literal["KRX", "NXT", "INTEGRATED"] = "KRX"
     target_source: Literal["HTS_CONDITION", "RANKING", "SYMBOLS"] = "HTS_CONDITION"
     hts_user_id: str = Field(min_length=1, max_length=128)
     condition_id: str = Field(min_length=1, max_length=64)
@@ -249,6 +250,7 @@ DEFAULT_CONDITION_BOLLINGER_SETTINGS = ConditionBollingerBlockSettings(
     close_retry_start="15:20:30",
     close_retry_end="15:30",
     close_confirm_time="15:30:05",
+    market_venue="KRX",
     route="KRX",
 )
 
@@ -336,6 +338,7 @@ BLOCK_LAYOUT_JSON = __BLOCK_LAYOUT_JSON__
 STRATEGY_ID = __STRATEGY_ID__
 TRADING_ACCOUNT = __TRADING_ACCOUNT__
 CONDITION_SOURCE = __CONDITION_SOURCE__
+MARKET_VENUE = __MARKET_VENUE__
 TARGET_SOURCE = __TARGET_SOURCE__
 HTS_USER_ID = __HTS_USER_ID__
 CONDITION_ID = __CONDITION_ID__
@@ -511,12 +514,7 @@ class ManagedBlockStrategy(Strategy):
 
     @staticmethod
     async def _current_price(ctx, code):
-        quote_venue = {
-            "NXT": Venue.NXT,
-            "SOR": Venue.INTEGRATED,
-            "AUTO": Venue.INTEGRATED,
-        }.get(ORDER_ROUTE, Venue.KRX)
-        quote = await ctx.market.quote(code, venue=quote_venue)
+        quote = await ctx.market.quote(code, venue=Venue(MARKET_VENUE))
         return quote.price
 
     async def on_start(self, ctx):
@@ -669,7 +667,7 @@ class ManagedBlockStrategy(Strategy):
                 required = self._required_bar_count(BUY_CONDITIONS)
                 try:
                     bars = await ctx.market.bars(
-                        code, BAR_INTERVAL, count=required, venue=Venue.KRX, complete_only=True,
+                        code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE), complete_only=True,
                     )
                 except RouterError as exc:
                     ctx.log.warning(f"{code} 매수 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
@@ -681,20 +679,31 @@ class ManagedBlockStrategy(Strategy):
                     continue
             limit_price = None
             try:
+                market_price = await self._current_price(ctx, code)
+                if market_price <= 0:
+                    raise RuntimeError(f"{MARKET_VENUE} 현재가가 0 이하입니다.")
                 if BUY_ORDER_TYPE == "LIMIT":
-                    limit_price = await self._current_price(ctx, code)
+                    limit_price = market_price
                 buying_power = await ctx.account.buying_power(
                     code,
                     order_type=BUY_ORDER_TYPE,
                     price=limit_price,
+                    route=ORDER_ROUTE,
                 )
             except RouterError as exc:
-                ctx.log.warning(f"{code} 주문 가능 수량 확인 실패 [{exc.code.value}]: {exc.message}")
+                ctx.log.warning(f"{code} {MARKET_VENUE} 주문 전 조회 실패 [{exc.code.value}]: {exc.message}")
                 continue
-            budget_quantity = int(BUY_BUDGET_PER_SYMBOL // buying_power.calculation_price)
+            except RuntimeError as exc:
+                ctx.log.warning(f"{code} {MARKET_VENUE} 주문 전 조회 실패: {exc}")
+                continue
+            calculation_price = max(buying_power.calculation_price, market_price)
+            if calculation_price <= 0:
+                ctx.log.warning(f"{code} 주문 전 조회 실패: 보수적 계산단가를 확인할 수 없습니다.")
+                continue
+            budget_quantity = int(BUY_BUDGET_PER_SYMBOL // calculation_price)
             quantity = min(int(buying_power.maximum_quantity), budget_quantity)
             if quantity < 1:
-                ctx.log.info(f"{code} 건너뜀: 계산단가 {buying_power.calculation_price}원 · 종목당 예산 {BUY_BUDGET_PER_SYMBOL}원")
+                ctx.log.info(f"{code} 건너뜀: {MARKET_VENUE} 보수적 계산단가 {calculation_price}원 · 종목당 예산 {BUY_BUDGET_PER_SYMBOL}원")
                 continue
             try:
                 order_id = f"target-{code}-{event.scheduled_at:%Y%m%d%H%M%S}-buy"
@@ -743,7 +752,7 @@ class ManagedBlockStrategy(Strategy):
                 continue
             required = self._required_bar_count(SELL_CONDITIONS)
             bars = await ctx.market.bars(
-                code, BAR_INTERVAL, count=required, venue=Venue.KRX, complete_only=True,
+                code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE), complete_only=True,
             )
             if len(bars) < required:
                 ctx.log.warning(f"{code} 매도 판단 보류: 완성 봉 {len(bars)}/{required}개")
@@ -804,6 +813,7 @@ def _render_condition_bollinger(
         "__STRATEGY_ID__": _literal(settings.strategy_id),
         "__TRADING_ACCOUNT__": _literal(settings.trading_account),
         "__CONDITION_SOURCE__": _literal(settings.condition_source),
+        "__MARKET_VENUE__": _literal(settings.market_venue),
         "__TARGET_SOURCE__": _literal(settings.target_source),
         "__HTS_USER_ID__": _literal(settings.hts_user_id),
         "__CONDITION_ID__": _literal(settings.condition_id),
@@ -911,7 +921,7 @@ def _constants_from_source(source: str) -> tuple[ast.Module, dict[str, object]]:
 def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategyPackage:
     mapping = {
         "strategy_id": "STRATEGY_ID", "trading_account": "TRADING_ACCOUNT",
-        "condition_source": "CONDITION_SOURCE", "hts_user_id": "HTS_USER_ID",
+        "condition_source": "CONDITION_SOURCE", "market_venue": "MARKET_VENUE", "hts_user_id": "HTS_USER_ID",
         "condition_id": "CONDITION_ID", "expected_condition_name": "EXPECTED_CONDITION_NAME",
         "target_source": "TARGET_SOURCE", "ranking_kind": "RANKING_KIND",
         "ranking_venue": "RANKING_VENUE", "ranking_market": "RANKING_MARKET",
@@ -936,7 +946,7 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         if required[field] is None:
             required[field] = True
     defaults = {
-        "target_source": "HTS_CONDITION", "ranking_kind": "RISE", "ranking_venue": "KRX",
+        "target_source": "HTS_CONDITION", "market_venue": "KRX", "ranking_kind": "RISE", "ranking_venue": "KRX",
         "ranking_market": "ALL", "ranking_limit": 20,
         "buy_condition_logic": "ALL", "sell_condition_logic": "ANY",
         "buy_order_type": "MARKET", "sell_order_type": "MARKET",

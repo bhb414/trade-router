@@ -40,6 +40,7 @@ class SimulationGateway:
         self.open_orders: tuple[AccountOrder, ...] | None = None
         self.changes: list[tuple[str, str, Decimal | None]] = []
         self.cost_rates: dict[str, str | None] = {}
+        self.buying_power_routes: list[OrderRoute] = []
 
     def capabilities(self, _: str) -> BrokerCapabilities:
         return BrokerCapabilities(
@@ -87,7 +88,9 @@ class SimulationGateway:
         *,
         order_type: OrderType = OrderType.MARKET,
         price: Decimal | None = None,
+        route: OrderRoute = OrderRoute.AUTO,
     ) -> BuyingPower:
+        self.buying_power_routes.append(route)
         return BuyingPower(
             instrument=InstrumentId(code),
             account_alias=account_reference,
@@ -98,6 +101,7 @@ class SimulationGateway:
             maximum_quantity=Decimal("10"),
             provider=self.provider,
             as_of=datetime.now(SEOUL),
+            route=route,
         )
 
     async def submit_order(
@@ -197,6 +201,7 @@ def test_provider_neutral_order_pipeline_is_idempotent(tmp_path: Path) -> None:
             assert first.id == repeated.id
             assert first.status is OrderStatus.ACKNOWLEDGED
             assert gateway.submissions == 1
+            assert gateway.buying_power_routes == [OrderRoute.AUTO]
         finally:
             store.close()
 

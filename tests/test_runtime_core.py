@@ -20,6 +20,7 @@ from trade_router import (
     RateLimitScope,
     RequestManager,
     RequestPriority,
+    OrderRoute,
     RankingKind,
     SchedulerPlan,
     TimeWindow,
@@ -378,6 +379,49 @@ def test_async_discovery_sdk_normalizes_ranking_entries() -> None:
             assert entries[0].instrument.code == "005930"
             assert entries[0].price == Decimal("73000")
             assert entries[0].change_rate == Decimal("3.20")
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+
+
+def test_async_account_sdk_sends_order_route_to_buying_power_preflight() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/v1/account/buying-power"
+            assert request.url.params["route"] == "NXT"
+            return httpx.Response(
+                200,
+                json={
+                    "instrument": {"code": "005930", "country": "KR"},
+                    "account_alias": "broker-account",
+                    "order_type": "MARKET",
+                    "requested_price": "0",
+                    "calculation_price": "75000",
+                    "cash_available": "150000",
+                    "maximum_quantity": "2",
+                    "provider": "kis",
+                    "as_of": "2026-10-16T09:00:00+09:00",
+                    "route": "NXT",
+                },
+            )
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://router.test",
+        )
+        router = AsyncTradeRouter(
+            strategy=StrategyConfig(
+                id="buying-power-route-test",
+                trading_account="broker-account",
+                market_sources={"primary": "live-source"},
+            ),
+            http_client=http,
+        )
+        try:
+            power = await router.account.buying_power("005930", route=OrderRoute.NXT)
+            assert power.route is OrderRoute.NXT
+            assert power.maximum_quantity == 2
         finally:
             await http.aclose()
 

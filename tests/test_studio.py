@@ -158,6 +158,22 @@ def test_managed_block_compiles_generic_comparisons() -> None:
     )) == DEFAULT_CONDITION_BOLLINGER_SETTINGS.bollinger_period + 1
 
 
+def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"market_venue": "NXT", "route": "NXT"}
+    )
+    source = render_block_strategy(settings)
+    assert 'MARKET_VENUE = "NXT"' in source
+    assert 'ORDER_ROUTE = "NXT"' in source
+    assert "ctx.market.quote(code, venue=Venue(MARKET_VENUE))" in source
+    assert "venue=Venue(MARKET_VENUE), complete_only=True" in source
+    assert "route=ORDER_ROUTE" in source
+
+    package = block_package_from_source("nxt-block", source)
+    assert package.settings.market_venue == "NXT"
+    assert package.settings.route == "NXT"
+
+
 def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metrics() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
     payload["bar_interval"] = "1h"

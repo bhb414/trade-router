@@ -6,6 +6,7 @@ from .models import (
     BrokerCapabilities,
     BuyingPower,
     InstrumentId,
+    OrderRoute,
     OrderRequest,
     ProviderOrderAck,
     Quote,
@@ -43,6 +44,7 @@ class OrderExecutionAdapterV1(Protocol):
         *,
         order_type: object,
         price: object | None = None,
+        route: OrderRoute = OrderRoute.AUTO,
     ) -> BuyingPower: ...
 
     async def submit_order(

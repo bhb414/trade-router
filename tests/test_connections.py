@@ -884,6 +884,18 @@ def test_kis_account_orders_and_buying_power_are_normalized(tmp_path: Path) -> N
             assert power.cash_available == 150000
             assert power.calculation_price == 95000
             assert power.maximum_quantity == 1
+            assert power.route is OrderRoute.KRX
+            try:
+                await runtime.buying_power(
+                    "paper-account",
+                    "005930",
+                    order_type=OrderType.MARKET,
+                    route=OrderRoute.NXT,
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.UNSUPPORTED_CAPABILITY
+            else:
+                raise AssertionError("KIS paper accounts must reject explicit NXT preflight.")
         finally:
             await runtime.close()
             await client.aclose()

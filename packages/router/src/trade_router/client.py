@@ -435,12 +435,14 @@ class SyncAccountClient:
         *,
         order_type: OrderType | str = OrderType.MARKET,
         price: Decimal | None = None,
+        route: OrderRoute | str = OrderRoute.AUTO,
     ) -> BuyingPower:
         return self._router._call(
             self._router._async.account.buying_power(
                 code,
                 order_type=order_type,
                 price=price,
+                route=route,
             )
         )
 
@@ -951,14 +953,17 @@ class AccountClient:
         *,
         order_type: OrderType | str = OrderType.MARKET,
         price: Decimal | None = None,
+        route: OrderRoute | str = OrderRoute.AUTO,
     ) -> BuyingPower:
         normalized_type = OrderType(order_type)
+        normalized_route = OrderRoute(route)
         payload = await self._router._get(
             "/api/v1/account/buying-power",
             {
                 "account": self._router.strategy.trading_account,
                 "code": code,
                 "order_type": normalized_type.value,
+                "route": normalized_route.value,
                 **({"price": str(price)} if price is not None else {}),
             },
         )
@@ -976,6 +981,7 @@ class AccountClient:
             maximum_quantity=Decimal(payload["maximum_quantity"]),
             provider=payload["provider"],
             as_of=datetime.fromisoformat(payload["as_of"]),
+            route=OrderRoute(payload.get("route", normalized_route.value)),
         )
 
 

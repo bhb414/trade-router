@@ -1072,12 +1072,29 @@ class ConnectionRuntime:
         *,
         order_type: OrderType = OrderType.MARKET,
         price: Decimal | None = None,
+        route: OrderRoute = OrderRoute.AUTO,
     ) -> BuyingPower:
         account = self._settings.get_account(account_reference)
         connection = self._settings.get_connection(account["connection_id"])
+        target = ConnectionTarget(connection["target"])
+        actual_route = route
+        if actual_route is OrderRoute.AUTO:
+            actual_route = (
+                OrderRoute.KRX if target is ConnectionTarget.PAPER else OrderRoute.SOR
+            )
+        if actual_route not in self.capabilities(account_reference).order_routes:
+            raise RouterError(
+                RouterErrorCode.UNSUPPORTED_CAPABILITY,
+                f"이 API 연결은 {actual_route.value} 주문 경로를 지원하지 않습니다.",
+            )
         if connection["provider"] == "namuh":
             return await self._namuh_buying_power(
-                account, connection, code, order_type=order_type, price=price
+                account,
+                connection,
+                code,
+                order_type=order_type,
+                price=price,
+                route=actual_route,
             )
         if connection["provider"] != "kis":
             raise RouterError(
@@ -1092,7 +1109,6 @@ class ConnectionRuntime:
             )
         requested_price = price or Decimal("0")
         account_number = self._settings.get_account_number(account["id"])
-        target = ConnectionTarget(connection["target"])
         tr_id = "VTTC8908R" if target is ConnectionTarget.PAPER else "TTTC8908R"
         payload, _ = await self._kis_get(
             connection,
@@ -1112,7 +1128,7 @@ class ConnectionRuntime:
             group="account",
             dedupe_key=(
                 f"{connection['id']}:buying-power:{account['id']}:"
-                f"{instrument.code}:{order_type.value}:{requested_price}"
+                f"{instrument.code}:{order_type.value}:{requested_price}:{actual_route.value}"
             ),
             cache_ttl=0.5,
         )
@@ -1139,6 +1155,7 @@ class ConnectionRuntime:
             ),
             provider="kis",
             as_of=datetime.now(SEOUL),
+            route=actual_route,
         )
 
     async def submit_order(
@@ -2033,6 +2050,7 @@ class ConnectionRuntime:
         *,
         order_type: OrderType,
         price: Decimal | None,
+        route: OrderRoute,
     ) -> BuyingPower:
         instrument = InstrumentId(code)
         if order_type is OrderType.LIMIT and (price is None or price <= 0):
@@ -2060,7 +2078,7 @@ class ConnectionRuntime:
             group="account",
             dedupe_key=(
                 f"{connection['id']}:buying-power:{account['id']}:"
-                f"{instrument.code}:{order_type.value}:{requested_price}"
+                f"{instrument.code}:{order_type.value}:{requested_price}:{route.value}"
             ),
             cache_ttl=0.5,
         )
@@ -2094,6 +2112,7 @@ class ConnectionRuntime:
             maximum_quantity=maximum,
             provider="namuh",
             as_of=datetime.now(SEOUL),
+            route=route,
         )
 
     async def _namuh_submit_order(

@@ -42,6 +42,7 @@ class OrderGateway(Protocol):
         *,
         order_type: OrderType = OrderType.MARKET,
         price: Decimal | None = None,
+        route: OrderRoute = OrderRoute.AUTO,
     ) -> BuyingPower: ...
 
     async def balance(self, account_reference: str) -> Balance: ...
@@ -1017,6 +1018,7 @@ class OrderService:
                 request.instrument.code,
                 order_type=request.order_type,
                 price=request.price,
+                route=request.route,
             )
             if buying_power.calculation_price <= 0:
                 raise RouterError(

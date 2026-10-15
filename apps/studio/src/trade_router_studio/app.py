@@ -2509,6 +2509,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         code: str,
         order_type: str = "MARKET",
         price: Decimal | None = None,
+        route: OrderRoute = OrderRoute.AUTO,
         session: StrategySession = Depends(require_strategy_session),
     ) -> dict[str, object]:
         started_at = time.perf_counter()
@@ -2520,7 +2521,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 outcome="error",
                 message="전략에 허용되지 않은 거래 계좌입니다.",
                 started_at=started_at,
-                details={"code": code},
+                details={"code": code, "route": route.value},
             )
             raise HTTPException(
                 status_code=403,
@@ -2532,6 +2533,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 code,
                 order_type=OrderType(order_type.upper()),
                 price=price,
+                route=route,
             )
         except ValueError as exc:
             record_service_result(
@@ -2541,7 +2543,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 outcome="error",
                 message="주문 유형은 MARKET 또는 LIMIT이어야 합니다.",
                 started_at=started_at,
-                details={"code": code, "order_type": order_type},
+                details={
+                    "code": code,
+                    "order_type": order_type,
+                    "route": route.value,
+                },
             )
             raise HTTPException(
                 status_code=400,
@@ -2555,7 +2561,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 outcome="error",
                 message=str(exc),
                 started_at=started_at,
-                details={"code": code},
+                details={"code": code, "route": route.value},
             )
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RouterError as exc:
@@ -2566,7 +2572,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 outcome="error",
                 message=exc.message,
                 started_at=started_at,
-                details={"code": code, "error_code": exc.code.value},
+                details={
+                    "code": code,
+                    "route": route.value,
+                    "error_code": exc.code.value,
+                },
             )
             status_code = (
                 400 if exc.code is RouterErrorCode.INVALID_REQUEST else 502
@@ -2586,6 +2596,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             "maximum_quantity": str(buying_power.maximum_quantity),
             "provider": buying_power.provider,
             "as_of": buying_power.as_of.isoformat(),
+            "route": buying_power.route.value,
         }
         record_service_result(
             session,
@@ -2596,6 +2607,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             started_at=started_at,
             details={
                 "code": code,
+                "route": buying_power.route.value,
                 "maximum_quantity": str(buying_power.maximum_quantity),
                 "calculation_price": str(buying_power.calculation_price),
                 "cash_available": str(buying_power.cash_available),

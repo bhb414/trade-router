@@ -116,6 +116,7 @@ class BuyingPower:
     maximum_quantity: Decimal
     provider: str
     as_of: datetime
+    route: OrderRoute = OrderRoute.AUTO
 
     def __post_init__(self) -> None:
         if self.as_of.tzinfo is None:
