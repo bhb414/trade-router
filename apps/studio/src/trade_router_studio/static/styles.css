@@ -969,6 +969,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 
 .toast {
   position: fixed;
+  z-index: 100;
   right: 18px;
   bottom: 18px;
   max-width: 420px;
