@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,9 +18,12 @@ from trade_router import (
     TokenScopeKey,
 )
 from trade_router_studio.app import _strategy_performance, create_app
+from trade_router_studio import paths as paths_module
 from trade_router_studio.paths import (
     BLOCK_EXAMPLE_STRATEGY,
+    EXAMPLE_STRATEGY,
     LEGACY_EXAMPLE_STRATEGY,
+    PREVIOUS_EXAMPLE_STRATEGY,
     WorkspacePaths,
 )
 from trade_router_studio.strategies import (
@@ -65,6 +69,19 @@ def test_workspace_preserves_a_user_edited_example(tmp_path: Path) -> None:
     assert example.read_text(encoding="utf-8") == source
 
 
+def test_workspace_upgrades_the_previous_bundled_example(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    example = paths.strategies / "example_strategy.py"
+    example.write_text(PREVIOUS_EXAMPLE_STRATEGY, encoding="utf-8")
+
+    paths.ensure()
+
+    assert example.read_text(encoding="utf-8") == EXAMPLE_STRATEGY
+    assert 'TRADING_ACCOUNT = "등록한 계좌 별칭"' in EXAMPLE_STRATEGY
+    assert 'MARKET_DATA_API = "등록한 API 이름"' in EXAMPLE_STRATEGY
+
+
 def test_workspace_includes_a_managed_block_example(tmp_path: Path) -> None:
     paths = workspace(tmp_path / "workspace")
 
@@ -75,6 +92,39 @@ def test_workspace_includes_a_managed_block_example(tmp_path: Path) -> None:
     assert '"type": "block"' in block_example.with_suffix(
         ".strategy.json"
     ).read_text(encoding="utf-8")
+
+
+def test_workspace_removes_only_the_untouched_personal_bundled_example(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    old_sample = paths.strategies / "kis_condition_bollinger.py"
+    bundled_source = "# old bundled personal sample\n"
+    old_sample.write_text(bundled_source, encoding="utf-8")
+    monkeypatch.setattr(
+        paths_module,
+        "OBSOLETE_KIS_EXAMPLE_SHA256",
+        hashlib.sha256(bundled_source.encode("utf-8")).hexdigest(),
+    )
+
+    paths.ensure()
+
+    assert not old_sample.exists()
+
+
+def test_workspace_preserves_an_edited_personal_strategy(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    strategy = paths.strategies / "kis_condition_bollinger.py"
+    strategy.write_text("# user-owned strategy\n", encoding="utf-8")
+    monkeypatch.setattr(paths_module, "OBSOLETE_KIS_EXAMPLE_SHA256", "0" * 64)
+
+    paths.ensure()
+
+    assert strategy.read_text(encoding="utf-8") == "# user-owned strategy\n"
 
 
 def test_removing_last_shared_key_alias_removes_its_encrypted_token(
@@ -131,8 +181,10 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'name="strategy-type" value="block"' in page.text
         assert status.json()["instance_id"]
         assert status.json()["instance_started_at"]
-        assert status.json()["strategy_count"] == 3
-        assert (app.state.workspace.strategies / "kis_condition_bollinger.py").is_file()
+        assert status.json()["strategy_count"] == 2
+        assert not (
+            app.state.workspace.strategies / "kis_condition_bollinger.py"
+        ).exists()
         block_example = client.get(
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py"
         )

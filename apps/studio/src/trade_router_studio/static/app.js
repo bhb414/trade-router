@@ -1855,16 +1855,31 @@ elements.editor.addEventListener("keydown", event => {
 });
 
 function scriptStrategyTemplate(strategyId) {
-  return `"""Trade Router 자동매매 전략"""
+  return `"""Trade Router 전략 템플릿.
+
+아래 세 값을 자신의 설정에 맞게 바꾸세요. 비밀키와 전체 계좌번호는 이 파일에
+입력하지 않습니다.
+"""
 
 from trade_router import Strategy, StrategyConfig
+
+
+# 설정 > 계좌의 "계좌 별칭"입니다. 계좌번호가 아닙니다.
+TRADING_ACCOUNT = "등록한 계좌 별칭"
+
+# 설정 > API 키에 표시되는 등록된 API 이름입니다. App Key가 아닙니다.
+MARKET_DATA_API = "등록한 API 이름"
+
+# 조회할 국내주식 6자리 종목코드입니다.
+SYMBOL = "005930"
 
 
 class NewStrategy(Strategy):
     config = StrategyConfig(
         id="${strategyId}",
-        trading_account="등록한 계좌 별칭",
-        market_sources={"primary": "등록한 API 연결 이름"},
+        trading_account=TRADING_ACCOUNT,
+        # primary는 전략 안에서 사용할 시세 연결 이름입니다.
+        market_sources={"primary": MARKET_DATA_API},
         required_capabilities={"primary": ("quotes", "bars")},
     )
 
@@ -1877,7 +1892,7 @@ class NewStrategy(Strategy):
         ctx.log.info("전략을 시작했습니다.")
 
     async def on_bar(self, ctx, event):
-        bars = await ctx.market.bars("005930", "3m", count=55)
+        bars = await ctx.market.source("primary").bars(SYMBOL, "3m", count=55)
         if bars:
             ctx.log.info(f"완성 3분봉 {len(bars)}개 · 최근 종가 {bars[-1].close}")
 
