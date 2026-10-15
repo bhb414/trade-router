@@ -13,7 +13,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -41,7 +41,7 @@ from .connections import ConnectionRuntime
 from .event_bus import StrategyEventBus
 from .paths import WorkspacePaths
 from .runtime_scheduler import RuntimeScheduler, schedule_from_dict
-from .runtime_store import RuntimeStore
+from .runtime_store import RuntimeStore, RuntimeStoreRestartRequired
 from .orders import OrderService
 from .order_reconciler import OrderReconciler
 from .realtime import RealtimeHub
@@ -532,6 +532,16 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     app.state.runtime_store = None
     app.state.order_service = None
     app.state.order_reconciler = None
+
+    @app.exception_handler(RuntimeStoreRestartRequired)
+    async def restart_after_runtime_store_failure(
+        _request: Request,
+        exc: RuntimeStoreRestartRequired,
+    ) -> JSONResponse:
+        control = getattr(app.state, "process_control", None)
+        if callable(control):
+            asyncio.get_running_loop().call_later(0.25, control, "restart")
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     def journal() -> RuntimeStore:
         if runtime_store is None:
@@ -1031,6 +1041,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             "registered_apis": len(registered_connections),
             "registered_accounts": len(accounts),
             "unresolved_orders": len(journal().unresolved_orders()),
+            "database_recovery": journal().recovery,
         }
 
     @app.get("/api/dashboard")

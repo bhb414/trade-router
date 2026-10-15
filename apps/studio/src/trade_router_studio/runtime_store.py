@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -14,6 +15,11 @@ from trade_router import OrderStatus
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
+
+
+class RuntimeStoreRestartRequired(RuntimeError):
+    """The runtime journal must be reopened by the supervising launcher."""
+
 
 _ORDER_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.SUBMITTING: frozenset(
@@ -72,8 +78,25 @@ class RuntimeStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(path, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
+        self.recovery: dict[str, Any] | None = None
+        self._connection = self._connect()
+        try:
+            self._verify_integrity_locked()
+        except sqlite3.DatabaseError as exc:
+            if not self._is_corruption_error(exc):
+                self._connection.close()
+                raise
+            self._connection.close()
+            backup = self._archive_corrupt_database(exc)
+            self._connection = self._connect()
+            self.recovery = {
+                "recovered_at": datetime.now(SEOUL).isoformat(),
+                "backup_path": str(backup),
+                "message": (
+                    "실행 기록 DB 손상을 자동 복구했습니다. 원본은 백업했으며 "
+                    "안전을 위해 계좌·전략 주문 허용은 해제되었습니다."
+                ),
+            }
         with self._lock, self._connection:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
@@ -201,6 +224,120 @@ class RuntimeStore:
                 WHERE provider_order_id IS NOT NULL AND provider_order_id != ''
                 """
             )
+        if self.recovery is not None:
+            self.record(
+                source="system",
+                event_type="runtime.database.recovered",
+                message=str(self.recovery["message"]),
+                details={"backup_path": self.recovery["backup_path"]},
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.path,
+            timeout=30,
+            check_same_thread=False,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _verify_integrity_locked(self) -> None:
+        rows = self._connection.execute("PRAGMA quick_check").fetchall()
+        results = [str(row[0]) for row in rows]
+        if results != ["ok"]:
+            raise sqlite3.DatabaseError(
+                "database integrity check failed: " + "; ".join(results[:10])
+            )
+
+    @staticmethod
+    def _is_corruption_error(exc: sqlite3.DatabaseError) -> bool:
+        message = str(exc).casefold()
+        return any(
+            marker in message
+            for marker in (
+                "database disk image is malformed",
+                "file is not a database",
+                "database integrity check failed",
+                "database corruption",
+            )
+        )
+
+    def _archive_corrupt_database(self, exc: sqlite3.DatabaseError) -> Path:
+        stamp = datetime.now(SEOUL).strftime("%Y%m%d-%H%M%S")
+        backup = self.path.parent / "recovery" / f"runtime-{stamp}-{uuid.uuid4().hex[:8]}"
+        backup.mkdir(parents=True, exist_ok=False)
+        sources = [
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ]
+        copied: list[Path] = []
+        try:
+            for source in sources:
+                if source.exists():
+                    shutil.copy2(source, backup / source.name)
+                    copied.append(source)
+            (backup / "recovery.json").write_text(
+                json.dumps(
+                    {
+                        "recovered_at": datetime.now(SEOUL).isoformat(),
+                        "database": str(self.path),
+                        "error": str(exc),
+                        "files": [source.name for source in copied],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            shutil.rmtree(backup, ignore_errors=True)
+            raise
+        for source in reversed(copied):
+            source.unlink(missing_ok=True)
+        return backup
+
+    def _reopen_after_read_failure_locked(
+        self, _exc: sqlite3.DatabaseError
+    ) -> None:
+        try:
+            self._connection.close()
+        except sqlite3.Error:
+            pass
+        self._connection = self._connect()
+        try:
+            self._verify_integrity_locked()
+        except sqlite3.DatabaseError as retry_exc:
+            if self._is_corruption_error(retry_exc):
+                raise RuntimeStoreRestartRequired(
+                    "실행 기록 DB 손상이 확인되어 자동 복구를 위해 다시 시작합니다."
+                ) from retry_exc
+            raise
+
+    def _fetchall(
+        self,
+        query: str,
+        values: tuple[Any, ...] | list[Any] = (),
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            try:
+                return self._connection.execute(query, values).fetchall()
+            except sqlite3.DatabaseError as exc:
+                self._reopen_after_read_failure_locked(exc)
+                return self._connection.execute(query, values).fetchall()
+
+    def _fetchone(
+        self,
+        query: str,
+        values: tuple[Any, ...] | list[Any] = (),
+    ) -> sqlite3.Row | None:
+        with self._lock:
+            try:
+                return self._connection.execute(query, values).fetchone()
+            except sqlite3.DatabaseError as exc:
+                self._reopen_after_read_failure_locked(exc)
+                return self._connection.execute(query, values).fetchone()
 
     def record(
         self,
@@ -242,8 +379,7 @@ class RuntimeStore:
             values.append(source)
         query += " ORDER BY id DESC LIMIT ?"
         values.append(safe_limit)
-        with self._lock:
-            rows = self._connection.execute(query, values).fetchall()
+        rows = self._fetchall(query, values)
         return [
             {
                 "id": row["id"],
@@ -275,8 +411,7 @@ class RuntimeStore:
             + " AND ".join(clauses)
             + " ORDER BY id ASC"
         )
-        with self._lock:
-            rows = self._connection.execute(query, values).fetchall()
+        rows = self._fetchall(query, values)
 
         results: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -348,8 +483,7 @@ class RuntimeStore:
             + " AND ".join(clauses)
             + " ORDER BY id DESC"
         )
-        with self._lock:
-            rows = self._connection.execute(query, values).fetchall()
+        rows = self._fetchall(query, values)
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         safe_limit = min(max(int(limit_per_service), 1), 100)
@@ -607,8 +741,7 @@ class RuntimeStore:
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY f.filled_at, f.id"
-        with self._lock:
-            rows = self._connection.execute(query, values).fetchall()
+        rows = self._fetchall(query, values)
         return [
             {
                 "id": row["id"],
@@ -648,8 +781,7 @@ class RuntimeStore:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at DESC LIMIT ?"
         values.append(min(max(limit, 1), 1_000))
-        with self._lock:
-            rows = self._connection.execute(query, values).fetchall()
+        rows = self._fetchall(query, values)
         return [self._order_row(row) for row in rows]
 
     def unresolved_orders(
@@ -689,8 +821,7 @@ class RuntimeStore:
             + " AND ".join(clauses)
             + " ORDER BY created_at ASC, id ASC"
         )
-        with self._lock:
-            rows = self._connection.execute(query, values).fetchall()
+        rows = self._fetchall(query, values)
         quantities: dict[str, Decimal] = {}
         for row in rows:
             request = json.loads(row["request_json"])
@@ -712,11 +843,10 @@ class RuntimeStore:
         }
 
     def order(self, order_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT * FROM order_ledger WHERE id = ?",
-                (order_id,),
-            ).fetchone()
+        row = self._fetchone(
+            "SELECT * FROM order_ledger WHERE id = ?",
+            (order_id,),
+        )
         return self._order_row(row) if row is not None else None
 
     def order_by_client_id(
@@ -724,29 +854,27 @@ class RuntimeStore:
         strategy_id: str,
         client_order_id: str,
     ) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT * FROM order_ledger
-                WHERE strategy_id = ? AND client_order_id = ?
-                """,
-                (strategy_id, client_order_id),
-            ).fetchone()
+        row = self._fetchone(
+            """
+            SELECT * FROM order_ledger
+            WHERE strategy_id = ? AND client_order_id = ?
+            """,
+            (strategy_id, client_order_id),
+        )
         return self._order_row(row) if row is not None else None
 
     def order_by_provider_id(
         self, account_alias: str, provider_order_id: str
     ) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT ledger.* FROM order_provider_ids AS aliases
-                JOIN order_ledger AS ledger ON ledger.id = aliases.order_id
-                WHERE aliases.account_alias = ? AND aliases.provider_order_id = ?
-                ORDER BY ledger.created_at DESC LIMIT 1
-                """,
-                (account_alias, provider_order_id),
-            ).fetchone()
+        row = self._fetchone(
+            """
+            SELECT ledger.* FROM order_provider_ids AS aliases
+            JOIN order_ledger AS ledger ON ledger.id = aliases.order_id
+            WHERE aliases.account_alias = ? AND aliases.provider_order_id = ?
+            ORDER BY ledger.created_at DESC LIMIT 1
+            """,
+            (account_alias, provider_order_id),
+        )
         return self._order_row(row) if row is not None else None
 
     def set_order_permission(
@@ -840,35 +968,32 @@ class RuntimeStore:
                 )
 
     def has_order_permission(self, scope_type: str, scope_id: str) -> bool:
-        with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT 1 FROM order_permissions
-                WHERE scope_type = ? AND scope_id = ?
-                """,
-                (scope_type, scope_id),
-            ).fetchone()
+        row = self._fetchone(
+            """
+            SELECT 1 FROM order_permissions
+            WHERE scope_type = ? AND scope_id = ?
+            """,
+            (scope_type, scope_id),
+        )
         return row is not None
 
     def order_permission(self, scope_type: str, scope_id: str) -> bool:
-        with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT armed FROM order_permissions
-                WHERE scope_type = ? AND scope_id = ?
-                """,
-                (scope_type, scope_id),
-            ).fetchone()
+        row = self._fetchone(
+            """
+            SELECT armed FROM order_permissions
+            WHERE scope_type = ? AND scope_id = ?
+            """,
+            (scope_type, scope_id),
+        )
         return bool(row["armed"]) if row is not None else False
 
     def order_permissions(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT scope_type, scope_id, armed, updated_at
-                FROM order_permissions ORDER BY scope_type, scope_id
-                """
-            ).fetchall()
+        rows = self._fetchall(
+            """
+            SELECT scope_type, scope_id, armed, updated_at
+            FROM order_permissions ORDER BY scope_type, scope_id
+            """
+        )
         return [
             {
                 "scope_type": row["scope_type"],
@@ -883,15 +1008,14 @@ class RuntimeStore:
         """Return the day's non-rejected buy reservations from normalized JSON."""
 
         total = Decimal("0")
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT request_json FROM order_ledger
-                WHERE strategy_id = ? AND created_at LIKE ?
-                  AND status != ?
-                """,
-                (strategy_id, f"{business_date}%", OrderStatus.REJECTED.value),
-            ).fetchall()
+        rows = self._fetchall(
+            """
+            SELECT request_json FROM order_ledger
+            WHERE strategy_id = ? AND created_at LIKE ?
+              AND status != ?
+            """,
+            (strategy_id, f"{business_date}%", OrderStatus.REJECTED.value),
+        )
         for row in rows:
             request = json.loads(row["request_json"])
             if request.get("side") == "BUY":
@@ -904,15 +1028,14 @@ class RuntimeStore:
         business_date: str,
     ) -> Decimal:
         total = Decimal("0")
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT request_json FROM order_ledger
-                WHERE account_alias = ? AND created_at LIKE ?
-                  AND status != ?
-                """,
-                (account_alias, f"{business_date}%", OrderStatus.REJECTED.value),
-            ).fetchall()
+        rows = self._fetchall(
+            """
+            SELECT request_json FROM order_ledger
+            WHERE account_alias = ? AND created_at LIKE ?
+              AND status != ?
+            """,
+            (account_alias, f"{business_date}%", OrderStatus.REJECTED.value),
+        )
         for row in rows:
             request = json.loads(row["request_json"])
             if request.get("side") == "BUY":

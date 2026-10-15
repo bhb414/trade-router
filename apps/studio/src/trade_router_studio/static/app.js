@@ -31,6 +31,7 @@ const state = {
   logCursorInstanceId: null,
   logTimer: null,
   instanceId: null,
+  databaseRecoveryKey: null,
   systemStatus: null,
   dashboard: null,
   dashboardLoading: false,
@@ -2575,12 +2576,23 @@ async function refreshStatus() {
     elements.serverDot.classList.add("online");
     elements.serverDot.title = `서버 정상 · 실행 전략 ${status.running}개`;
     elements.serverDot.setAttribute("aria-label", elements.serverDot.title);
-    if (status.unresolved_orders) {
+    if (status.database_recovery) {
+      const recoveryKey = `${status.instance_id}:${status.database_recovery.backup_path}`;
+      elements.runtime.hidden = false;
+      elements.runtime.textContent = "실행 기록 DB 자동 복구 · 주문 허용 확인 필요";
+      elements.runtime.title = status.database_recovery.backup_path || "";
+      if (state.databaseRecoveryKey !== recoveryKey) {
+        state.databaseRecoveryKey = recoveryKey;
+        notify(status.database_recovery.message, true);
+      }
+    } else if (status.unresolved_orders) {
       elements.runtime.hidden = false;
       elements.runtime.textContent = `확인 필요 주문 ${status.unresolved_orders}`;
+      elements.runtime.title = "";
     } else {
       elements.runtime.hidden = true;
       elements.runtime.textContent = "";
+      elements.runtime.title = "";
     }
     elements.connections.textContent = `API ${status.registered_apis} · 계좌 ${status.registered_accounts}`;
     elements.workspace.textContent = status.workspace;

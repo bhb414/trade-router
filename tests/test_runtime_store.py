@@ -39,6 +39,47 @@ def test_runtime_store_uses_wal_and_filters_events(tmp_path: Path) -> None:
         store.close()
 
 
+def test_runtime_store_reopens_after_a_transient_read_connection_failure(
+    tmp_path: Path,
+) -> None:
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    try:
+        store.record(
+            source="example.py",
+            event_type="strategy.start",
+            message="started",
+        )
+        store._connection.close()
+
+        events = store.events(source="example.py")
+
+        assert len(events) == 1
+        assert events[0]["message"] == "started"
+    finally:
+        store.close()
+
+
+def test_runtime_store_archives_corruption_and_starts_disarmed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    path.write_bytes(b"this is not a sqlite database")
+    Path(f"{path}-wal").write_bytes(b"damaged wal")
+
+    store = RuntimeStore(path)
+    try:
+        assert store.recovery is not None
+        backup = Path(str(store.recovery["backup_path"]))
+        assert (backup / "runtime.sqlite3").read_bytes() == b"this is not a sqlite database"
+        assert (backup / "recovery.json").is_file()
+        assert store.order_permissions() == []
+        assert store.unresolved_orders() == []
+        assert store.events()[0]["event_type"] == "runtime.database.recovered"
+        assert store._connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    finally:
+        store.close()
+
+
 def test_order_ledger_reserves_idempotency_key_and_tracks_unresolved(tmp_path: Path) -> None:
     store = RuntimeStore(tmp_path / "runtime.sqlite3")
     request = {"code": "005930", "side": "BUY", "quantity": "1"}

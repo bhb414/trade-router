@@ -364,6 +364,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert status.json()["instance_id"]
         assert status.json()["instance_started_at"]
         assert status.json()["strategy_count"] == 2
+        assert status.json()["database_recovery"] is None
+        assert "status.database_recovery" in static_script.text
         assert not (
             app.state.workspace.strategies / "kis_condition_bollinger.py"
         ).exists()
@@ -480,6 +482,21 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert restart.status_code == 200
         assert shutdown.status_code == 200
         assert process_actions == ["restart", "shutdown"]
+
+
+def test_status_reports_automatic_runtime_database_recovery(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.data.mkdir(parents=True)
+    (paths.data / "runtime.sqlite3").write_bytes(b"not a sqlite database")
+    app = create_app(paths)
+
+    with TestClient(app) as client:
+        response = client.get("/api/status")
+
+    assert response.status_code == 200
+    recovery = response.json()["database_recovery"]
+    assert recovery["message"].startswith("실행 기록 DB 손상을 자동 복구했습니다.")
+    assert Path(recovery["backup_path"], "runtime.sqlite3").is_file()
 
 
 def test_block_editor_condition_options_use_connection_runtime(tmp_path: Path) -> None:
