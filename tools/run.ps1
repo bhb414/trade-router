@@ -1,6 +1,7 @@
 param(
     [switch]$ApplyUpdateOnly,
-    [switch]$CheckPythonOnly
+    [switch]$CheckPythonOnly,
+    [switch]$PrepareEnvironmentOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -260,7 +261,7 @@ function Ensure-ProjectEnvironment {
             "venv",
             (Join-Path $ProjectRoot ".venv")
         )
-        & $python.FilePath @venvArguments
+        & $python.FilePath @venvArguments 2>&1 | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) {
             throw "Python was found, but the local environment could not be created."
         }
@@ -273,7 +274,8 @@ function Ensure-ProjectEnvironment {
     }
     if ($installedHash -ne $projectHash) {
         Write-Host "Installing Trade Router dependencies..."
-        & $venvPython -m pip install --disable-pip-version-check -e $ProjectRoot
+        & $venvPython -m pip install --disable-pip-version-check -e $ProjectRoot 2>&1 |
+            ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0) {
             throw "Dependency installation failed."
         }
@@ -294,6 +296,15 @@ try {
 
     if ($ApplyUpdateOnly) {
         Apply-PendingUpdate
+        exit 0
+    }
+
+    if ($PrepareEnvironmentOnly) {
+        $venvPython = Ensure-ProjectEnvironment
+        if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+            throw "The local Python environment was not prepared correctly."
+        }
+        Write-Output $venvPython
         exit 0
     }
 

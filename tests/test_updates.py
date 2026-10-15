@@ -213,3 +213,52 @@ def test_launcher_finds_python_when_py_launcher_is_unavailable(tmp_path: Path) -
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "python"
+
+
+def test_launcher_first_run_returns_only_the_venv_python_path(tmp_path: Path) -> None:
+    source_launcher = Path(__file__).parents[1] / "tools" / "run.ps1"
+    project = tmp_path / "first-run-project"
+    tools = project / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(source_launcher, tools / "run.ps1")
+    (project / "pyproject.toml").write_text(
+        "\n".join(
+            (
+                "[build-system]",
+                'requires = ["setuptools>=75"]',
+                'build-backend = "setuptools.build_meta"',
+                "",
+                "[project]",
+                'name = "launcher-first-run-test"',
+                'version = "0.0.1"',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    powershell = shutil.which("powershell.exe")
+    assert powershell is not None
+    environment = os.environ.copy()
+    environment["TRADE_ROUTER_PYTHON"] = sys.executable
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(tools / "run.ps1"),
+            "-PrepareEnvironmentOnly",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=120,
+    )
+
+    expected_python = project / ".venv" / "Scripts" / "python.exe"
+    assert completed.returncode == 0, completed.stderr
+    assert expected_python.is_file()
+    assert completed.stdout.splitlines()[-1] == str(expected_python)
