@@ -1,3 +1,5 @@
+const LOG_CLEAR_STORAGE_KEY = "trade-router.log-clear-cursors.v1";
+
 const state = {
   view: "dashboard",
   selected: null,
@@ -16,6 +18,8 @@ const state = {
   strategyPermission: null,
   activityTab: "logs",
   logCursor: 0,
+  clearedLogCursors: {},
+  logCursorInstanceId: null,
   logTimer: null,
   instanceId: null,
   systemStatus: null,
@@ -136,6 +140,46 @@ function resetActivity(message = "전략을 실행하면 활동 기록이 표시
   empty.className = "activity-empty";
   empty.textContent = message;
   elements.log.append(empty);
+}
+
+function restoreLogClearCursors(instanceId) {
+  const normalizedInstanceId = String(instanceId || "");
+  if (!normalizedInstanceId || state.logCursorInstanceId === normalizedInstanceId) return;
+  const cursors = {};
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(LOG_CLEAR_STORAGE_KEY) || "null");
+    if (saved?.instanceId === normalizedInstanceId && saved.cursors && typeof saved.cursors === "object") {
+      Object.entries(saved.cursors).forEach(([name, cursor]) => {
+        const value = Number(cursor);
+        if (Number.isSafeInteger(value) && value >= 0) cursors[name] = value;
+      });
+    }
+  } catch (_) {}
+  state.logCursorInstanceId = normalizedInstanceId;
+  state.clearedLogCursors = cursors;
+}
+
+function persistLogClearCursors() {
+  if (!state.logCursorInstanceId) return;
+  try {
+    window.localStorage.setItem(LOG_CLEAR_STORAGE_KEY, JSON.stringify({
+      instanceId: state.logCursorInstanceId,
+      cursors: state.clearedLogCursors,
+    }));
+  } catch (_) {}
+}
+
+function rememberLogClearCursor(name, cursor) {
+  const value = Number(cursor);
+  if (!name || !Number.isSafeInteger(value) || value < 0) return;
+  state.clearedLogCursors[name] = value;
+  persistLogClearCursors();
+}
+
+function forgetLogClearCursor(name) {
+  if (!(name in state.clearedLogCursors)) return;
+  delete state.clearedLogCursors[name];
+  persistLogClearCursors();
 }
 
 function appendActivity(entry) {
@@ -1210,7 +1254,7 @@ async function openStrategy(name) {
   setDirty(false);
   updateLineNumbers();
   setStrategyTab(state.strategyType === "block" ? "blocks" : "overview");
-  state.logCursor = 0;
+  state.logCursor = state.clearedLogCursors[name] || 0;
   resetActivity();
   await refreshStrategies();
   await refreshStrategyPermission();
@@ -1291,12 +1335,12 @@ async function clearActivityLog() {
     return;
   }
   const payload = await api(
-    `/api/strategies/${encodeURIComponent(state.selected)}/logs`,
-    { method: "DELETE" },
+    `/api/strategies/${encodeURIComponent(state.selected)}/logs?after=${Number.MAX_SAFE_INTEGER}`
   );
   state.logCursor = payload.next;
+  rememberLogClearCursor(state.selected, payload.next);
   resetActivity("표시할 활동 기록이 없습니다.");
-  notify("이 전략의 실행 기록을 지웠습니다.");
+  notify("이 시점 이전의 실행 기록을 화면에서 숨겼습니다.");
 }
 
 async function stopStrategy() {
@@ -1311,7 +1355,9 @@ async function stopStrategy() {
 
 async function deleteStrategy() {
   if (!state.selected || !window.confirm(`${displayStrategyName(state.selected)} 전략을 삭제할까요?`)) return;
+  const deletedName = state.selected;
   await api(`/api/strategies/${encodeURIComponent(state.selected)}`, { method: "DELETE" });
+  forgetLogClearCursor(deletedName);
   state.selected = null;
   state.strategySummary = null;
   elements.fileName.textContent = "전략을 선택하세요";
@@ -1424,6 +1470,12 @@ async function refreshStatus() {
   try {
     const status = await api("/api/status");
     state.systemStatus = status;
+    const previousLogInstanceId = state.logCursorInstanceId;
+    restoreLogClearCursors(status.instance_id);
+    if (previousLogInstanceId && previousLogInstanceId !== state.logCursorInstanceId && state.selected) {
+      state.logCursor = 0;
+      resetActivity();
+    }
     state.instanceId = status.instance_id || state.instanceId;
     elements.serverDot.classList.remove("offline");
     elements.serverDot.classList.add("online");

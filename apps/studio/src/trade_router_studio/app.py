@@ -2873,13 +2873,6 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         except StrategyNameError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @app.delete("/api/strategies/{name}/logs")
-    async def clear_strategy_logs(name: str) -> dict[str, object]:
-        try:
-            return manager.clear_logs(name)
-        except StrategyNameError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     @app.get("/api/updates/check")
     async def updates() -> dict[str, object]:
         try:

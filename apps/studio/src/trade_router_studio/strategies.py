@@ -268,25 +268,6 @@ class StrategyManager:
             "exit_code": state.exit_code if state else None,
         }
 
-    def clear_logs(self, name: str) -> dict[str, Any]:
-        """Remove the selected strategy's visible history without stopping it.
-
-        The sequence counter deliberately remains monotonic so clients that are
-        already polling can continue from the returned cursor and receive only
-        output produced after the clear operation.
-        """
-        self.resolve(name)
-        state = self._states.get(name)
-        if state is not None:
-            state.logs.clear()
-        return {
-            "lines": [],
-            "entries": [],
-            "next": state.next_log_sequence if state else 0,
-            "running": bool(state and state.running),
-            "exit_code": state.exit_code if state else None,
-        }
-
     async def _read_output(self, state: StrategyProcess) -> None:
         assert state.process is not None
         assert state.process.stdout is not None
