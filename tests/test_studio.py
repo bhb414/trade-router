@@ -174,6 +174,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         static_script = client.get("/static/app.js")
         assert static_script.status_code == 200
         assert static_script.headers["cache-control"] == "no-store, max-age=0"
+        assert "사용자 Python 로직" not in static_script.text
         page = client.get("/")
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text

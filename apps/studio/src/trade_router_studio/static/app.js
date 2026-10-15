@@ -993,7 +993,10 @@ function parseStrategyBlocks(source) {
       if (actions.at(-1) !== item.label) actions.push(item.label);
     }
     if (branchCount) actions.push(`조건 분기 ${branchCount}개`);
-    if (!actions.length) actions.push("사용자 Python 로직");
+    // Block strategies are rendered from a fixed, validated template. Lifecycle
+    // methods that only contain router-managed setup, logging, or shutdown work
+    // are implementation details rather than user-authored blocks.
+    if (!actions.length) return;
     handlers.push({
       id: `handler:${match[1]}`,
       name: match[1],
