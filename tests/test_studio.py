@@ -741,6 +741,42 @@ def test_strategy_log_cursor_remains_monotonic_after_ring_buffer_rollover(
     assert result["next"] == cursor + 1
 
 
+def test_cleared_strategy_logs_do_not_return_when_strategy_is_reopened(
+    tmp_path: Path,
+) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.ensure()
+    manager = StrategyManager(paths)
+    state = StrategyProcess(name="example_strategy.py")
+    manager._states[state.name] = state
+
+    manager._append_log(state, "output", "old execution record")
+    cleared = manager.clear_logs(state.name)
+
+    assert cleared["next"] == 1
+    assert manager.logs(state.name, after=0)["lines"] == []
+
+    manager._append_log(state, "output", "new execution record")
+    result = manager.logs(state.name, after=cleared["next"])
+    assert result["lines"] == ["new execution record"]
+    assert result["next"] == 2
+
+
+def test_clear_strategy_logs_endpoint_clears_server_history(tmp_path: Path) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    state = StrategyProcess(name="example_strategy.py")
+    app.state.strategies._states[state.name] = state
+    app.state.strategies._append_log(state, "output", "old execution record")
+
+    with TestClient(app) as client:
+        cleared = client.delete("/api/strategies/example_strategy.py/logs")
+        reopened = client.get("/api/strategies/example_strategy.py/logs")
+
+    assert cleared.status_code == 200
+    assert cleared.json()["next"] == 1
+    assert reopened.json()["lines"] == []
+
+
 def test_user_stop_is_not_reported_as_strategy_failure(tmp_path: Path) -> None:
     async def run() -> None:
         paths = workspace(tmp_path / "workspace")

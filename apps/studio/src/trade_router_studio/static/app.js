@@ -1290,13 +1290,13 @@ async function clearActivityLog() {
     resetActivity("표시할 활동 기록이 없습니다.");
     return;
   }
-  // Clearing is a per-browser view operation. Advance to the server's latest
-  // monotonic cursor so a later strategy start only appends new activity.
   const payload = await api(
-    `/api/strategies/${encodeURIComponent(state.selected)}/logs?after=${Number.MAX_SAFE_INTEGER}`
+    `/api/strategies/${encodeURIComponent(state.selected)}/logs`,
+    { method: "DELETE" },
   );
   state.logCursor = payload.next;
   resetActivity("표시할 활동 기록이 없습니다.");
+  notify("이 전략의 실행 기록을 지웠습니다.");
 }
 
 async function stopStrategy() {
