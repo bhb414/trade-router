@@ -60,6 +60,9 @@ class ConditionBollingerBlockSettings(BaseModel):
     bollinger_stddev: Decimal = Field(gt=0, le=Decimal("20"))
     take_profit_multiplier: Decimal = Field(gt=1)
     stop_loss_multiplier: Decimal = Field(gt=0, lt=1)
+    use_bollinger_exit: bool = True
+    use_take_profit: bool = True
+    use_stop_loss: bool = True
     buy_scan_seconds: int = Field(ge=1, le=86_400)
     buy_start_time: str
     buy_end_time: str
@@ -93,6 +96,10 @@ class ConditionBollingerBlockSettings(BaseModel):
         ]
         if close_times != sorted(close_times):
             raise ValueError("Close, retry, and confirm times must be chronological.")
+        if not any(
+            (self.use_bollinger_exit, self.use_take_profit, self.use_stop_loss)
+        ):
+            raise ValueError("At least one sell condition must be enabled.")
         return self
 
 
@@ -126,6 +133,9 @@ DEFAULT_CONDITION_BOLLINGER_SETTINGS = ConditionBollingerBlockSettings(
     bollinger_stddev=Decimal("1.04"),
     take_profit_multiplier=Decimal("1.03"),
     stop_loss_multiplier=Decimal("0.97"),
+    use_bollinger_exit=True,
+    use_take_profit=True,
+    use_stop_loss=True,
     buy_scan_seconds=30,
     buy_start_time="09:00",
     buy_end_time="15:00",
@@ -204,6 +214,9 @@ BOLLINGER_PERIOD = __BOLLINGER_PERIOD__
 BOLLINGER_STDDEV = Decimal(__BOLLINGER_STDDEV__)
 TAKE_PROFIT_MULTIPLIER = Decimal(__TAKE_PROFIT_MULTIPLIER__)
 STOP_LOSS_MULTIPLIER = Decimal(__STOP_LOSS_MULTIPLIER__)
+USE_BOLLINGER_EXIT = __USE_BOLLINGER_EXIT__
+USE_TAKE_PROFIT = __USE_TAKE_PROFIT__
+USE_STOP_LOSS = __USE_STOP_LOSS__
 BUY_SCAN_SECONDS = __BUY_SCAN_SECONDS__
 BUY_START_TIME = __BUY_START_TIME__
 BUY_END_TIME = __BUY_END_TIME__
@@ -434,11 +447,11 @@ class ManagedBlockStrategy(Strategy):
             take_profit_price = average_price * TAKE_PROFIT_MULTIPLIER
             stop_loss_price = average_price * STOP_LOSS_MULTIPLIER
             sell_reason = None
-            if average_price > 0 and latest.close >= take_profit_price:
+            if USE_TAKE_PROFIT and average_price > 0 and latest.close >= take_profit_price:
                 sell_reason = f"익절: 종가 {latest.close}원 >= {take_profit_price:.2f}원"
-            elif average_price > 0 and latest.close <= stop_loss_price:
+            elif USE_STOP_LOSS and average_price > 0 and latest.close <= stop_loss_price:
                 sell_reason = f"손절: 종가 {latest.close}원 <= {stop_loss_price:.2f}원"
-            elif latest.close < upper:
+            elif USE_BOLLINGER_EXIT and latest.close < upper:
                 sell_reason = f"볼린저 청산: 종가 {latest.close}원 < 상단 {upper:.2f}원"
             if sell_reason is None:
                 continue
@@ -482,6 +495,9 @@ def _render_condition_bollinger(settings: ConditionBollingerBlockSettings) -> st
         "__BOLLINGER_STDDEV__": _literal(str(settings.bollinger_stddev)),
         "__TAKE_PROFIT_MULTIPLIER__": _literal(str(settings.take_profit_multiplier)),
         "__STOP_LOSS_MULTIPLIER__": _literal(str(settings.stop_loss_multiplier)),
+        "__USE_BOLLINGER_EXIT__": str(settings.use_bollinger_exit),
+        "__USE_TAKE_PROFIT__": str(settings.use_take_profit),
+        "__USE_STOP_LOSS__": str(settings.use_stop_loss),
         "__BUY_SCAN_SECONDS__": str(settings.buy_scan_seconds),
         "__BUY_START_TIME__": _literal(settings.buy_start_time),
         "__BUY_END_TIME__": _literal(settings.buy_end_time),
@@ -500,7 +516,7 @@ def _render_condition_bollinger(settings: ConditionBollingerBlockSettings) -> st
     return source
 
 
-def render_block_strategy(
+def compile_block_strategy(
     settings: BlockStrategySettings | ConditionBollingerBlockSettings,
     *,
     template: str | None = None,
@@ -512,6 +528,11 @@ def render_block_strategy(
     if template not in {None, BAR_OBSERVER_TEMPLATE}:
         raise ValueError("Block template and settings do not match.")
     return _render_bar_observer(settings)
+
+
+# Compatibility name for older extensions. New code should use the explicit
+# compiler name because a block package is the source of truth.
+render_block_strategy = compile_block_strategy
 
 
 def _literal_value(node: ast.AST | None, constants: dict[str, object]) -> object | None:
@@ -563,7 +584,9 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         "buy_budget_per_symbol": "BUY_BUDGET_PER_SYMBOL", "total_operating_budget": "TOTAL_OPERATING_BUDGET",
         "max_new_buys_per_scan": "MAX_NEW_BUYS_PER_SCAN", "bollinger_period": "BOLLINGER_PERIOD",
         "bollinger_stddev": "BOLLINGER_STDDEV", "take_profit_multiplier": "TAKE_PROFIT_MULTIPLIER",
-        "stop_loss_multiplier": "STOP_LOSS_MULTIPLIER", "buy_scan_seconds": "BUY_SCAN_SECONDS",
+        "stop_loss_multiplier": "STOP_LOSS_MULTIPLIER",
+        "use_bollinger_exit": "USE_BOLLINGER_EXIT", "use_take_profit": "USE_TAKE_PROFIT",
+        "use_stop_loss": "USE_STOP_LOSS", "buy_scan_seconds": "BUY_SCAN_SECONDS",
         "buy_start_time": "BUY_START_TIME", "buy_end_time": "BUY_END_TIME",
         "bar_interval": "BAR_INTERVAL", "sell_start_time": "SELL_START_TIME",
         "sell_end_time": "SELL_END_TIME", "close_time": "CLOSE_TIME",
@@ -571,6 +594,10 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         "close_confirm_time": "CLOSE_CONFIRM_TIME", "route": "ORDER_ROUTE",
     }
     required = {field: constants.get(source_name) for field, source_name in mapping.items()}
+    # v0.1.13 packages always enabled the three built-in exit conditions.
+    for field in ("use_bollinger_exit", "use_take_profit", "use_stop_loss"):
+        if required[field] is None:
+            required[field] = True
     if any(value is None for value in required.values()):
         raise ValueError("This condition/Bollinger block has unsupported fields.")
     settings = ConditionBollingerBlockSettings.model_validate(required)

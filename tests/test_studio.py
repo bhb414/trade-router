@@ -13,6 +13,7 @@ from trade_router import (
     AccessToken,
     Balance,
     ConnectionTarget,
+    ConditionDefinition,
     InstrumentId,
     Position,
     TokenScopeKey,
@@ -227,6 +228,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert static_script.status_code == 200
         assert static_script.headers["cache-control"] == "no-store, max-age=0"
         assert "사용자 Python 로직" not in static_script.text
+        assert "blockPackageFields" in static_script.text
+        assert "/api/block-options/conditions" in static_script.text
         page = client.get("/")
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text
@@ -254,6 +257,19 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert package["settings"]["condition_id"] == "1"
         assert package["settings"]["bar_interval"] == "3m"
         assert package["settings"]["total_operating_budget"] == "150000"
+        assert package["settings"]["use_take_profit"] is True
+        package["settings"]["use_take_profit"] = False
+        saved_package = client.put(
+            "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package",
+            json=package,
+        )
+        assert saved_package.status_code == 200
+        compiled_block = client.get(
+            "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py"
+        ).json()["source"]
+        assert "USE_TAKE_PROFIT = False" in compiled_block
+        assert "if USE_TAKE_PROFIT and" in compiled_block
+        package["settings"]["use_take_profit"] = True
         package["name"] = "가져온 블록 예제"
         imported = client.post("/api/strategies/import-block", json=package)
         assert imported.status_code == 200
@@ -318,6 +334,40 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert restart.status_code == 200
         assert shutdown.status_code == 200
         assert process_actions == ["restart", "shutdown"]
+
+
+def test_block_editor_condition_options_use_connection_runtime(tmp_path: Path) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    calls: list[tuple[str, str]] = []
+
+    async def conditions(source: str, user_id: str, *, source_alias=None):
+        calls.append((source, user_id))
+        return (
+            ConditionDefinition(
+                id="3",
+                name="bb+macd 상향돌파",
+                provider="kis",
+                source_alias=source_alias,
+            ),
+        )
+
+    app.state.connections.condition_definitions = conditions
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/block-options/conditions",
+            params={"source": "kis-live", "user_id": "tester"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["conditions"] == [
+        {
+            "id": "3",
+            "name": "bb+macd 상향돌파",
+            "provider": "kis",
+            "source_alias": None,
+        }
+    ]
+    assert calls == [("kis-live", "tester")]
 
 
 def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> None:

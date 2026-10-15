@@ -35,7 +35,7 @@ from . import __version__
 from .block_packages import (
     BlockStrategyPackage,
     block_package_from_source,
-    render_block_strategy,
+    compile_block_strategy,
 )
 from .connections import ConnectionRuntime
 from .event_bus import StrategyEventBus
@@ -1192,6 +1192,44 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 }
             )
         return result
+
+    @app.get("/api/block-options/conditions")
+    async def block_condition_options(
+        source: str,
+        user_id: str,
+    ) -> dict[str, object]:
+        """Return saved broker conditions for the block editor.
+
+        This endpoint deliberately has no strategy session dependency: it is a
+        read-only editor lookup.  Authentication, token reuse, caching and rate
+        limiting still go through ConnectionRuntime.
+        """
+
+        try:
+            conditions = await connection_runtime.condition_definitions(
+                source,
+                user_id,
+            )
+        except SettingsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RouterError as exc:
+            status_code = (
+                422
+                if exc.code is RouterErrorCode.UNSUPPORTED_CAPABILITY
+                else 502
+            )
+            raise HTTPException(status_code=status_code, detail=exc.as_dict()) from exc
+        return {
+            "conditions": [
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "provider": item.provider,
+                    "source_alias": item.source_alias,
+                }
+                for item in conditions
+            ]
+        }
 
     @app.get("/api/system/doctor")
     async def system_doctor() -> dict[str, object]:
@@ -2757,7 +2795,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 )
             return await manager.save(
                 name,
-                render_block_strategy(package.settings, template=package.template),
+                compile_block_strategy(package.settings, template=package.template),
                 strategy_type="block",
             )
         except StrategyNameError as exc:
@@ -2982,7 +3020,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 ) from exc
             # Block strategies always run the server-owned template.  The browser
             # only supplies validated settings extracted from its block canvas.
-            source = render_block_strategy(package.settings, template=package.template)
+            source = compile_block_strategy(package.settings, template=package.template)
         try:
             return await manager.save(
                 name,
@@ -2995,6 +3033,35 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    @app.put("/api/strategies/{name}/block-package")
+    async def save_block_strategy_package(
+        name: str,
+        package: BlockStrategyPackage,
+    ) -> dict[str, object]:
+        """Validate a block definition and compile it to the managed runtime."""
+
+        try:
+            if manager.strategy_type(name) != "block":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Only block strategies accept block definitions.",
+                )
+            display_name = name[:-3] if name.lower().endswith(".py") else name
+            normalized = package.model_copy(update={"name": display_name})
+            source = compile_block_strategy(
+                normalized.settings,
+                template=normalized.template,
+            )
+            return await manager.save(name, source)
+        except StrategyNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Strategy not found.") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.delete("/api/strategies/{name}", status_code=204)
     async def delete_strategy(name: str) -> None:

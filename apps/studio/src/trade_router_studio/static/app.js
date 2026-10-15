@@ -6,6 +6,10 @@ const state = {
   strategyType: "script",
   strategyTab: "overview",
   blockSource: null,
+  blockPackage: null,
+  blockConditions: [],
+  blockConditionKey: null,
+  blockConditionError: null,
   strategySearch: "",
   dirty: false,
   strategies: [],
@@ -757,6 +761,9 @@ const BLOCK_CONSTANT_META = {
   BAR_COUNT: ["risk", "조회 봉 수"],
   TAKE_PROFIT_MULTIPLIER: ["risk", "익절 기준(1.03 = +3%)"],
   STOP_LOSS_MULTIPLIER: ["risk", "손절 기준(0.97 = -3%)"],
+  USE_BOLLINGER_EXIT: ["risk", "볼린저 청산"],
+  USE_TAKE_PROFIT: ["risk", "익절"],
+  USE_STOP_LOSS: ["risk", "손절"],
   BUY_SCAN_SECONDS: ["schedule", "조건검색 간격(초)"],
   BUY_START_TIME: ["schedule", "매수 시작 시각"],
   BUY_END_TIME: ["schedule", "매수 종료 시각"],
@@ -1100,13 +1107,170 @@ function formatBlockFieldValue(field, value) {
   return JSON.stringify(String(value));
 }
 
-function applyBlockFieldEdit(fieldId, value) {
+const BLOCK_PACKAGE_FIELD_TYPES = {
+  bar_count: "number",
+  max_new_buys_per_scan: "number",
+  bollinger_period: "number",
+  buy_scan_seconds: "number",
+  buy_budget_per_symbol: "decimal",
+  total_operating_budget: "decimal",
+  bollinger_stddev: "decimal",
+  take_profit_multiplier: "decimal",
+  stop_loss_multiplier: "decimal",
+  use_bollinger_exit: "boolean",
+  use_take_profit: "boolean",
+  use_stop_loss: "boolean",
+};
+
+const BLOCK_PACKAGE_SOURCE_NAMES = {
+  route: "ORDER_ROUTE",
+};
+
+function packageFieldSourceName(key) {
+  return BLOCK_PACKAGE_SOURCE_NAMES[key] || key.toUpperCase();
+}
+
+function blockPackageFields() {
+  const settings = state.blockPackage?.settings;
+  if (!settings) return [];
+  return Object.entries(settings)
+    .filter(([key]) => key !== "expected_condition_name")
+    .map(([settingKey, value]) => {
+      const sourceName = packageFieldSourceName(settingKey);
+      const [category, label] = genericConstantMeta(sourceName);
+      return {
+        id: `setting:${settingKey}`,
+        settingKey,
+        sourceName,
+        label,
+        category,
+        type: BLOCK_PACKAGE_FIELD_TYPES[settingKey] || "string",
+        value,
+      };
+    });
+}
+
+function currentBlockModel() {
   const parsed = parseStrategyBlocks(elements.editor.value);
+  if (!state.blockPackage) return parsed;
+  return {
+    ...parsed,
+    template: state.blockPackage.template,
+    fields: blockPackageFields(),
+  };
+}
+
+function blockFieldOptions(field) {
+  const settings = state.blockPackage?.settings || {};
+  if (field.settingKey === "trading_account") {
+    return state.accounts.map(account => ({
+      value: account.alias,
+      label: `${account.alias} · ${account.connection_label || account.provider || "계좌"}`,
+    }));
+  }
+  if (field.settingKey === "condition_source" || field.settingKey === "market_source") {
+    return state.connections
+      .filter(connection => {
+        if (field.settingKey === "market_source") return true;
+        return Boolean(state.capabilities.find(item => (
+          item.connection_id === connection.id && item.conditions
+        )));
+      })
+      .map(connection => ({
+        value: connection.label,
+        label: `${connection.label} · ${selectedProvider(connection.provider)?.name || connection.provider}`,
+      }));
+  }
+  if (field.settingKey === "hts_user_id") {
+    const selected = state.connections.find(connection => (
+      connection.id === settings.condition_source || connection.label === settings.condition_source
+    ));
+    const values = selected?.realtime_user_id
+      ? [selected]
+      : state.connections.filter(connection => connection.realtime_user_id);
+    return values.map(connection => ({
+      value: connection.realtime_user_id,
+      label: `${connection.realtime_user_id} · ${connection.label}`,
+    }));
+  }
+  if (field.settingKey === "condition_id") {
+    return state.blockConditions.map(condition => ({
+      value: condition.id,
+      label: `${condition.id} · ${condition.name}`,
+    }));
+  }
+  if (field.settingKey === "route") {
+    const account = state.accounts.find(item => item.alias === settings.trading_account);
+    const capability = state.capabilities.find(item => item.connection_id === account?.connection_id);
+    const routes = capability?.order_routes?.length
+      ? capability.order_routes
+      : ["KRX", "NXT", "SOR", "AUTO"];
+    return routes.map(route => ({ value: route, label: route }));
+  }
+  if (field.settingKey === "bar_interval") {
+    return ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d", "1w"]
+      .map(value => ({ value, label: value }));
+  }
+  return null;
+}
+
+function normalizeBlockPackageValue(field, value) {
+  if (field.type === "boolean") return value === true || value === "true";
+  if (field.type === "number") {
+    const normalized = String(value).trim();
+    if (!/^-?\d+$/.test(normalized)) throw new Error(`${field.label}에 정수를 입력하세요.`);
+    return Number(normalized);
+  }
+  if (field.type === "decimal") {
+    const normalized = String(value).trim();
+    if (!/^-?\d+(?:\.\d+)?$/.test(normalized)) throw new Error(`${field.label}에 숫자를 입력하세요.`);
+    return normalized;
+  }
+  return String(value);
+}
+
+function applyBlockFieldEdit(fieldId, value) {
+  const parsed = currentBlockModel();
   const field = [
     ...parsed.fields,
     ...parsed.schedules.flatMap(schedule => schedule.fields),
   ].find(item => item.id === fieldId);
   if (!field) throw new Error("블록 구성이 변경되어 필드 위치를 찾지 못했습니다. 블록 화면을 다시 열어주세요.");
+  if (field.settingKey && state.blockPackage) {
+    const normalized = normalizeBlockPackageValue(field, value);
+    state.blockPackage.settings[field.settingKey] = normalized;
+    if (field.settingKey === "condition_source") {
+      const connection = state.connections.find(item => (
+        item.id === normalized || item.label === normalized
+      ));
+      if (connection?.realtime_user_id) {
+        state.blockPackage.settings.hts_user_id = connection.realtime_user_id;
+      }
+      state.blockConditions = [];
+      state.blockConditionKey = null;
+      state.blockConditionError = null;
+      refreshBlockConditions().catch(error => {
+        state.blockConditionError = error.message;
+        renderStrategyBlocks();
+        notify(error.message, true);
+      });
+    } else if (field.settingKey === "hts_user_id") {
+      state.blockConditions = [];
+      state.blockConditionKey = null;
+      state.blockConditionError = null;
+      refreshBlockConditions().catch(error => {
+        state.blockConditionError = error.message;
+        renderStrategyBlocks();
+        notify(error.message, true);
+      });
+    } else if (field.settingKey === "condition_id") {
+      const selected = state.blockConditions.find(item => item.id === normalized);
+      state.blockPackage.settings.expected_condition_name = selected?.name || "";
+    }
+    setDirty(true);
+    renderStrategyBlocks();
+    return;
+  }
   const replacement = formatBlockFieldValue(field, value);
   elements.editor.value = `${elements.editor.value.slice(0, field.start)}${replacement}${elements.editor.value.slice(field.end)}`;
   elements.editor.dispatchEvent(new Event("input"));
@@ -1120,12 +1284,30 @@ function createBlockFieldControl(field, disabled) {
   label.textContent = field.label;
   label.htmlFor = `block-field-${field.id.replace(/[^a-z0-9_-]/gi, "-")}`;
   let control;
-  if (field.type === "boolean") {
+  const choices = blockFieldOptions(field);
+  if (field.type === "boolean" || choices) {
     control = document.createElement("select");
-    for (const [value, text] of [["true", "사용"], ["false", "사용 안 함"]]) {
+    const options = field.type === "boolean"
+      ? [{ value: "true", label: "사용" }, { value: "false", label: "사용 안 함" }]
+      : choices;
+    if (!options.length) {
       const option = document.createElement("option");
-      option.value = value;
-      option.textContent = text;
+      option.value = String(field.value ?? "");
+      option.textContent = field.settingKey === "condition_id"
+        ? (state.blockConditionError || "조회 가능한 조건식 없음")
+        : "등록된 항목 없음";
+      control.append(option);
+    }
+    if (field.value != null && !options.some(item => String(item.value) === String(field.value))) {
+      options.unshift({
+        value: String(field.value),
+        label: `${field.value} · 현재 설정`,
+      });
+    }
+    for (const item of options) {
+      const option = document.createElement("option");
+      option.value = item.value;
+      option.textContent = item.label;
       control.append(option);
     }
     control.value = String(field.value);
@@ -1205,10 +1387,178 @@ function createBlockLane(title, description, count, className = "") {
   return lane;
 }
 
+async function refreshBlockConditions() {
+  if (state.blockPackage?.template !== "condition-bollinger-v1") return;
+  const settings = state.blockPackage.settings;
+  const connection = state.connections.find(item => (
+    item.id === settings.condition_source || item.label === settings.condition_source
+  ));
+  const source = connection?.label || settings.condition_source;
+  const userId = settings.hts_user_id;
+  if (!connection || !userId || String(userId).startsWith("등록한 ")) {
+    state.blockConditions = [];
+    state.blockConditionKey = null;
+    state.blockConditionError = null;
+    renderStrategyBlocks();
+    return;
+  }
+  const key = `${connection.id}\u0000${userId}`;
+  if (state.blockConditionKey === key) return;
+  state.blockConditionError = null;
+  const payload = await api(
+    `/api/block-options/conditions?source=${encodeURIComponent(source)}&user_id=${encodeURIComponent(userId)}`
+  );
+  state.blockConditions = payload.conditions || [];
+  state.blockConditionKey = key;
+  const selected = state.blockConditions.find(item => item.id === String(settings.condition_id));
+  if (selected) state.blockPackage.settings.expected_condition_name = selected.name;
+  renderStrategyBlocks();
+}
+
+async function loadBlockEditorData(name) {
+  const [blockPackage, providers, connections, accounts, capabilities] = await Promise.all([
+    api(`/api/strategies/${encodeURIComponent(name)}/block-package`),
+    api("/api/settings/providers"),
+    api("/api/settings/connections"),
+    api("/api/settings/accounts"),
+    api("/api/system/capabilities"),
+  ]);
+  state.blockPackage = blockPackage;
+  state.providers = providers;
+  state.connections = connections;
+  state.accounts = accounts;
+  state.capabilities = capabilities;
+  state.blockConditions = [];
+  state.blockConditionKey = null;
+  state.blockConditionError = null;
+  try {
+    await refreshBlockConditions();
+  } catch (error) {
+    state.blockConditionError = error.message;
+  }
+}
+
+function conditionJoin(text = "또는 (OR)") {
+  const join = document.createElement("div");
+  join.className = "block-condition-join";
+  join.textContent = text;
+  return join;
+}
+
+function renderConditionBollingerBlocks(parsed, running) {
+  const fields = new Map(parsed.fields.map(field => [field.settingKey, field]));
+  const take = (...keys) => keys.map(key => fields.get(key)).filter(Boolean);
+
+  const connectionLane = createBlockLane(
+    "연결과 대상",
+    "등록된 계좌·API·HTS 조건식을 선택합니다.",
+    2,
+  );
+  connectionLane.append(createStrategyBlockNode({
+    title: "전략 연결",
+    meta: "등록 설정 사용",
+    tone: "connection",
+    fields: take("strategy_id", "trading_account", "condition_source", "hts_user_id", "route"),
+  }, running));
+  connectionLane.append(createStrategyBlockNode({
+    title: "HTS 조건검색 결과",
+    meta: state.blockConditionError
+      ? "조건식 조회 실패"
+      : `${state.blockConditions.length}개 조건식`,
+    tone: "target",
+    fields: take("condition_id"),
+    actions: ["조건검색 포함 종목만 신규 매수 후보"],
+  }, running));
+  elements.blockCanvas.append(connectionLane);
+
+  const buyLane = createBlockLane(
+    "매수 흐름",
+    "조건검색 결과를 계좌와 예산 규칙으로 거른 뒤 주문합니다.",
+    2,
+  );
+  buyLane.append(createStrategyBlockNode({
+    title: "매수 조건",
+    meta: "AND",
+    tone: "risk",
+    fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
+    actions: ["미보유", "미체결 없음", "주문 가능 수량 ≥ 1", "운용 예산 이내"],
+    vertical: true,
+  }, running));
+  buyLane.append(createStrategyBlockNode({
+    title: "매수 실행",
+    meta: "중앙 주문 처리",
+    tone: "event",
+    actions: ["멱등성 키 예약", "위험 한도 확인", "시장가 매수", "주문 상태 조정"],
+    vertical: true,
+  }, running));
+  elements.blockCanvas.append(buyLane);
+
+  const sellLane = createBlockLane(
+    "매도 조건",
+    "사용 중인 조건 중 하나라도 충족하면 전략 보유 수량을 매도합니다.",
+    3,
+    "conditions",
+  );
+  sellLane.append(createStrategyBlockNode({
+    title: "익절",
+    meta: "평균 매수가 기준",
+    tone: "risk",
+    fields: take("use_take_profit", "take_profit_multiplier"),
+  }, running));
+  sellLane.append(conditionJoin());
+  sellLane.append(createStrategyBlockNode({
+    title: "손절",
+    meta: "평균 매수가 기준",
+    tone: "risk",
+    fields: take("use_stop_loss", "stop_loss_multiplier"),
+  }, running));
+  sellLane.append(conditionJoin());
+  sellLane.append(createStrategyBlockNode({
+    title: "볼린저 상단선 미만",
+    meta: "완성 봉 종가",
+    tone: "risk",
+    fields: take("use_bollinger_exit", "bar_interval", "bollinger_period", "bollinger_stddev"),
+  }, running));
+  sellLane.append(createStrategyBlockNode({
+    title: "매도 실행",
+    meta: "OR 충족",
+    tone: "event",
+    actions: ["전략 소유 수량 확인", "시장가 매도", "주문 상태 조정"],
+    vertical: true,
+  }, running));
+  elements.blockCanvas.append(sellLane);
+
+  const scheduleLane = createBlockLane(
+    "실행 일정",
+    "정각 주기·완성 봉·장 마감 일정을 중앙 스케줄러가 실행합니다.",
+    3,
+    "schedule-config",
+  );
+  scheduleLane.append(createStrategyBlockNode({
+    title: "조건검색·매수",
+    meta: "정각 맞춤 반복",
+    tone: "schedule",
+    fields: take("buy_scan_seconds", "buy_start_time", "buy_end_time"),
+  }, running));
+  scheduleLane.append(createStrategyBlockNode({
+    title: "보유종목 매도 판단",
+    meta: "완성 봉마다",
+    tone: "schedule",
+    fields: take("sell_start_time", "sell_end_time"),
+  }, running));
+  scheduleLane.append(createStrategyBlockNode({
+    title: "장 마감 청산",
+    meta: "정시·재확인",
+    tone: "schedule",
+    fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"),
+  }, running));
+  elements.blockCanvas.append(scheduleLane);
+}
+
 function renderStrategyBlocks() {
   if (!elements.blockCanvas) return;
   const source = elements.editor.value;
-  const parsed = parseStrategyBlocks(source);
+  const parsed = currentBlockModel();
   const running = Boolean(selectedState()?.running);
   elements.blockCanvas.replaceChildren();
   elements.blockSummary.textContent = `${parsed.fields.length}개 설정 · ${parsed.schedules.length}개 일정 · ${parsed.handlers.length}개 실행 흐름`;
@@ -1219,6 +1569,11 @@ function renderStrategyBlocks() {
     empty.className = "block-empty";
     empty.textContent = "표시할 수 있는 블록이 없습니다.\n새 블록 전략을 만들거나 제공되는 설정 블록을 추가해 주세요.";
     elements.blockCanvas.append(empty);
+    return;
+  }
+
+  if (parsed.template === "condition-bollinger-v1" && state.blockPackage) {
+    renderConditionBollingerBlocks(parsed, running);
     return;
   }
 
@@ -1398,6 +1753,14 @@ async function openStrategy(name) {
   const payload = await api(`/api/strategies/${encodeURIComponent(name)}`);
   state.selected = name;
   state.strategyType = payload.strategy_type === "block" ? "block" : "script";
+  if (state.strategyType === "block") {
+    await loadBlockEditorData(name);
+  } else {
+    state.blockPackage = null;
+    state.blockConditions = [];
+    state.blockConditionKey = null;
+    state.blockConditionError = null;
+  }
   state.strategySummary = null;
   showWorkspaceView("strategy");
   elements.fileName.textContent = displayStrategyName(name);
@@ -1424,6 +1787,10 @@ async function openDashboard() {
   state.strategyType = "script";
   state.strategyPermission = null;
   state.strategySummary = null;
+  state.blockPackage = null;
+  state.blockConditions = [];
+  state.blockConditionKey = null;
+  state.blockConditionError = null;
   showWorkspaceView("dashboard");
   resetActivity("전략을 선택하면 실행 기록이 표시됩니다.");
   renderStrategies();
@@ -1458,13 +1825,30 @@ async function toggleStrategyPermission() {
 
 async function saveStrategy() {
   if (!state.selected) return;
-  await api(`/api/strategies/${encodeURIComponent(state.selected)}`, {
-    method: "PUT",
-    body: JSON.stringify({
-      source: elements.editor.value,
-      strategy_type: state.strategyType,
-    }),
-  });
+  if (state.strategyType === "block") {
+    if (!state.blockPackage) throw new Error("블록 정의를 불러오지 못했습니다. 전략을 다시 열어주세요.");
+    await api(`/api/strategies/${encodeURIComponent(state.selected)}/block-package`, {
+      method: "PUT",
+      body: JSON.stringify(state.blockPackage),
+    });
+    const [strategy, blockPackage] = await Promise.all([
+      api(`/api/strategies/${encodeURIComponent(state.selected)}`),
+      api(`/api/strategies/${encodeURIComponent(state.selected)}/block-package`),
+    ]);
+    elements.editor.value = strategy.source;
+    state.blockPackage = blockPackage;
+    state.blockSource = strategy.source;
+    updateLineNumbers();
+    renderStrategyBlocks();
+  } else {
+    await api(`/api/strategies/${encodeURIComponent(state.selected)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        source: elements.editor.value,
+        strategy_type: state.strategyType,
+      }),
+    });
+  }
   setDirty(false);
   notify("전략을 저장했습니다.");
   await refreshStrategies();
@@ -1513,6 +1897,10 @@ async function deleteStrategy() {
   forgetLogClearCursor(deletedName);
   state.selected = null;
   state.strategySummary = null;
+  state.blockPackage = null;
+  state.blockConditions = [];
+  state.blockConditionKey = null;
+  state.blockConditionError = null;
   elements.fileName.textContent = "전략을 선택하세요";
   elements.editor.value = "";
   resetActivity();
@@ -2318,6 +2706,9 @@ BOLLINGER_PERIOD = 55
 BOLLINGER_STDDEV = Decimal("1.04")
 TAKE_PROFIT_MULTIPLIER = Decimal("1.03")
 STOP_LOSS_MULTIPLIER = Decimal("0.97")
+USE_BOLLINGER_EXIT = True
+USE_TAKE_PROFIT = True
+USE_STOP_LOSS = True
 BUY_SCAN_SECONDS = 30
 BUY_START_TIME = "09:00"
 BUY_END_TIME = "15:00"
