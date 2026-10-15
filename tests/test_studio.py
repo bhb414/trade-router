@@ -18,11 +18,18 @@ from trade_router import (
     TokenScopeKey,
 )
 from trade_router_studio.app import _strategy_performance, create_app
+from trade_router_studio.block_packages import (
+    BAR_OBSERVER_TEMPLATE,
+    BlockStrategySettings,
+    block_package_from_source,
+    render_block_strategy,
+)
 from trade_router_studio import paths as paths_module
 from trade_router_studio.paths import (
     BLOCK_EXAMPLE_STRATEGY,
     EXAMPLE_STRATEGY,
     LEGACY_EXAMPLE_STRATEGY,
+    PREVIOUS_BLOCK_EXAMPLE_STRATEGY,
     PREVIOUS_EXAMPLE_STRATEGY,
     WorkspacePaths,
 )
@@ -92,6 +99,51 @@ def test_workspace_includes_a_managed_block_example(tmp_path: Path) -> None:
     assert '"type": "block"' in block_example.with_suffix(
         ".strategy.json"
     ).read_text(encoding="utf-8")
+
+
+def test_workspace_upgrades_only_the_untouched_block_example(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    block_example = paths.strategies / "블록 예제.py"
+    block_example.write_text(PREVIOUS_BLOCK_EXAMPLE_STRATEGY, encoding="utf-8")
+
+    paths.ensure()
+
+    source = block_example.read_text(encoding="utf-8")
+    assert source == BLOCK_EXAMPLE_STRATEGY
+    assert 'BLOCK_TEMPLATE = "condition-bollinger-v1"' in source
+
+
+def test_workspace_preserves_a_user_edited_block_example(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    block_example = paths.strategies / "블록 예제.py"
+    source = PREVIOUS_BLOCK_EXAMPLE_STRATEGY + "\n# 사용자 수정\n"
+    block_example.write_text(source, encoding="utf-8")
+
+    paths.ensure()
+
+    assert block_example.read_text(encoding="utf-8") == source
+
+
+def test_legacy_bar_block_package_still_round_trips() -> None:
+    settings = BlockStrategySettings(
+        strategy_id="legacy-observer",
+        trading_account="account",
+        market_source="market",
+        symbol="005930",
+        bar_interval="3m",
+        bar_count=55,
+        schedule_id="regular-bars",
+        start_time="09:00",
+        end_time="15:20",
+    )
+    source = render_block_strategy(settings, template=BAR_OBSERVER_TEMPLATE)
+
+    package = block_package_from_source("legacy", source)
+
+    assert package.template == BAR_OBSERVER_TEMPLATE
+    assert package.settings == settings
 
 
 def test_workspace_removes_only_the_untouched_personal_bundled_example(
@@ -197,9 +249,11 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert exported.status_code == 200
         package = exported.json()
         assert package["kind"] == "trade-router-block-strategy"
-        assert package["template"] == "bar-observer-v1"
+        assert package["template"] == "condition-bollinger-v1"
         assert "source" not in package
-        assert package["settings"]["symbol"] == "005930"
+        assert package["settings"]["condition_id"] == "1"
+        assert package["settings"]["bar_interval"] == "3m"
+        assert package["settings"]["total_operating_budget"] == "150000"
         package["name"] = "가져온 블록 예제"
         imported = client.post("/api/strategies/import-block", json=package)
         assert imported.status_code == 200
@@ -209,6 +263,9 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         )
         assert imported_source.status_code == 200
         assert "ManagedBlockStrategy" in imported_source.json()["source"]
+        assert "ctx.discovery.matches" in imported_source.json()["source"]
+        assert "ctx.orders.market_buy" in imported_source.json()["source"]
+        assert "ctx.orders.market_sell" in imported_source.json()["source"]
         package["source"] = "print('hidden code')"
         rejected_hidden_source = client.post(
             "/api/strategies/import-block",

@@ -755,8 +755,18 @@ const BLOCK_CONSTANT_META = {
   BOLLINGER_STDDEV: ["risk", "볼린저 표준편차"],
   BAR_INTERVAL: ["schedule", "봉 주기"],
   BAR_COUNT: ["risk", "조회 봉 수"],
-  TAKE_PROFIT_MULTIPLIER: ["risk", "익절 배수"],
-  STOP_LOSS_MULTIPLIER: ["risk", "손절 배수"],
+  TAKE_PROFIT_MULTIPLIER: ["risk", "익절 기준(1.03 = +3%)"],
+  STOP_LOSS_MULTIPLIER: ["risk", "손절 기준(0.97 = -3%)"],
+  BUY_SCAN_SECONDS: ["schedule", "조건검색 간격(초)"],
+  BUY_START_TIME: ["schedule", "매수 시작 시각"],
+  BUY_END_TIME: ["schedule", "매수 종료 시각"],
+  SELL_START_TIME: ["schedule", "매도 판단 시작"],
+  SELL_END_TIME: ["schedule", "매도 판단 종료"],
+  CLOSE_TIME: ["schedule", "전량 청산 시각"],
+  CLOSE_RETRY_START: ["schedule", "청산 재확인 시작"],
+  CLOSE_RETRY_END: ["schedule", "청산 재확인 종료"],
+  CLOSE_CONFIRM_TIME: ["schedule", "최종 확인 시각"],
+  ORDER_ROUTE: ["connection", "주문 경로"],
 };
 
 const BLOCK_CATEGORY_META = {
@@ -878,10 +888,12 @@ function parseStrategyBlocks(source) {
   const schedules = [];
   const handlers = [];
   const ignoredSecret = /(SECRET|TOKEN|PASSWORD|APP_?KEY)/;
+  const templateMatch = source.match(/^BLOCK_TEMPLATE\s*=\s*(["'])(.*?)\1\s*$/m);
+  const template = templateMatch?.[2] || "bar-observer-v1";
 
   for (const match of source.matchAll(/^([A-Z][A-Z0-9_]*)[ \t]*=[ \t]*(.+?)[ \t]*$/gm)) {
     const name = match[1];
-    if (ignoredSecret.test(name)) continue;
+    if (name === "BLOCK_TEMPLATE" || ignoredSecret.test(name)) continue;
     const raw = match[2];
     const rawStart = match.index + match[0].indexOf(raw);
     const [category, label] = genericConstantMeta(name);
@@ -954,6 +966,7 @@ function parseStrategyBlocks(source) {
       id: idPrefix,
       method,
       title: scheduleId?.value || ({ every: "주기 실행", on_bar_close: "봉 마감 실행", daily_at: "지정 시각 실행" }[method] || method),
+      meta: ({ every: "반복 실행", on_bar_close: "완성 봉마다", daily_at: "지정 시각" }[method] || "중앙 일정"),
       fields: scheduleFields,
       line: sourceLineNumber(source, start),
     });
@@ -971,6 +984,7 @@ function parseStrategyBlocks(source) {
     [/ctx\.market\.bars\s*\(/g, "봉 조회"],
     [/ctx\.account\.balance\s*\(/g, "잔고 조회"],
     [/ctx\.account\.open_orders\s*\(/g, "미체결 조회"],
+    [/ctx\.account\.buying_power\s*\(/g, "주문 가능 수량 계산"],
     [/ctx\.orders\.market_buy\s*\(/g, "시장가 매수"],
     [/ctx\.orders\.limit_buy\s*\(/g, "지정가 매수"],
     [/ctx\.orders\.market_sell\s*\(/g, "시장가 매도"],
@@ -1006,7 +1020,64 @@ function parseStrategyBlocks(source) {
     });
   });
 
-  return { fields, schedules, handlers };
+  if (template === "condition-bollinger-v1") {
+    const schedulePresentation = {
+      "condition-scan": ["조건검색 매수", "설정한 초 간격·정각 맞춤"],
+      "bollinger-sell": ["보유종목 매도", "완성 봉마다"],
+      "close-all": ["장 마감 전량 청산", "지정 시각"],
+      "close-retry": ["청산 재확인", "30초 간격"],
+      "close-confirm": ["최종 잔여 확인", "지정 시각"],
+    };
+    schedules.forEach(schedule => {
+      const presentation = schedulePresentation[schedule.title];
+      if (!presentation) return;
+      [schedule.title, schedule.meta] = presentation;
+      schedule.fields = [];
+    });
+    handlers.splice(0, handlers.length,
+      {
+        id: "workflow:buy",
+        name: "30초 주기",
+        title: "조건검색 매수",
+        vertical: true,
+        actions: [
+          "조건검색 결과 조회",
+          "잔고·미체결 확인",
+          "보유·주문 종목 제외",
+          "주문 가능 수량 계산",
+          "종목당·총 운용 예산 확인",
+          "시장가 매수",
+        ],
+      },
+      {
+        id: "workflow:sell",
+        name: "완성 3분봉",
+        title: "보유종목 매도",
+        vertical: true,
+        actions: [
+          "전략 보유종목 확인",
+          "완성 봉 조회",
+          "볼린저·익절·손절 계산",
+          "매도 조건 분기",
+          "시장가 매도",
+        ],
+      },
+      {
+        id: "workflow:close",
+        name: "장 마감",
+        title: "전량 청산",
+        vertical: true,
+        actions: [
+          "잔고·미체결 확인",
+          "전략 소유 수량 확인",
+          "시장가 매도",
+          "재확인",
+        ],
+      },
+    );
+  }
+
+  return { fields, schedules, handlers, template };
 }
 
 function formatBlockFieldValue(field, value) {
@@ -1079,7 +1150,7 @@ function createBlockFieldControl(field, disabled) {
   return row;
 }
 
-function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [] }, disabled) {
+function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [], vertical = false }, disabled) {
   const node = document.createElement("article");
   node.className = `strategy-block-node ${tone}`;
   const heading = document.createElement("div");
@@ -1098,12 +1169,12 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [] 
   }
   if (actions.length) {
     const flow = document.createElement("div");
-    flow.className = "block-flow";
+    flow.className = `block-flow${vertical ? " vertical" : ""}`;
     actions.forEach((action, index) => {
       if (index) {
         const arrow = document.createElement("span");
         arrow.className = "block-flow-arrow";
-        arrow.textContent = "→";
+        arrow.textContent = vertical ? "↓" : "→";
         flow.append(arrow);
       }
       const step = document.createElement("span");
@@ -1140,7 +1211,7 @@ function renderStrategyBlocks() {
   const parsed = parseStrategyBlocks(source);
   const running = Boolean(selectedState()?.running);
   elements.blockCanvas.replaceChildren();
-  elements.blockSummary.textContent = `${parsed.fields.length}개 설정 · ${parsed.schedules.length}개 일정 · ${parsed.handlers.length}개 이벤트`;
+  elements.blockSummary.textContent = `${parsed.fields.length}개 설정 · ${parsed.schedules.length}개 일정 · ${parsed.handlers.length}개 실행 흐름`;
   state.blockSource = source;
 
   if (!parsed.fields.length && !parsed.schedules.length && !parsed.handlers.length) {
@@ -1175,7 +1246,7 @@ function renderStrategyBlocks() {
   parsed.schedules.forEach(schedule => {
     scheduleLane.append(createStrategyBlockNode({
       title: schedule.title,
-      meta: schedule.method,
+      meta: schedule.meta,
       tone: "schedule",
       fields: schedule.fields,
     }, running));
@@ -1200,6 +1271,7 @@ function renderStrategyBlocks() {
         meta: handler.name,
         tone: "event",
         actions: handler.actions,
+        vertical: handler.vertical,
       }, running));
     });
     eventLane.append(eventGrid);
@@ -2228,42 +2300,35 @@ class NewStrategy(Strategy):
 }
 
 function blockStrategyTemplate(strategyId) {
-  return `"""Trade Router가 관리하는 블록 전략 실행 파일"""
+  return `"""Trade Router가 관리하는 조건검색·볼린저 블록 전략 설정."""
 
-from trade_router import Strategy, StrategyConfig
+from decimal import Decimal
 
-
+BLOCK_TEMPLATE = "condition-bollinger-v1"
 STRATEGY_ID = "${strategyId}"
 TRADING_ACCOUNT = "등록한 계좌 별칭"
-MARKET_SOURCE = "등록한 API 연결 이름"
-SYMBOL = "005930"
+CONDITION_SOURCE = "등록한 KIS 실전 API 이름"
+HTS_USER_ID = "등록한 HTS ID"
+CONDITION_ID = "1"
+EXPECTED_CONDITION_NAME = ""
+BUY_BUDGET_PER_SYMBOL = Decimal("50000")
+TOTAL_OPERATING_BUDGET = Decimal("150000")
+MAX_NEW_BUYS_PER_SCAN = 5
+BOLLINGER_PERIOD = 55
+BOLLINGER_STDDEV = Decimal("1.04")
+TAKE_PROFIT_MULTIPLIER = Decimal("1.03")
+STOP_LOSS_MULTIPLIER = Decimal("0.97")
+BUY_SCAN_SECONDS = 30
+BUY_START_TIME = "09:00"
+BUY_END_TIME = "15:00"
 BAR_INTERVAL = "3m"
-BAR_COUNT = 55
-
-
-class ManagedBlockStrategy(Strategy):
-    config = StrategyConfig(
-        id=STRATEGY_ID,
-        trading_account=TRADING_ACCOUNT,
-        market_sources={"primary": MARKET_SOURCE},
-        required_capabilities={"primary": ("quotes", "bars")},
-    )
-
-    async def on_start(self, ctx):
-        ctx.scheduler.on_bar_close(
-            BAR_INTERVAL,
-            schedule_id="regular-bars",
-            between=("09:00", "15:20"),
-        )
-        ctx.log.info("블록 전략을 시작했습니다.")
-
-    async def on_bar(self, ctx, event):
-        bars = await ctx.market.bars(SYMBOL, BAR_INTERVAL, count=BAR_COUNT)
-        if bars:
-            ctx.log.info(f"완성 봉 {len(bars)}개 · 최근 종가 {bars[-1].close}")
-
-    async def on_stop(self, ctx):
-        ctx.log.info("블록 전략을 종료합니다.")
+SELL_START_TIME = "09:00"
+SELL_END_TIME = "15:20"
+CLOSE_TIME = "15:20"
+CLOSE_RETRY_START = "15:20:30"
+CLOSE_RETRY_END = "15:30"
+CLOSE_CONFIRM_TIME = "15:30:05"
+ORDER_ROUTE = "KRX"
 `;
 }
 

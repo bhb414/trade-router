@@ -5,6 +5,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .block_packages import (
+    CONDITION_BOLLINGER_TEMPLATE,
+    DEFAULT_CONDITION_BOLLINGER_SETTINGS,
+    render_block_strategy,
+)
+
 
 EXAMPLE_STRATEGY = '''"""연결·계좌 설정과 공통 시세 API 사용법을 보여주는 읽기 전용 예제.
 
@@ -113,7 +119,7 @@ class ExampleStrategy(Strategy):
 '''
 
 
-BLOCK_EXAMPLE_STRATEGY = '''"""Trade Router가 관리하는 블록 전략 예제 실행 파일."""
+PREVIOUS_BLOCK_EXAMPLE_STRATEGY = '''"""Trade Router가 관리하는 블록 전략 예제 실행 파일."""
 
 from trade_router import Strategy, StrategyConfig
 
@@ -153,6 +159,14 @@ class BlockExampleStrategy(Strategy):
     async def on_stop(self, ctx):
         ctx.log.info("블록 예제 전략을 종료합니다.")
 '''
+
+
+BLOCK_EXAMPLE_STRATEGY = render_block_strategy(
+    DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"strategy_id": "block-example"}
+    ),
+    template=CONDITION_BOLLINGER_TEMPLATE,
+)
 
 
 BLOCK_EXAMPLE_METADATA = '''{
@@ -241,6 +255,13 @@ class WorkspacePaths:
 
         block_example = self.strategies / "블록 예제.py"
         if not block_example.exists():
+            block_example.write_text(BLOCK_EXAMPLE_STRATEGY, encoding="utf-8")
+        elif (
+            block_example.read_text(encoding="utf-8").strip()
+            == PREVIOUS_BLOCK_EXAMPLE_STRATEGY.strip()
+        ):
+            # Replace only the untouched bundled observer. User-edited block
+            # strategies keep their exact source during an update.
             block_example.write_text(BLOCK_EXAMPLE_STRATEGY, encoding="utf-8")
         block_metadata = block_example.with_suffix(".strategy.json")
         if (
