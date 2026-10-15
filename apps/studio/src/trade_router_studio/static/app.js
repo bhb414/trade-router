@@ -771,6 +771,7 @@ const BLOCK_CONSTANT_META = {
   BOLLINGER_PERIOD: ["risk", "볼린저 기간"],
   BOLLINGER_STDDEV: ["risk", "볼린저 표준편차"],
   BAR_INTERVAL: ["schedule", "봉 주기"],
+  BAR_DATA_MODE: ["schedule", "봉 상태"],
   BAR_COUNT: ["risk", "조회 봉 수"],
   TAKE_PROFIT_MULTIPLIER: ["risk", "익절 기준(1.03 = +3%)"],
   STOP_LOSS_MULTIPLIER: ["risk", "손절 기준(0.97 = -3%)"],
@@ -1278,7 +1279,13 @@ function blockFieldOptions(field) {
   }
   if (field.settingKey === "bar_interval") {
     return ["1m", "3m", "5m", "10m", "15m", "30m", "60m", "120m", "1d"]
-      .map(value => ({ value, label: value === "1d" ? "일봉 (완성봉)" : value }));
+      .map(value => ({ value, label: value === "1d" ? "일봉" : value }));
+  }
+  if (field.settingKey === "bar_data_mode") {
+    return [
+      { value: "COMPLETE_ONLY", label: "완성봉만" },
+      { value: "INCLUDE_CURRENT", label: "진행 중 봉 포함" },
+    ];
   }
   return null;
 }
@@ -2060,7 +2067,7 @@ function renderConditionBollingerBlocks(parsed, running) {
       fields: targetFields, actions: ["조회 결과를 종목 목록으로 전달"] },
     { id: "buyConditions", title: "매수 추가 조건", meta: settings.buy_conditions.length
       ? `${settings.buy_conditions.length}개 · ${settings.buy_condition_logic}` : "조건 없이 통과", tone: "risk", width: 430,
-      fields: take("buy_condition_logic", "bar_interval", "bollinger_period", "bollinger_stddev"), conditionKind: "buy" },
+      fields: take("buy_condition_logic", "bar_interval", "bar_data_mode", "bollinger_period", "bollinger_stddev"), conditionKind: "buy" },
     { id: "buyRules", title: "매수 조건", meta: "AND", tone: "risk", width: 340,
       fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
       actions: ["미보유", "미체결 없음", "가능 수량 ≥ 1", "운용 예산 이내"] },

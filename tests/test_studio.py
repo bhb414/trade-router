@@ -166,7 +166,8 @@ def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> N
     assert 'MARKET_VENUE = "NXT"' in source
     assert 'ORDER_ROUTE = "NXT"' in source
     assert "ctx.market.quote(code, venue=Venue(MARKET_VENUE))" in source
-    assert "venue=Venue(MARKET_VENUE), complete_only=True" in source
+    assert 'BAR_DATA_MODE = "COMPLETE_ONLY"' in source
+    assert 'complete_only=BAR_DATA_MODE == "COMPLETE_ONLY"' in source
     assert "route=ORDER_ROUTE" in source
 
     package = block_package_from_source("nxt-block", source)
@@ -212,6 +213,21 @@ def test_managed_block_supports_daily_bars_at_the_sell_start_time() -> None:
         assert "ctx.scheduler.daily_at(SELL_START_TIME" in source
         assert 'schedule_id="bollinger-sell-daily"' in source
         assert "await self.on_bar(ctx, event)" in source
+
+
+def test_managed_block_can_include_the_current_forming_bar() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"bar_interval": "1d", "bar_data_mode": "INCLUDE_CURRENT"}
+    )
+    source = render_block_strategy(settings)
+
+    assert 'BAR_DATA_MODE = "INCLUDE_CURRENT"' in source
+    assert 'schedule_id="bollinger-sell-live"' in source
+    assert "seconds=BUY_SCAN_SECONDS" in source
+    assert 'complete_only=BAR_DATA_MODE == "COMPLETE_ONLY"' in source
+
+    package = block_package_from_source("live-daily", source)
+    assert package.settings.bar_data_mode == "INCLUDE_CURRENT"
 
 
 def test_managed_block_limits_daily_history_to_one_period_request() -> None:

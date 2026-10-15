@@ -111,6 +111,7 @@ class ConditionBollingerBlockSettings(BaseModel):
     buy_start_time: str
     buy_end_time: str
     bar_interval: str = Field(max_length=16)
+    bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
     sell_start_time: str
     sell_end_time: str
     close_time: str
@@ -252,6 +253,7 @@ DEFAULT_CONDITION_BOLLINGER_SETTINGS = ConditionBollingerBlockSettings(
     buy_start_time="09:00",
     buy_end_time="15:00",
     bar_interval="3m",
+    bar_data_mode="COMPLETE_ONLY",
     sell_start_time="09:00",
     sell_end_time="15:20",
     close_time="15:20",
@@ -376,6 +378,7 @@ BUY_SCAN_SECONDS = __BUY_SCAN_SECONDS__
 BUY_START_TIME = __BUY_START_TIME__
 BUY_END_TIME = __BUY_END_TIME__
 BAR_INTERVAL = __BAR_INTERVAL__
+BAR_DATA_MODE = __BAR_DATA_MODE__
 SELL_START_TIME = __SELL_START_TIME__
 SELL_END_TIME = __SELL_END_TIME__
 CLOSE_TIME = __CLOSE_TIME__
@@ -526,13 +529,22 @@ class ManagedBlockStrategy(Strategy):
         return quote.price
 
     async def on_start(self, ctx):
+        bar_mode_label = "완성봉만" if BAR_DATA_MODE == "COMPLETE_ONLY" else "진행 중 봉 포함"
+        ctx.log.info(f"봉 데이터 설정: {BAR_INTERVAL} · {bar_mode_label}")
         ctx.scheduler.every(
             seconds=BUY_SCAN_SECONDS,
             schedule_id="condition-scan",
             between=(BUY_START_TIME, BUY_END_TIME),
             aligned=True,
         )
-        if BAR_INTERVAL == "1d":
+        if BAR_DATA_MODE == "INCLUDE_CURRENT":
+            ctx.scheduler.every(
+                seconds=BUY_SCAN_SECONDS,
+                schedule_id="bollinger-sell-live",
+                between=(SELL_START_TIME, SELL_END_TIME),
+                aligned=True,
+            )
+        elif BAR_INTERVAL == "1d":
             ctx.scheduler.daily_at(SELL_START_TIME, schedule_id="bollinger-sell-daily")
         else:
             ctx.scheduler.on_bar_close(
@@ -639,7 +651,7 @@ class ManagedBlockStrategy(Strategy):
                 ctx.state.set("strategy_positions", tracked)
 
     async def on_timer(self, ctx, event):
-        if event.schedule_id == "bollinger-sell-daily":
+        if event.schedule_id in {"bollinger-sell-daily", "bollinger-sell-live"}:
             await self.on_bar(ctx, event)
             return
         if event.schedule_id in {"close-all", "close-retry", "close-confirm"}:
@@ -681,13 +693,15 @@ class ManagedBlockStrategy(Strategy):
                 required = self._required_bar_count(BUY_CONDITIONS)
                 try:
                     bars = await ctx.market.bars(
-                        code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE), complete_only=True,
+                        code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE),
+                        complete_only=BAR_DATA_MODE == "COMPLETE_ONLY",
                     )
                 except RouterError as exc:
                     ctx.log.warning(f"{code} 매수 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
                     continue
                 if len(bars) < required:
-                    ctx.log.info(f"{code} 매수 판단 보류: 완성 봉 {len(bars)}/{required}개")
+                    mode_text = "완성 봉" if BAR_DATA_MODE == "COMPLETE_ONLY" else "현재 포함 봉"
+                    ctx.log.info(f"{code} 매수 판단 보류: {mode_text} {len(bars)}/{required}개")
                     continue
                 if not self._conditions_match(BUY_CONDITIONS, BUY_CONDITION_LOGIC, bars):
                     continue
@@ -766,10 +780,12 @@ class ManagedBlockStrategy(Strategy):
                 continue
             required = self._required_bar_count(SELL_CONDITIONS)
             bars = await ctx.market.bars(
-                code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE), complete_only=True,
+                code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE),
+                complete_only=BAR_DATA_MODE == "COMPLETE_ONLY",
             )
             if len(bars) < required:
-                ctx.log.warning(f"{code} 매도 판단 보류: 완성 봉 {len(bars)}/{required}개")
+                mode_text = "완성 봉" if BAR_DATA_MODE == "COMPLETE_ONLY" else "현재 포함 봉"
+                ctx.log.warning(f"{code} 매도 판단 보류: {mode_text} {len(bars)}/{required}개")
                 continue
             average_price = position.average_price
             matched = [
@@ -857,6 +873,7 @@ def _render_condition_bollinger(
         "__BUY_START_TIME__": _literal(settings.buy_start_time),
         "__BUY_END_TIME__": _literal(settings.buy_end_time),
         "__BAR_INTERVAL__": _literal(settings.bar_interval),
+        "__BAR_DATA_MODE__": _literal(settings.bar_data_mode),
         "__SELL_START_TIME__": _literal(settings.sell_start_time),
         "__SELL_END_TIME__": _literal(settings.sell_end_time),
         "__CLOSE_TIME__": _literal(settings.close_time),
@@ -949,7 +966,8 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         "buy_condition_logic": "BUY_CONDITION_LOGIC", "sell_condition_logic": "SELL_CONDITION_LOGIC",
         "buy_order_type": "BUY_ORDER_TYPE", "sell_order_type": "SELL_ORDER_TYPE",
         "buy_start_time": "BUY_START_TIME", "buy_end_time": "BUY_END_TIME",
-        "bar_interval": "BAR_INTERVAL", "sell_start_time": "SELL_START_TIME",
+        "bar_interval": "BAR_INTERVAL", "bar_data_mode": "BAR_DATA_MODE",
+        "sell_start_time": "SELL_START_TIME",
         "sell_end_time": "SELL_END_TIME", "close_time": "CLOSE_TIME",
         "close_retry_start": "CLOSE_RETRY_START", "close_retry_end": "CLOSE_RETRY_END",
         "close_confirm_time": "CLOSE_CONFIRM_TIME", "route": "ORDER_ROUTE",
@@ -960,7 +978,8 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         if required[field] is None:
             required[field] = True
     defaults = {
-        "target_source": "HTS_CONDITION", "market_venue": "KRX", "ranking_kind": "RISE", "ranking_venue": "KRX",
+        "target_source": "HTS_CONDITION", "market_venue": "KRX", "bar_data_mode": "COMPLETE_ONLY",
+        "ranking_kind": "RISE", "ranking_venue": "KRX",
         "ranking_market": "ALL", "ranking_limit": 20,
         "buy_condition_logic": "ALL", "sell_condition_logic": "ANY",
         "buy_order_type": "MARKET", "sell_order_type": "MARKET",
