@@ -145,17 +145,23 @@ def test_managed_block_compiles_generic_comparisons() -> None:
         )
         for index in range(60)
     ]
-    assert strategy._conditions_match(
-        ({"left": "close", "operator": "GT", "right": "value", "value": "150"},),
-        "ALL", bars,
+    group = {
+        "id": "test-1", "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+        "bollinger_period": 55, "bollinger_stddev": "1.04",
+        "conditions": [],
+    }
+    assert strategy._condition_matches(
+        {"left": "close", "operator": "GT", "right": "value", "value": "150"},
+        bars, None, group,
     )
-    assert strategy._conditions_match(
-        ({"left": "profit_rate", "operator": "GTE", "right": "value", "value": "3"},),
-        "ALL", bars, Decimal("150"),
+    assert strategy._condition_matches(
+        {"left": "profit_rate", "operator": "GTE", "right": "value", "value": "3"},
+        bars, Decimal("150"), group,
     )
-    assert strategy._required_bar_count((
+    group["conditions"] = [
         {"left": "close", "operator": "CROSS_UP", "right": "bollinger_upper", "left_offset": 0, "right_offset": 0},
-    )) == DEFAULT_CONDITION_BOLLINGER_SETTINGS.bollinger_period + 1
+    ]
+    assert strategy._required_bar_count(group) == 56
 
 
 def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> None:
@@ -167,7 +173,8 @@ def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> N
     assert 'ORDER_ROUTE = "NXT"' in source
     assert "ctx.market.quote(code, venue=Venue(MARKET_VENUE))" in source
     assert 'BAR_DATA_MODE = "COMPLETE_ONLY"' in source
-    assert 'complete_only=BAR_DATA_MODE == "COMPLETE_ONLY"' in source
+    assert "complete_only=complete_only" in source
+    assert "group[\"bar_interval\"]" in source
     assert "route=ORDER_ROUTE" in source
 
     package = block_package_from_source("nxt-block", source)
@@ -177,21 +184,23 @@ def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> N
 
 def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metrics() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
-    payload["bar_interval"] = "1h"
-    payload["bollinger_period"] = 20
+    payload["sell_condition_groups"][0]["bar_interval"] = "1h"
+    payload["sell_condition_groups"][0]["bollinger_period"] = 20
     normalized = ConditionBollingerBlockSettings.model_validate(payload)
-    assert normalized.bar_interval == "60m"
+    assert normalized.sell_condition_groups[0].bar_interval == "60m"
     assert _minute_interval("1h") == 60
     assert _bar_interval_seconds("1h") == 60 * 60
 
-    payload["buy_conditions"] = [
-        {
+    payload["buy_condition_groups"] = [{
+        "id": "buy-invalid", "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+        "bollinger_period": 20, "bollinger_stddev": "1.04",
+        "conditions": [{
             "left": "profit_rate",
             "operator": "GTE",
             "right": "value",
             "value": "1",
-        }
-    ]
+        }],
+    }]
     try:
         ConditionBollingerBlockSettings.model_validate(payload)
     except ValueError as exc:
@@ -202,38 +211,38 @@ def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metr
 
 def test_managed_block_supports_daily_bars_at_the_sell_start_time() -> None:
     for venue in ("KRX", "NXT", "INTEGRATED"):
-        settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
-            update={"bar_interval": "1d", "market_venue": venue}
-        )
-        normalized = ConditionBollingerBlockSettings.model_validate(
-            settings.model_dump(mode="json")
-        )
+        payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+        payload["market_venue"] = venue
+        payload["sell_condition_groups"][0]["bar_interval"] = "1d"
+        normalized = ConditionBollingerBlockSettings.model_validate(payload)
         source = render_block_strategy(normalized)
-        assert normalized.bar_interval == "1d"
-        assert "ctx.scheduler.daily_at(SELL_START_TIME" in source
-        assert 'schedule_id="bollinger-sell-daily"' in source
+        assert normalized.sell_condition_groups[0].bar_interval == "1d"
+        assert "ctx.scheduler.daily_at(" in source
+        assert 'schedule_id=f"condition-sell-daily-{index}"' in source
         assert "await self.on_bar(ctx, event)" in source
 
 
 def test_managed_block_can_include_the_current_forming_bar() -> None:
-    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
-        update={"bar_interval": "1d", "bar_data_mode": "INCLUDE_CURRENT"}
-    )
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["sell_condition_groups"][0]["bar_interval"] = "1d"
+    payload["sell_condition_groups"][0]["bar_data_mode"] = "INCLUDE_CURRENT"
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
     source = render_block_strategy(settings)
 
-    assert 'BAR_DATA_MODE = "INCLUDE_CURRENT"' in source
-    assert 'schedule_id="bollinger-sell-live"' in source
+    round_trip = block_package_from_source("forming-bar", source)
+    assert round_trip.settings.sell_condition_groups[0].bar_data_mode == "INCLUDE_CURRENT"
+    assert 'schedule_id="condition-sell-live"' in source
     assert "seconds=BUY_SCAN_SECONDS" in source
-    assert 'complete_only=BAR_DATA_MODE == "COMPLETE_ONLY"' in source
+    assert 'complete_only = group["bar_data_mode"] == "COMPLETE_ONLY"' in source
 
     package = block_package_from_source("live-daily", source)
-    assert package.settings.bar_data_mode == "INCLUDE_CURRENT"
+    assert package.settings.sell_condition_groups[0].bar_data_mode == "INCLUDE_CURRENT"
 
 
 def test_managed_block_limits_daily_history_to_one_period_request() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
-    payload["bar_interval"] = "1d"
-    payload["bollinger_period"] = 401
+    payload["sell_condition_groups"][0]["bar_interval"] = "1d"
+    payload["sell_condition_groups"][0]["bollinger_period"] = 401
     try:
         ConditionBollingerBlockSettings.model_validate(payload)
     except ValueError as exc:
@@ -244,13 +253,48 @@ def test_managed_block_limits_daily_history_to_one_period_request() -> None:
 
 def test_managed_block_rejects_history_windows_larger_than_the_adapter_bound() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
-    payload["bar_interval"] = "30m"
+    payload["sell_condition_groups"][0]["bar_interval"] = "30m"
     try:
         ConditionBollingerBlockSettings.model_validate(payload)
     except ValueError as exc:
         assert "1회 조회 범위를 초과" in str(exc)
     else:
         raise AssertionError("An unreachable managed history window must be rejected.")
+
+
+def test_managed_block_keeps_or_conditions_inside_and_groups_across_timeframes() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = [
+        {
+            "id": "buy-fast",
+            "bar_interval": "1m",
+            "bar_data_mode": "INCLUDE_CURRENT",
+            "bollinger_period": 20,
+            "bollinger_stddev": "2",
+            "conditions": [
+                {"left": "close", "operator": "GT", "right": "open", "value": "0"},
+                {"left": "volume", "operator": "GT", "right": "value", "value": "1000"},
+            ],
+        },
+        {
+            "id": "buy-slow",
+            "bar_interval": "3m",
+            "bar_data_mode": "COMPLETE_ONLY",
+            "bollinger_period": 55,
+            "bollinger_stddev": "1.04",
+            "conditions": [
+                {"left": "close", "operator": "CROSS_UP", "right": "bollinger_upper", "value": "0"},
+            ],
+        },
+    ]
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
+    source = render_block_strategy(settings)
+    package = block_package_from_source("multi-timeframe", source)
+
+    assert [group.bar_interval for group in package.settings.buy_condition_groups] == ["1m", "3m"]
+    assert len(package.settings.buy_condition_groups[0].conditions) == 2
+    assert "A condition block is OR. Every condition block must pass (AND)." in source
+    assert "requests[key] = max" in source
 
 
 def test_legacy_bar_block_package_still_round_trips() -> None:
@@ -356,6 +400,9 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "사용자 Python 로직" not in static_script.text
         assert "blockPackageFields" in static_script.text
         assert "/api/block-options/conditions" in static_script.text
+        assert 'button.addEventListener("pointerdown"' in static_script.text
+        assert "buy_condition_groups" in static_script.text
+        assert "매수 주문 조건" in static_script.text
         page = client.get("/")
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text
@@ -389,15 +436,21 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert package["settings"]["target_source"] == "HTS_CONDITION"
         assert package["settings"]["buy_order_type"] == "MARKET"
         assert len(package["settings"]["sell_conditions"]) == 3
+        assert package["settings"]["buy_condition_groups"] == []
+        assert len(package["settings"]["sell_condition_groups"]) == 1
         assert package["layout"]["viewport"]["zoom"] == 0.75
         package["layout"]["nodes"]["target"] = {"x": 412.5, "y": 93.0}
         package["layout"]["viewport"] = {"x": 18.0, "y": 27.0, "zoom": 0.9}
         package["settings"]["target_source"] = "RANKING"
         package["settings"]["ranking_kind"] = "TRADING_VALUE"
         package["settings"]["buy_order_type"] = "LIMIT"
-        package["settings"]["buy_conditions"] = [{
-            "left": "close", "operator": "CROSS_UP", "right": "bollinger_upper",
-            "value": "0", "left_offset": 0, "right_offset": 0,
+        package["settings"]["buy_condition_groups"] = [{
+            "id": "buy-1", "bar_interval": "1m", "bar_data_mode": "COMPLETE_ONLY",
+            "bollinger_period": 20, "bollinger_stddev": "2",
+            "conditions": [{
+                "left": "close", "operator": "CROSS_UP", "right": "bollinger_upper",
+                "value": "0", "left_offset": 0, "right_offset": 0,
+            }],
         }]
         saved_package = client.put(
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package",
@@ -411,6 +464,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'RANKING_KIND = "TRADING_VALUE"' in compiled_block
         assert 'BUY_ORDER_TYPE = "LIMIT"' in compiled_block
         assert '"CROSS_UP"' in compiled_block
+        compiled_package = block_package_from_source("compiled", compiled_block)
+        assert compiled_package.settings.buy_condition_groups[0].bar_interval == "1m"
         compile(compiled_block, "<managed-block>", "exec")
         assert "BLOCK_LAYOUT_JSON" in compiled_block
         saved_layout = client.get(

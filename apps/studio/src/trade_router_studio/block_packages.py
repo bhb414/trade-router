@@ -70,6 +70,61 @@ DEFAULT_SELL_CONDITIONS = (
 )
 
 
+def _normalize_managed_bar_interval(value: str) -> str:
+    candidate = value.strip().lower()
+    if candidate in {"1d", "d", "day"}:
+        return "1d"
+    if candidate == "1h":
+        candidate = "60m"
+    if not candidate.endswith("m") or not candidate[:-1].isdigit():
+        raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
+    minutes = int(candidate[:-1])
+    if not 1 <= minutes <= 120:
+        raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
+    return f"{minutes}m"
+
+
+class BlockConditionGroup(BaseModel):
+    """One OR group. Multiple groups are combined with AND by the compiler."""
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
+    bar_interval: str = Field(default="3m", max_length=16)
+    bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
+    bollinger_period: int = Field(default=55, ge=2, le=2_000)
+    bollinger_stddev: Decimal = Field(default=Decimal("1.04"), gt=0, le=Decimal("20"))
+    conditions: list[BlockTradeCondition] = Field(min_length=1, max_length=20)
+
+    _validate_interval = field_validator("bar_interval")(_normalize_managed_bar_interval)
+
+
+def _legacy_condition_groups(
+    conditions: list[object] | tuple[object, ...],
+    logic: object,
+    *,
+    prefix: str,
+    bar_interval: object,
+    bar_data_mode: object,
+    bollinger_period: object,
+    bollinger_stddev: object,
+) -> list[dict[str, object]]:
+    rows = list(conditions or [])
+    if not rows:
+        return []
+    groups = [rows] if str(logic or "ANY") == "ANY" else [[row] for row in rows]
+    return [
+        {
+            "id": f"{prefix}-{index}",
+            "bar_interval": bar_interval or "3m",
+            "bar_data_mode": bar_data_mode or "COMPLETE_ONLY",
+            "bollinger_period": bollinger_period or 55,
+            "bollinger_stddev": bollinger_stddev or Decimal("1.04"),
+            "conditions": group,
+        }
+        for index, group in enumerate(groups, start=1)
+    ]
+
+
 class ConditionBollingerBlockSettings(BaseModel):
     """Editable values for the router-owned condition/Bollinger workflow."""
 
@@ -105,6 +160,8 @@ class ConditionBollingerBlockSettings(BaseModel):
         min_length=1,
         max_length=20,
     )
+    buy_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
+    sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, min_length=1, max_length=8)
     buy_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     sell_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     buy_scan_seconds: int = Field(ge=1, le=86_400)
@@ -125,20 +182,41 @@ class ConditionBollingerBlockSettings(BaseModel):
         "close_time", "close_retry_start", "close_retry_end", "close_confirm_time",
     )(_validate_clock)
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_condition_lists(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        common = {
+            "bar_interval": values.get("bar_interval", "3m"),
+            "bar_data_mode": values.get("bar_data_mode", "COMPLETE_ONLY"),
+            "bollinger_period": values.get("bollinger_period", 55),
+            "bollinger_stddev": values.get("bollinger_stddev", Decimal("1.04")),
+        }
+        if "buy_condition_groups" not in values:
+            values["buy_condition_groups"] = _legacy_condition_groups(
+                values.get("buy_conditions", []),
+                values.get("buy_condition_logic", "ALL"),
+                prefix="buy",
+                **common,
+            )
+        if "sell_condition_groups" not in values:
+            sell_conditions = values.get("sell_conditions") or [
+                item.model_dump(mode="json") for item in DEFAULT_SELL_CONDITIONS
+            ]
+            values["sell_condition_groups"] = _legacy_condition_groups(
+                sell_conditions,
+                values.get("sell_condition_logic", "ANY"),
+                prefix="sell",
+                **common,
+            )
+        return values
+
     @field_validator("bar_interval")
     @classmethod
     def validate_bar_interval(cls, value: str) -> str:
-        candidate = value.strip().lower()
-        if candidate in {"1d", "d", "day"}:
-            return "1d"
-        if candidate == "1h":
-            candidate = "60m"
-        if not candidate.endswith("m") or not candidate[:-1].isdigit():
-            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
-        minutes = int(candidate[:-1])
-        if not 1 <= minutes <= 120:
-            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
-        return f"{minutes}m"
+        return _normalize_managed_bar_interval(value)
 
     @model_validator(mode="after")
     def validate_limits(self) -> "ConditionBollingerBlockSettings":
@@ -160,37 +238,40 @@ class ConditionBollingerBlockSettings(BaseModel):
         if self.target_source == "SYMBOLS" and not self.symbols:
             raise ValueError("At least one symbol is required for a symbol-list source.")
         position_only_metrics = {"average_price", "profit_rate"}
-        for condition in self.buy_conditions:
-            if condition.left in position_only_metrics or condition.right in position_only_metrics:
-                raise ValueError(
-                    "매수 조건에서는 보유 후에만 생기는 평균 매수가·수익률을 사용할 수 없습니다."
+        for group in self.buy_condition_groups:
+            for condition in group.conditions:
+                if condition.left in position_only_metrics or condition.right in position_only_metrics:
+                    raise ValueError(
+                        "매수 조건에서는 보유 후에만 생기는 평균 매수가·수익률을 사용할 수 없습니다."
+                    )
+        identifiers = [group.id for group in (*self.buy_condition_groups, *self.sell_condition_groups)]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("매수·매도 조건 블록 ID는 서로 달라야 합니다.")
+        for group in (*self.buy_condition_groups, *self.sell_condition_groups):
+            required_bars = 1
+            for condition in group.conditions:
+                offset = max(condition.left_offset, condition.right_offset)
+                if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
+                    offset += 1
+                uses_bollinger = condition.left.startswith("bollinger_") or condition.right.startswith("bollinger_")
+                required_bars = max(
+                    required_bars,
+                    offset + (group.bollinger_period if uses_bollinger else 1),
                 )
-        if not self.sell_conditions:
-            raise ValueError("At least one sell condition must be configured.")
-        required_bars = 1
-        for condition in (*self.buy_conditions, *self.sell_conditions):
-            offset = max(condition.left_offset, condition.right_offset)
-            if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
-                offset += 1
-            uses_bollinger = condition.left.startswith("bollinger_") or condition.right.startswith("bollinger_")
-            required_bars = max(
-                required_bars,
-                offset + (self.bollinger_period if uses_bollinger else 1),
-            )
-        if self.bar_interval == "1d":
-            if required_bars > 400:
+            if group.bar_interval == "1d":
+                if required_bars > 400:
+                    raise ValueError(
+                        "일봉 조건에 필요한 이력은 한 번에 최대 400봉까지 지원합니다."
+                    )
+                continue
+            interval_minutes = int(group.bar_interval[:-1])
+            # The KIS minute-history adapter deliberately performs at most twelve
+            # 120-row calls per evaluation so one strategy cannot monopolize the
+            # shared API queue. Reject block settings that can never fit that bound.
+            if required_bars * interval_minutes > 1_440:
                 raise ValueError(
-                    "일봉 조건에 필요한 이력은 한 번에 최대 400봉까지 지원합니다."
+                    "선택한 봉 주기·지표 기간·N봉 전 값에 필요한 이력이 관리형 1회 조회 범위를 초과합니다."
                 )
-            return self
-        interval_minutes = int(self.bar_interval[:-1])
-        # The KIS minute-history adapter deliberately performs at most twelve
-        # 120-row calls per evaluation so one strategy cannot monopolize the
-        # shared API queue. Reject block settings that can never fit that bound.
-        if required_bars * interval_minutes > 1_440:
-            raise ValueError(
-                "선택한 봉 주기·지표 기간·N봉 전 값에 필요한 이력이 관리형 1회 조회 범위를 초과합니다."
-            )
         return self
 
 
@@ -335,7 +416,7 @@ class ManagedBlockStrategy(Strategy):
 '''
 
 
-_CONDITION_BOLLINGER_SOURCE = '''"""Trade Router가 관리하는 종목 데이터·조건 비교 블록 전략."""
+_CONDITION_BOLLINGER_SOURCE = '''"""Trade Router가 관리하는 종목 데이터·계산·조건 비교 블록 전략."""
 
 import json
 from datetime import datetime, time
@@ -372,6 +453,8 @@ BUY_CONDITION_LOGIC = __BUY_CONDITION_LOGIC__
 BUY_CONDITIONS_JSON = __BUY_CONDITIONS_JSON__
 SELL_CONDITION_LOGIC = __SELL_CONDITION_LOGIC__
 SELL_CONDITIONS_JSON = __SELL_CONDITIONS_JSON__
+BUY_CONDITION_GROUPS_JSON = __BUY_CONDITION_GROUPS_JSON__
+SELL_CONDITION_GROUPS_JSON = __SELL_CONDITION_GROUPS_JSON__
 BUY_ORDER_TYPE = __BUY_ORDER_TYPE__
 SELL_ORDER_TYPE = __SELL_ORDER_TYPE__
 BUY_SCAN_SECONDS = __BUY_SCAN_SECONDS__
@@ -390,6 +473,8 @@ ORDER_ROUTE = __ORDER_ROUTE__
 SYMBOLS = tuple(json.loads(SYMBOLS_JSON))
 BUY_CONDITIONS = tuple(json.loads(BUY_CONDITIONS_JSON))
 SELL_CONDITIONS = tuple(json.loads(SELL_CONDITIONS_JSON))
+BUY_CONDITION_GROUPS = tuple(json.loads(BUY_CONDITION_GROUPS_JSON))
+SELL_CONDITION_GROUPS = tuple(json.loads(SELL_CONDITION_GROUPS_JSON))
 DISCOVERY_CAPABILITY = {
     "HTS_CONDITION": "conditions",
     "RANKING": "rankings",
@@ -430,18 +515,20 @@ class ManagedBlockStrategy(Strategy):
         return unique
 
     @staticmethod
-    def _bollinger_values(bars, offset):
+    def _bollinger_values(bars, offset, group):
+        period = int(group["bollinger_period"])
+        stddev = Decimal(str(group["bollinger_stddev"]))
         end = len(bars) - offset
-        start = end - BOLLINGER_PERIOD
+        start = end - period
         if start < 0 or end <= 0:
             return None
         closes = [bar.close for bar in bars[start:end]]
-        mean = sum(closes, Decimal("0")) / Decimal(BOLLINGER_PERIOD)
-        variance = sum(((value - mean) ** 2 for value in closes), Decimal("0")) / Decimal(BOLLINGER_PERIOD)
-        deviation = BOLLINGER_STDDEV * variance.sqrt()
+        mean = sum(closes, Decimal("0")) / Decimal(period)
+        variance = sum(((value - mean) ** 2 for value in closes), Decimal("0")) / Decimal(period)
+        deviation = stddev * variance.sqrt()
         return mean + deviation, mean, mean - deviation
 
-    def _indicator_value(self, metric, bars, offset, average_price):
+    def _indicator_value(self, metric, bars, offset, average_price, group):
         index = len(bars) - 1 - offset
         if index < 0:
             return None
@@ -449,7 +536,7 @@ class ManagedBlockStrategy(Strategy):
         if metric in {"open", "high", "low", "close", "volume"}:
             return getattr(bar, metric)
         if metric in {"bollinger_upper", "bollinger_middle", "bollinger_lower"}:
-            values = self._bollinger_values(bars, offset)
+            values = self._bollinger_values(bars, offset, group)
             if values is None:
                 return None
             return values[{"bollinger_upper": 0, "bollinger_middle": 1, "bollinger_lower": 2}[metric]]
@@ -461,20 +548,20 @@ class ManagedBlockStrategy(Strategy):
             return (bar.close / average_price - Decimal("1")) * Decimal("100")
         return None
 
-    def _condition_values(self, condition, bars, average_price, extra_offset=0):
+    def _condition_values(self, condition, bars, average_price, group, extra_offset=0):
         left = self._indicator_value(
-            condition["left"], bars, int(condition.get("left_offset", 0)) + extra_offset, average_price
+            condition["left"], bars, int(condition.get("left_offset", 0)) + extra_offset, average_price, group
         )
         if condition["right"] == "value":
             right = Decimal(str(condition.get("value", "0")))
         else:
             right = self._indicator_value(
-                condition["right"], bars, int(condition.get("right_offset", 0)) + extra_offset, average_price
+                condition["right"], bars, int(condition.get("right_offset", 0)) + extra_offset, average_price, group
             )
         return left, right
 
-    def _condition_matches(self, condition, bars, average_price):
-        left, right = self._condition_values(condition, bars, average_price)
+    def _condition_matches(self, condition, bars, average_price, group):
+        left, right = self._condition_values(condition, bars, average_price, group)
         if left is None or right is None:
             return False
         operator = condition["operator"]
@@ -488,7 +575,7 @@ class ManagedBlockStrategy(Strategy):
             return left >= right
         if operator == "EQ":
             return left == right
-        previous_left, previous_right = self._condition_values(condition, bars, average_price, 1)
+        previous_left, previous_right = self._condition_values(condition, bars, average_price, group, 1)
         if previous_left is None or previous_right is None:
             return False
         if operator == "CROSS_UP":
@@ -497,22 +584,66 @@ class ManagedBlockStrategy(Strategy):
             return previous_left >= previous_right and left < right
         return False
 
-    def _conditions_match(self, conditions, logic, bars, average_price=None):
-        if not conditions:
-            return True
-        results = [self._condition_matches(item, bars, average_price) for item in conditions]
-        return all(results) if logic == "ALL" else any(results)
-
     @staticmethod
-    def _required_bar_count(conditions):
+    def _required_bar_count(group):
         required = 1
-        for item in conditions:
+        for item in group["conditions"]:
             offset = max(int(item.get("left_offset", 0)), int(item.get("right_offset", 0)))
             if item["operator"] in {"CROSS_UP", "CROSS_DOWN"}:
                 offset += 1
             uses_bollinger = item["left"].startswith("bollinger_") or item["right"].startswith("bollinger_")
-            required = max(required, offset + (BOLLINGER_PERIOD if uses_bollinger else 1))
+            required = max(required, offset + (int(group["bollinger_period"]) if uses_bollinger else 1))
         return required
+
+    def _condition_group_result(self, ctx, code, group, bars, *, average_price=None, side):
+        required = self._required_bar_count(group)
+        complete_only = group["bar_data_mode"] == "COMPLETE_ONLY"
+        if len(bars) < required:
+            mode_text = "완성 봉" if complete_only else "현재 포함 봉"
+            ctx.log.info(
+                f"{code} {side} 판단 보류: {group['bar_interval']} {mode_text} {len(bars)}/{required}개"
+            )
+            return False, []
+        matched = [
+            item for item in group["conditions"]
+            if self._condition_matches(item, bars, average_price, group)
+        ]
+        # A condition block is OR. Every condition block must pass (AND).
+        return bool(matched), matched
+
+    async def _condition_groups_result(self, ctx, code, groups, *, average_price=None, side):
+        requests = {}
+        for group in groups:
+            key = (group["bar_interval"], group["bar_data_mode"] == "COMPLETE_ONLY")
+            requests[key] = max(requests.get(key, 0), self._required_bar_count(group))
+        bars_by_request = {}
+        for (interval, complete_only), required in requests.items():
+            try:
+                bars_by_request[(interval, complete_only)] = await ctx.market.bars(
+                    code,
+                    interval,
+                    count=required,
+                    venue=Venue(MARKET_VENUE),
+                    complete_only=complete_only,
+                )
+            except RouterError as exc:
+                ctx.log.warning(f"{code} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
+                return False, []
+        matched_groups = []
+        for group in groups:
+            key = (group["bar_interval"], group["bar_data_mode"] == "COMPLETE_ONLY")
+            passed, matched = self._condition_group_result(
+                ctx,
+                code,
+                group,
+                bars_by_request[key],
+                average_price=average_price,
+                side=side,
+            )
+            if not passed:
+                return False, matched_groups
+            matched_groups.append(matched)
+        return True, matched_groups
 
     @staticmethod
     def _condition_summary(condition):
@@ -529,29 +660,43 @@ class ManagedBlockStrategy(Strategy):
         return quote.price
 
     async def on_start(self, ctx):
-        bar_mode_label = "완성봉만" if BAR_DATA_MODE == "COMPLETE_ONLY" else "진행 중 봉 포함"
-        ctx.log.info(f"봉 데이터 설정: {BAR_INTERVAL} · {bar_mode_label}")
+        buy_group_text = ", ".join(
+            f"{group['bar_interval']}·{'완성봉' if group['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
+            for group in BUY_CONDITION_GROUPS
+        ) or "추가 조건 없음"
+        sell_group_text = ", ".join(
+            f"{group['bar_interval']}·{'완성봉' if group['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
+            for group in SELL_CONDITION_GROUPS
+        )
+        ctx.log.info(f"매수 조건 블록: {buy_group_text} · 그룹 내부 OR / 그룹 간 AND")
+        ctx.log.info(f"매도 조건 블록: {sell_group_text} · 그룹 내부 OR / 그룹 간 AND")
         ctx.scheduler.every(
             seconds=BUY_SCAN_SECONDS,
             schedule_id="condition-scan",
             between=(BUY_START_TIME, BUY_END_TIME),
             aligned=True,
         )
-        if BAR_DATA_MODE == "INCLUDE_CURRENT":
+        if any(group["bar_data_mode"] == "INCLUDE_CURRENT" for group in SELL_CONDITION_GROUPS):
             ctx.scheduler.every(
                 seconds=BUY_SCAN_SECONDS,
-                schedule_id="bollinger-sell-live",
+                schedule_id="condition-sell-live",
                 between=(SELL_START_TIME, SELL_END_TIME),
                 aligned=True,
             )
-        elif BAR_INTERVAL == "1d":
-            ctx.scheduler.daily_at(SELL_START_TIME, schedule_id="bollinger-sell-daily")
         else:
-            ctx.scheduler.on_bar_close(
-                BAR_INTERVAL,
-                schedule_id="bollinger-sell",
-                between=(SELL_START_TIME, SELL_END_TIME),
-            )
+            intervals = list(dict.fromkeys(group["bar_interval"] for group in SELL_CONDITION_GROUPS))
+            for index, interval in enumerate(intervals, start=1):
+                if interval == "1d":
+                    ctx.scheduler.daily_at(
+                        SELL_START_TIME,
+                        schedule_id=f"condition-sell-daily-{index}",
+                    )
+                else:
+                    ctx.scheduler.on_bar_close(
+                        interval,
+                        schedule_id=f"condition-sell-bars-{index}",
+                        between=(SELL_START_TIME, SELL_END_TIME),
+                    )
         ctx.scheduler.daily_at(CLOSE_TIME, schedule_id="close-all")
         ctx.scheduler.every(
             seconds=30,
@@ -651,7 +796,7 @@ class ManagedBlockStrategy(Strategy):
                 ctx.state.set("strategy_positions", tracked)
 
     async def on_timer(self, ctx, event):
-        if event.schedule_id in {"bollinger-sell-daily", "bollinger-sell-live"}:
+        if event.schedule_id.startswith("condition-sell-"):
             await self.on_bar(ctx, event)
             return
         if event.schedule_id in {"close-all", "close-retry", "close-confirm"}:
@@ -689,21 +834,11 @@ class ManagedBlockStrategy(Strategy):
         for code in candidate_codes:
             if code in held_codes or code in pending_codes or code in tracked:
                 continue
-            if BUY_CONDITIONS:
-                required = self._required_bar_count(BUY_CONDITIONS)
-                try:
-                    bars = await ctx.market.bars(
-                        code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE),
-                        complete_only=BAR_DATA_MODE == "COMPLETE_ONLY",
-                    )
-                except RouterError as exc:
-                    ctx.log.warning(f"{code} 매수 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
-                    continue
-                if len(bars) < required:
-                    mode_text = "완성 봉" if BAR_DATA_MODE == "COMPLETE_ONLY" else "현재 포함 봉"
-                    ctx.log.info(f"{code} 매수 판단 보류: {mode_text} {len(bars)}/{required}개")
-                    continue
-                if not self._conditions_match(BUY_CONDITIONS, BUY_CONDITION_LOGIC, bars):
+            if BUY_CONDITION_GROUPS:
+                passed, _ = await self._condition_groups_result(
+                    ctx, code, BUY_CONDITION_GROUPS, side="매수"
+                )
+                if not passed:
                     continue
             limit_price = None
             try:
@@ -778,29 +913,19 @@ class ManagedBlockStrategy(Strategy):
                 continue
             if code in pending_codes:
                 continue
-            required = self._required_bar_count(SELL_CONDITIONS)
-            bars = await ctx.market.bars(
-                code, BAR_INTERVAL, count=required, venue=Venue(MARKET_VENUE),
-                complete_only=BAR_DATA_MODE == "COMPLETE_ONLY",
-            )
-            if len(bars) < required:
-                mode_text = "완성 봉" if BAR_DATA_MODE == "COMPLETE_ONLY" else "현재 포함 봉"
-                ctx.log.warning(f"{code} 매도 판단 보류: {mode_text} {len(bars)}/{required}개")
-                continue
             average_price = position.average_price
-            matched = [
-                item for item in SELL_CONDITIONS
-                if self._condition_matches(item, bars, average_price)
-            ]
-            should_sell = (
-                len(matched) == len(SELL_CONDITIONS)
-                if SELL_CONDITION_LOGIC == "ALL"
-                else bool(matched)
+            should_sell, matched_groups = await self._condition_groups_result(
+                ctx,
+                code,
+                SELL_CONDITION_GROUPS,
+                average_price=average_price,
+                side="매도",
             )
             if not should_sell:
                 continue
-            sell_reason = (" 그리고 " if SELL_CONDITION_LOGIC == "ALL" else " 또는 ").join(
-                self._condition_summary(item) for item in matched
+            sell_reason = " 그리고 ".join(
+                "(" + " 또는 ".join(self._condition_summary(item) for item in matched) + ")"
+                for matched in matched_groups
             )
             tracked_quantity = position.strategy_quantity if position.strategy_quantity is not None else Decimal(str(tracked[code]))
             quantity = min(tracked_quantity, position.available_quantity)
@@ -829,7 +954,7 @@ class ManagedBlockStrategy(Strategy):
                 ctx.state.set("strategy_positions", tracked)
 
     async def on_stop(self, ctx):
-        ctx.log.info("조건검색·볼린저 블록 전략을 종료합니다.")
+        ctx.log.info("관리형 조건 블록 전략을 종료합니다.")
 '''
 
 
@@ -867,6 +992,8 @@ def _render_condition_bollinger(
         "__BUY_CONDITIONS_JSON__": _json_literal(settings.buy_conditions),
         "__SELL_CONDITION_LOGIC__": _literal(settings.sell_condition_logic),
         "__SELL_CONDITIONS_JSON__": _json_literal(settings.sell_conditions),
+        "__BUY_CONDITION_GROUPS_JSON__": _json_literal(settings.buy_condition_groups),
+        "__SELL_CONDITION_GROUPS_JSON__": _json_literal(settings.sell_condition_groups),
         "__BUY_ORDER_TYPE__": _literal(settings.buy_order_type),
         "__SELL_ORDER_TYPE__": _literal(settings.sell_order_type),
         "__BUY_SCAN_SECONDS__": str(settings.buy_scan_seconds),
@@ -994,6 +1121,8 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         required["symbols"] = []
     buy_json = constants.get("BUY_CONDITIONS_JSON")
     sell_json = constants.get("SELL_CONDITIONS_JSON")
+    buy_groups_json = constants.get("BUY_CONDITION_GROUPS_JSON")
+    sell_groups_json = constants.get("SELL_CONDITION_GROUPS_JSON")
     try:
         required["buy_conditions"] = json.loads(buy_json) if isinstance(buy_json, str) else []
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -1002,6 +1131,18 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         required["sell_conditions"] = json.loads(sell_json) if isinstance(sell_json, str) else []
     except (TypeError, ValueError, json.JSONDecodeError):
         required["sell_conditions"] = []
+    try:
+        required["buy_condition_groups"] = (
+            json.loads(buy_groups_json) if isinstance(buy_groups_json, str) else None
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        required["buy_condition_groups"] = None
+    try:
+        required["sell_condition_groups"] = (
+            json.loads(sell_groups_json) if isinstance(sell_groups_json, str) else None
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        required["sell_condition_groups"] = None
     if not required["sell_conditions"]:
         legacy_conditions: list[dict[str, object]] = []
         if required["use_take_profit"]:
@@ -1013,6 +1154,10 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         if required["use_bollinger_exit"]:
             legacy_conditions.append({"left": "close", "operator": "LT", "right": "bollinger_upper", "value": 0})
         required["sell_conditions"] = legacy_conditions or [item.model_dump() for item in DEFAULT_SELL_CONDITIONS]
+    if required["buy_condition_groups"] is None:
+        required.pop("buy_condition_groups")
+    if required["sell_condition_groups"] is None:
+        required.pop("sell_condition_groups")
     if any(value is None for value in required.values()):
         raise ValueError("This condition/Bollinger block has unsupported fields.")
     settings = ConditionBollingerBlockSettings.model_validate(required)
