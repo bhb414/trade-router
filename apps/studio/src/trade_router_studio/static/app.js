@@ -1722,6 +1722,8 @@ const CONDITION_GRAPH_EDGES = [
   ["closeSchedule", "sellOrder", "장 마감"],
 ];
 
+const CONDITION_GRAPH_SIZE = { width: 1580, height: 1450 };
+
 function ensureBlockLayout() {
   if (!state.blockPackage) return null;
   state.blockPackage.layout ||= {};
@@ -1752,29 +1754,94 @@ function applyBlockViewport(world) {
   if (elements.blockZoomLabel) elements.blockZoomLabel.textContent = `${Math.round(viewport.zoom * 100)}%`;
 }
 
+function blockEdgeGeometry(from, to) {
+  const source = {
+    left: from.offsetLeft,
+    top: from.offsetTop,
+    width: from.offsetWidth,
+    height: from.offsetHeight,
+  };
+  const target = {
+    left: to.offsetLeft,
+    top: to.offsetTop,
+    width: to.offsetWidth,
+    height: to.offsetHeight,
+  };
+  source.right = source.left + source.width;
+  source.bottom = source.top + source.height;
+  source.cx = source.left + source.width / 2;
+  source.cy = source.top + source.height / 2;
+  target.right = target.left + target.width;
+  target.bottom = target.top + target.height;
+  target.cx = target.left + target.width / 2;
+  target.cy = target.top + target.height / 2;
+
+  const dx = target.cx - source.cx;
+  const dy = target.cy - source.cy;
+  const horizontalClearance = Math.abs(dx) - (source.width + target.width) / 2;
+  const verticalClearance = Math.abs(dy) - (source.height + target.height) / 2;
+  const horizontal = horizontalClearance >= verticalClearance;
+
+  if (horizontal) {
+    const direction = dx >= 0 ? 1 : -1;
+    const x1 = direction > 0 ? source.right : source.left;
+    const y1 = source.cy;
+    const x2 = direction > 0 ? target.left : target.right;
+    const y2 = target.cy;
+    const bend = Math.max(48, Math.min(220, Math.abs(x2 - x1) * .45 + Math.abs(y2 - y1) * .08));
+    return {
+      x1, y1, x2, y2,
+      c1x: x1 + direction * bend,
+      c1y: y1,
+      c2x: x2 - direction * bend,
+      c2y: y2,
+      labelX: (x1 + x2) / 2,
+      labelY: (y1 + y2) / 2 - 9,
+    };
+  }
+
+  const direction = dy >= 0 ? 1 : -1;
+  const x1 = source.cx;
+  const y1 = direction > 0 ? source.bottom : source.top;
+  const x2 = target.cx;
+  const y2 = direction > 0 ? target.top : target.bottom;
+  const bend = Math.max(48, Math.min(220, Math.abs(y2 - y1) * .45 + Math.abs(x2 - x1) * .08));
+  return {
+    x1, y1, x2, y2,
+    c1x: x1,
+    c1y: y1 + direction * bend,
+    c2x: x2,
+    c2y: y2 - direction * bend,
+    labelX: (x1 + x2) / 2 + 12,
+    labelY: (y1 + y2) / 2 + 3,
+  };
+}
+
 function drawBlockGraphEdges(world, edgeLayer) {
   [...edgeLayer.children].forEach(child => {
     if (child.tagName.toLowerCase() !== "defs") child.remove();
   });
-  edgeLayer.setAttribute("viewBox", "0 0 1580 1450");
+  edgeLayer.setAttribute("viewBox", `0 0 ${CONDITION_GRAPH_SIZE.width} ${CONDITION_GRAPH_SIZE.height}`);
   for (const [fromId, toId, label] of CONDITION_GRAPH_EDGES) {
     const from = world.querySelector(`[data-block-node="${fromId}"]`);
     const to = world.querySelector(`[data-block-node="${toId}"]`);
     if (!from || !to) continue;
-    const x1 = from.offsetLeft + from.offsetWidth;
-    const y1 = from.offsetTop + Math.min(45, from.offsetHeight / 2);
-    const x2 = to.offsetLeft;
-    const y2 = to.offsetTop + Math.min(45, to.offsetHeight / 2);
-    const bend = Math.max(70, Math.abs(x2 - x1) * .42);
+    const edge = blockEdgeGeometry(from, to);
+    const port = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    port.setAttribute("cx", String(edge.x1));
+    port.setAttribute("cy", String(edge.y1));
+    port.setAttribute("r", "4");
+    port.setAttribute("class", "block-edge-port");
+    edgeLayer.append(port);
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+    path.setAttribute("d", `M ${edge.x1} ${edge.y1} C ${edge.c1x} ${edge.c1y}, ${edge.c2x} ${edge.c2y}, ${edge.x2} ${edge.y2}`);
     path.setAttribute("class", "block-edge-path");
     path.setAttribute("marker-end", "url(#block-edge-arrow)");
     edgeLayer.append(path);
     if (label) {
       const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      text.setAttribute("x", String((x1 + x2) / 2));
-      text.setAttribute("y", String((y1 + y2) / 2 - 7));
+      text.setAttribute("x", String(edge.labelX));
+      text.setAttribute("y", String(edge.labelY));
       text.setAttribute("class", "block-edge-label");
       text.textContent = label;
       edgeLayer.append(text);
@@ -1965,6 +2032,8 @@ function renderConditionBollingerBlocks(parsed, running) {
   };
   const world = document.createElement("div");
   world.className = "block-canvas-world";
+  world.style.width = `${CONDITION_GRAPH_SIZE.width}px`;
+  world.style.height = `${CONDITION_GRAPH_SIZE.height}px`;
   const edgeLayer = createBlockEdgeLayer();
   world.append(edgeLayer);
   createGraphSectionLabel(world, "연결 · 종목 데이터", 70, 38);

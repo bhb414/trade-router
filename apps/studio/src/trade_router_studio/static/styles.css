@@ -479,7 +479,7 @@ button:disabled { cursor: default; opacity: .45; }
 .block-canvas.graph-mode.panning { cursor: grabbing; }
 .block-canvas-world {
   width: 1580px;
-  height: 1290px;
+  height: 1450px;
   position: absolute;
   top: 0;
   left: 0;
@@ -488,7 +488,7 @@ button:disabled { cursor: default; opacity: .45; }
 }
 .block-edge-layer {
   width: 1580px;
-  height: 1290px;
+  height: 1450px;
   position: absolute;
   inset: 0;
   z-index: 0;
@@ -498,6 +498,12 @@ button:disabled { cursor: default; opacity: .45; }
 .block-edge-path {
   fill: none;
   stroke: #8794a6;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.block-edge-port {
+  fill: #8794a6;
+  stroke: #f8f9fa;
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
@@ -611,6 +617,8 @@ button:disabled { cursor: default; opacity: .45; }
   background: #738094;
   content: "";
 }
+.strategy-block-node.graph-node::before,
+.strategy-block-node.graph-node::after { display: none; }
 .strategy-block-title {
   min-height: 34px;
   display: flex;
