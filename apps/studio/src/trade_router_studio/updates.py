@@ -9,12 +9,15 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 
 RELEASE_API = "https://api.github.com/repos/bhb414/trade-router/releases/latest"
+LATEST_RELEASE_URL = "https://github.com/bhb414/trade-router/releases/latest"
+RELEASE_DOWNLOAD_ROOT = "https://github.com/bhb414/trade-router/releases/download"
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 16 * 1024
 
@@ -58,19 +61,75 @@ def _github_request(url: str) -> Request:
     )
 
 
+def _web_request(url: str) -> Request:
+    return Request(
+        url,
+        headers={
+            "Accept": "text/html,application/octet-stream;q=0.9,*/*;q=0.8",
+            "User-Agent": "Trade-Router-Updater",
+        },
+    )
+
+
 def _latest_release() -> dict[str, object] | None:
     try:
         with urlopen(_github_request(RELEASE_API), timeout=10) as response:
             payload = json.load(response)
     except HTTPError as exc:
         if exc.code == 404:
+            return _latest_release_from_public_page()
+        if exc.code in {403, 429}:
+            return _latest_release_from_public_page()
+        raise RuntimeError(f"GitHub가 업데이트 확인을 거부했습니다. (HTTP {exc.code})") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        try:
+            return _latest_release_from_public_page()
+        except RuntimeError:
+            raise RuntimeError("GitHub에 연결하지 못했습니다.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub 배포 정보를 해석하지 못했습니다.")
+    return payload
+
+
+def _latest_release_from_public_page() -> dict[str, object] | None:
+    """Resolve the latest tag without consuming GitHub API quota."""
+
+    try:
+        with urlopen(_web_request(LATEST_RELEASE_URL), timeout=10) as response:
+            final_url = response.geturl()
+    except HTTPError as exc:
+        if exc.code == 404:
             return None
         raise RuntimeError(f"GitHub가 업데이트 확인을 거부했습니다. (HTTP {exc.code})") from exc
     except (URLError, TimeoutError, OSError) as exc:
         raise RuntimeError("GitHub에 연결하지 못했습니다.") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("GitHub 배포 정보를 해석하지 못했습니다.")
-    return payload
+
+    parsed = urlparse(final_url)
+    match = re.fullmatch(
+        r"/bhb414/trade-router/releases/tag/v?(\d+\.\d+\.\d+)",
+        parsed.path.rstrip("/"),
+    )
+    if parsed.scheme != "https" or parsed.netloc.casefold() != "github.com" or not match:
+        raise RuntimeError("GitHub 최신 배포 주소를 해석하지 못했습니다.")
+    version = match.group(1)
+    tag = f"v{version}"
+    archive_name = f"trade-router-v{version}-windows.zip"
+    checksum_name = f"{archive_name}.sha256"
+    download_root = f"{RELEASE_DOWNLOAD_ROOT}/{quote(tag, safe='')}"
+    return {
+        "tag_name": tag,
+        "html_url": final_url,
+        "assets": [
+            {
+                "name": archive_name,
+                "browser_download_url": f"{download_root}/{quote(archive_name, safe='')}",
+            },
+            {
+                "name": checksum_name,
+                "browser_download_url": f"{download_root}/{quote(checksum_name, safe='')}",
+            },
+        ],
+    }
 
 
 def _release_details(

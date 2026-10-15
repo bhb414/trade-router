@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from urllib.error import HTTPError
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import trade_router_studio.updates as updates
@@ -103,6 +104,36 @@ def test_release_without_both_verified_assets_cannot_apply() -> None:
     )
     assert details["available"] is True
     assert details["can_apply"] is False
+
+
+def test_latest_release_falls_back_when_github_api_rate_limit_is_exhausted(
+    monkeypatch,
+) -> None:
+    class PublicReleaseResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def geturl() -> str:
+            return "https://github.com/bhb414/trade-router/releases/tag/v0.2.0"
+
+    def fake_urlopen(request, **_kwargs):
+        if request.full_url == updates.RELEASE_API:
+            raise HTTPError(request.full_url, 403, "rate limited", None, None)
+        assert request.full_url == updates.LATEST_RELEASE_URL
+        return PublicReleaseResponse()
+
+    monkeypatch.setattr(updates, "urlopen", fake_urlopen)
+
+    details = updates._check("0.1.0")
+
+    assert details["latest"] == "0.2.0"
+    assert details["available"] is True
+    assert details["can_apply"] is True
+    assert details["asset_name"] == "trade-router-v0.2.0-windows.zip"
 
 
 def test_launcher_applies_pending_update_without_touching_user_data(tmp_path: Path) -> None:
