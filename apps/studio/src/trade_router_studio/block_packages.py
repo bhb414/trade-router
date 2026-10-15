@@ -128,13 +128,15 @@ class ConditionBollingerBlockSettings(BaseModel):
     @classmethod
     def validate_bar_interval(cls, value: str) -> str:
         candidate = value.strip().lower()
+        if candidate in {"1d", "d", "day"}:
+            return "1d"
         if candidate == "1h":
             candidate = "60m"
         if not candidate.endswith("m") or not candidate[:-1].isdigit():
-            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉까지 지원합니다.")
+            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
         minutes = int(candidate[:-1])
         if not 1 <= minutes <= 120:
-            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉까지 지원합니다.")
+            raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
         return f"{minutes}m"
 
     @model_validator(mode="after")
@@ -174,6 +176,12 @@ class ConditionBollingerBlockSettings(BaseModel):
                 required_bars,
                 offset + (self.bollinger_period if uses_bollinger else 1),
             )
+        if self.bar_interval == "1d":
+            if required_bars > 400:
+                raise ValueError(
+                    "일봉 조건에 필요한 이력은 한 번에 최대 400봉까지 지원합니다."
+                )
+            return self
         interval_minutes = int(self.bar_interval[:-1])
         # The KIS minute-history adapter deliberately performs at most twelve
         # 120-row calls per evaluation so one strategy cannot monopolize the
@@ -524,11 +532,14 @@ class ManagedBlockStrategy(Strategy):
             between=(BUY_START_TIME, BUY_END_TIME),
             aligned=True,
         )
-        ctx.scheduler.on_bar_close(
-            BAR_INTERVAL,
-            schedule_id="bollinger-sell",
-            between=(SELL_START_TIME, SELL_END_TIME),
-        )
+        if BAR_INTERVAL == "1d":
+            ctx.scheduler.daily_at(SELL_START_TIME, schedule_id="bollinger-sell-daily")
+        else:
+            ctx.scheduler.on_bar_close(
+                BAR_INTERVAL,
+                schedule_id="bollinger-sell",
+                between=(SELL_START_TIME, SELL_END_TIME),
+            )
         ctx.scheduler.daily_at(CLOSE_TIME, schedule_id="close-all")
         ctx.scheduler.every(
             seconds=30,
@@ -628,6 +639,9 @@ class ManagedBlockStrategy(Strategy):
                 ctx.state.set("strategy_positions", tracked)
 
     async def on_timer(self, ctx, event):
+        if event.schedule_id == "bollinger-sell-daily":
+            await self.on_bar(ctx, event)
+            return
         if event.schedule_id in {"close-all", "close-retry", "close-confirm"}:
             labels = {
                 "close-all": "장 마감 정시 전량 청산",

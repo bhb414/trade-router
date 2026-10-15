@@ -199,6 +199,33 @@ def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metr
         raise AssertionError("Position-only metrics must be rejected in buy conditions.")
 
 
+def test_managed_block_supports_daily_bars_at_the_sell_start_time() -> None:
+    for venue in ("KRX", "NXT", "INTEGRATED"):
+        settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+            update={"bar_interval": "1d", "market_venue": venue}
+        )
+        normalized = ConditionBollingerBlockSettings.model_validate(
+            settings.model_dump(mode="json")
+        )
+        source = render_block_strategy(normalized)
+        assert normalized.bar_interval == "1d"
+        assert "ctx.scheduler.daily_at(SELL_START_TIME" in source
+        assert 'schedule_id="bollinger-sell-daily"' in source
+        assert "await self.on_bar(ctx, event)" in source
+
+
+def test_managed_block_limits_daily_history_to_one_period_request() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["bar_interval"] = "1d"
+    payload["bollinger_period"] = 401
+    try:
+        ConditionBollingerBlockSettings.model_validate(payload)
+    except ValueError as exc:
+        assert "최대 400봉" in str(exc)
+    else:
+        raise AssertionError("Daily conditions beyond the period API bound must be rejected.")
+
+
 def test_managed_block_rejects_history_windows_larger_than_the_adapter_bound() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
     payload["bar_interval"] = "30m"

@@ -1277,8 +1277,8 @@ function blockFieldOptions(field) {
     ];
   }
   if (field.settingKey === "bar_interval") {
-    return ["1m", "3m", "5m", "10m", "15m", "30m", "60m", "120m"]
-      .map(value => ({ value, label: value }));
+    return ["1m", "3m", "5m", "10m", "15m", "30m", "60m", "120m", "1d"]
+      .map(value => ({ value, label: value === "1d" ? "일봉 (완성봉)" : value }));
   }
   return null;
 }

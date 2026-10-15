@@ -3151,6 +3151,11 @@ def _parse_period_row(
         low = _decimal(row.get("stck_lwpr"))
         close = _decimal(row.get("stck_clpr"))
         volume = _decimal(row.get("acml_vol"), default=Decimal("0"))
+        local_received = received_at.astimezone(SEOUL)
+        current_day_complete = False
+        if interval == "1d" and open_time.date() == local_received.date():
+            market_close = time(15, 30) if venue is Venue.KRX else time(20, 0)
+            current_day_complete = local_received.time().replace(tzinfo=None) >= market_close
         return Bar(
             instrument=instrument,
             interval=interval,
@@ -3164,7 +3169,9 @@ def _parse_period_row(
             venue=venue,
             provider=provider,
             correlation_id=correlation_id,
-            complete=open_time.date() < received_at.date(),
+            complete=(
+                open_time.date() < local_received.date() or current_day_complete
+            ),
             source_alias=source_alias,
             received_at=received_at,
         )

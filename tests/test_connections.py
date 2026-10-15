@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -21,7 +22,7 @@ from trade_router import (
     RouterErrorCode,
     Venue,
 )
-from trade_router_studio.connections import ConnectionRuntime
+from trade_router_studio.connections import ConnectionRuntime, _parse_period_row
 from trade_router_studio.paths import WorkspacePaths
 from trade_router_studio.settings import SettingsStore
 
@@ -36,6 +37,37 @@ def workspace(root: Path) -> WorkspacePaths:
     )
     paths.ensure()
     return paths
+
+
+def test_daily_bar_completes_only_after_the_selected_market_closes() -> None:
+    row = {
+        "stck_bsop_date": "20261016",
+        "stck_oprc": "100",
+        "stck_hgpr": "110",
+        "stck_lwpr": "90",
+        "stck_clpr": "105",
+        "acml_vol": "500",
+    }
+    seoul = ZoneInfo("Asia/Seoul")
+
+    def parsed(venue: Venue, hour: int, minute: int):
+        return _parse_period_row(
+            row,
+            instrument=InstrumentId("005930"),
+            interval="1d",
+            days=1,
+            venue=venue,
+            provider="kis",
+            correlation_id="daily-complete-test",
+            source_alias="primary",
+            received_at=datetime(2026, 10, 16, hour, minute, tzinfo=seoul),
+        )
+
+    assert parsed(Venue.KRX, 15, 29).complete is False
+    assert parsed(Venue.KRX, 15, 30).complete is True
+    assert parsed(Venue.NXT, 19, 59).complete is False
+    assert parsed(Venue.NXT, 20, 0).complete is True
+    assert parsed(Venue.INTEGRATED, 20, 0).complete is True
 
 
 def test_rate_limit_scope_is_shared_by_the_same_api_key(tmp_path: Path) -> None:
