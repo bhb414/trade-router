@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime
 from decimal import Decimal
 import os
@@ -595,6 +595,8 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         nonlocal runtime_store, order_service, order_reconciler
+        restore_names = manager.consume_restart_checkpoint()
+        restore_task: asyncio.Task[None] | None = None
         workspace.ensure()
         runtime_store = RuntimeStore(workspace.data / "runtime.sqlite3")
         order_service = OrderService(
@@ -609,8 +611,45 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         await connection_runtime.restore_cached_statuses()
         await scheduler.start()
         await order_reconciler.start()
+        if restore_names:
+            async def restore_running_strategies() -> None:
+                # The worker registers its manifest through this HTTP server,
+                # so wait until FastAPI has completed application startup.
+                await asyncio.sleep(0.5)
+                restored: list[str] = []
+                failed: dict[str, str] = {}
+                for name in restore_names:
+                    try:
+                        await manager.start(name)
+                        restored.append(name)
+                    except Exception as exc:
+                        failed[name] = f"{type(exc).__name__}: {exc}"
+                if restored:
+                    journal().record(
+                        source="system",
+                        event_type="strategy.restart_restore",
+                        message=f"재시작 전 실행 중이던 전략 {len(restored)}개를 복구했습니다.",
+                        details={"strategies": restored},
+                    )
+                if failed:
+                    journal().record(
+                        source="system",
+                        event_type="strategy.restart_restore_error",
+                        message="재시작 전 전략 일부를 복구하지 못했습니다.",
+                        details={"failures": failed},
+                    )
+
+            restore_task = asyncio.create_task(
+                restore_running_strategies(),
+                name="trade-router-strategy-restart-restore",
+            )
         yield
         order_service.close_submission_gate()
+        if restore_task is not None:
+            if not restore_task.done():
+                restore_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await restore_task
         await manager.shutdown()
         await order_reconciler.close()
         await realtime.close()
@@ -3301,6 +3340,10 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 status_code=503,
                 detail="현재 실행 방식에서는 프로그램 제어를 사용할 수 없습니다.",
             )
+        if action in {"restart", "update"}:
+            manager.checkpoint_running_for_restart()
+        else:
+            manager.clear_restart_checkpoint()
         control(action)
         return {"action": action, "message": f"프로그램 {action} 요청을 받았습니다."}
 

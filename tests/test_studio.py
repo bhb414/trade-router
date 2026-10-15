@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -1372,6 +1373,56 @@ def test_user_stop_is_not_reported_as_strategy_failure(tmp_path: Path) -> None:
         )
 
     asyncio.run(run())
+
+
+def test_requested_restart_restores_only_running_strategies(tmp_path: Path) -> None:
+    async def run() -> None:
+        paths = workspace(tmp_path / "workspace")
+        paths.ensure()
+        manager = StrategyManager(paths)
+        source = "import time\nprint('ready', flush=True)\ntime.sleep(30)\n"
+        await manager.save("running.py", source)
+        await manager.save("stopped.py", source)
+        await manager.start("running.py")
+
+        assert manager.checkpoint_running_for_restart() == ["running.py"]
+        await manager.shutdown()
+
+        restarted = StrategyManager(paths)
+        names = restarted.consume_restart_checkpoint()
+        assert names == ["running.py"]
+        assert restarted.consume_restart_checkpoint() == []
+        for name in names:
+            await restarted.start(name)
+        assert restarted.details("running.py")["running"] is True
+        assert restarted.details("stopped.py")["running"] is False
+        await restarted.shutdown()
+
+    asyncio.run(run())
+
+
+def test_app_restart_restores_the_previous_running_process(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    app = create_app(paths)
+    app.state.process_control = lambda _action: None
+    with TestClient(app) as client:
+        created = client.put(
+            "/api/strategies/restart-me.py",
+            json={"source": "import time\ntime.sleep(30)\n"},
+        )
+        assert created.status_code == 200
+        assert client.post("/api/strategies/restart-me.py/start").status_code == 200
+        assert client.post("/api/system/restart").status_code == 200
+
+    restarted = create_app(paths)
+    with TestClient(restarted) as client:
+        for _ in range(30):
+            details = client.get("/api/strategies/restart-me.py").json()
+            if details["running"]:
+                break
+            time.sleep(0.05)
+        assert details["running"] is True
+        assert not (paths.data / "restart-strategies.json").exists()
 
 
 def test_strategy_runtime_api_requires_session_and_schedules_events(tmp_path: Path) -> None:

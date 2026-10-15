@@ -20,6 +20,7 @@ from .sessions import StrategySessionRegistry
 MAX_SOURCE_BYTES = 512 * 1024
 MAX_LOG_LINES = 1_000
 STRATEGY_TYPES = {"script", "block"}
+RESTART_CHECKPOINT_FILE = "restart-strategies.json"
 _SAFE_NAME = re.compile(r"^[^\\/:*?\"<>|\x00-\x1f]+\.py$", re.IGNORECASE)
 
 
@@ -250,6 +251,57 @@ class StrategyManager:
         running = [name for name, state in self._states.items() if state.running]
         for name in running:
             await self.stop(name)
+
+    def checkpoint_running_for_restart(self) -> list[str]:
+        """Remember only strategies active at a requested restart or update."""
+
+        self.paths.data.mkdir(parents=True, exist_ok=True)
+        names = sorted(
+            name for name, state in self._states.items() if state.running
+        )
+        path = self.paths.data / RESTART_CHECKPOINT_FILE
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(
+                {"format": 1, "strategies": names},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        return names
+
+    def clear_restart_checkpoint(self) -> None:
+        (self.paths.data / RESTART_CHECKPOINT_FILE).unlink(missing_ok=True)
+
+    def consume_restart_checkpoint(self) -> list[str]:
+        """Consume the one-shot restart list before starting any child process."""
+
+        path = self.paths.data / RESTART_CHECKPOINT_FILE
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            path.unlink(missing_ok=True)
+            return []
+        path.unlink(missing_ok=True)
+        if not isinstance(payload, dict) or payload.get("format") != 1:
+            return []
+        raw_names = payload.get("strategies")
+        if not isinstance(raw_names, list):
+            return []
+        names: list[str] = []
+        for value in raw_names:
+            if not isinstance(value, str) or value in names:
+                continue
+            try:
+                strategy_path = self.resolve(value)
+            except StrategyNameError:
+                continue
+            if strategy_path.is_file():
+                names.append(value)
+        return names
 
     def details(self, name: str) -> dict[str, Any]:
         self.resolve(name)
