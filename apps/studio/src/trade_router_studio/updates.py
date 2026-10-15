@@ -155,7 +155,11 @@ def _prepare(
         raise RuntimeError(str(details["message"]))
 
     version = str(details["latest"])
-    updates_root = workspace_root / "updates"
+    # Stage updates beside the portable installation. Microsoft Store Python
+    # redirects its LocalAppData writes into a package LocalCache, while the
+    # PowerShell launcher runs outside that package. Using the install folder
+    # gives both processes one physical location.
+    updates_root = install_root / ".trade-router-updates"
     updates_root.mkdir(parents=True, exist_ok=True)
     transaction = updates_root / f"v{version}-{uuid4().hex[:8]}"
     transaction.mkdir(parents=True)

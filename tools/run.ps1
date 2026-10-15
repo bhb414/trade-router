@@ -12,7 +12,7 @@ $UserDataRoot = if ($env:LOCALAPPDATA) {
 } else {
     Join-Path $env:USERPROFILE ".trade-router"
 }
-$PendingUpdatePath = Join-Path $UserDataRoot "updates\pending-update.json"
+$InstallUpdatesRoot = Join-Path $ProjectRoot ".trade-router-updates"
 $env:TRADE_ROUTER_INSTALL_DIR = $ProjectRoot
 Set-Location -LiteralPath $ProjectRoot
 
@@ -29,20 +29,48 @@ function Assert-ChildPath {
     return $childFull
 }
 
+function Find-PendingUpdatePath {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $candidates.Add((Join-Path $InstallUpdatesRoot "pending-update.json"))
+    $candidates.Add((Join-Path $UserDataRoot "updates\pending-update.json"))
+
+    # Microsoft Store Python can redirect LocalAppData into this package
+    # LocalCache. v0.1.5 and earlier staged updates there while this launcher
+    # looked only at the ordinary LocalAppData path.
+    if ($env:LOCALAPPDATA) {
+        $storePattern = Join-Path $env:LOCALAPPDATA (
+            "Packages\PythonSoftwareFoundation.Python.*" +
+            "\LocalCache\Local\TradeRouter\updates\pending-update.json"
+        )
+        foreach ($item in Get-Item -Path $storePattern -ErrorAction SilentlyContinue |
+            Sort-Object -Property LastWriteTime -Descending) {
+            $candidates.Add($item.FullName)
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    return $null
+}
+
 function Apply-PendingUpdate {
-    if (-not (Test-Path -LiteralPath $PendingUpdatePath)) {
+    $pendingUpdatePath = Find-PendingUpdatePath
+    if ([string]::IsNullOrWhiteSpace($pendingUpdatePath)) {
         return
     }
 
     Write-Host "Applying the downloaded Trade Router update..."
-    $pending = Get-Content -Raw -LiteralPath $PendingUpdatePath -Encoding utf8 | ConvertFrom-Json
+    $pending = Get-Content -Raw -LiteralPath $pendingUpdatePath -Encoding utf8 | ConvertFrom-Json
     $expectedRoot = [System.IO.Path]::GetFullPath([string]$pending.install_root)
     if (-not $expectedRoot.Equals($ProjectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "The update was prepared for a different installation folder."
     }
 
     $payloadRoot = [System.IO.Path]::GetFullPath([string]$pending.payload_root)
-    $updatesRoot = [System.IO.Path]::GetFullPath((Join-Path $UserDataRoot "updates"))
+    $updatesRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $pendingUpdatePath))
     [void](Assert-ChildPath -Parent $updatesRoot -Child $payloadRoot)
     $manifestPath = Join-Path $payloadRoot "release-manifest.json"
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
@@ -100,7 +128,7 @@ function Apply-PendingUpdate {
         }
         throw
     }
-    Remove-Item -LiteralPath $PendingUpdatePath -Force
+    Remove-Item -LiteralPath $pendingUpdatePath -Force
     Write-Host "Trade Router v$($pending.version) update applied."
 }
 

@@ -288,6 +288,8 @@ trade-router-v0.1.0-windows.zip.sha256
 **업데이트 시작**으로 바뀌며, 누르면 Release ZIP과 SHA-256 파일을 함께 내려받아
 압축 전체와 내부 파일 목록을 검증합니다. 검증이 끝난 뒤 전략과 연결을 정리하고
 명령 창의 실행기가 프로그램 파일만 교체한 다음 같은 창에서 다시 시작합니다.
+업데이트 파일은 설치 폴더의 `.trade-router-updates`에 준비하므로 Microsoft Store판
+Python의 LocalCache 경로를 사용해도 실행기와 같은 파일을 확인합니다.
 
 로컬에서 배포 ZIP만 만들려면 다음을 실행합니다.
 

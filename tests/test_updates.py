@@ -78,7 +78,9 @@ def test_update_download_is_verified_and_staged(tmp_path: Path, monkeypatch) -> 
 
     assert result["prepared"] is True
     pending = json.loads(
-        (workspace / "updates" / "pending-update.json").read_text(encoding="utf-8")
+        (install / ".trade-router-updates" / "pending-update.json").read_text(
+            encoding="utf-8"
+        )
     )
     payload = Path(pending["payload_root"])
     assert payload.joinpath("run.cmd").read_bytes() == _release_files("0.2.0")["run.cmd"]
@@ -113,7 +115,7 @@ def test_launcher_applies_pending_update_without_touching_user_data(tmp_path: Pa
     (install / "pyproject.toml").write_text("old", encoding="utf-8")
 
     local_app_data = tmp_path / "local-app-data"
-    updates_root = local_app_data / "TradeRouter" / "updates"
+    updates_root = install / ".trade-router-updates"
     payload = updates_root / "v0.2.0-test" / "payload"
     payload_tools = payload / "tools"
     payload_tools.mkdir(parents=True)
@@ -170,6 +172,88 @@ def test_launcher_applies_pending_update_without_touching_user_data(tmp_path: Pa
     assert (install / "run.cmd").read_bytes() == new_run
     assert (install / "pyproject.toml").read_bytes() == new_project
     assert user_marker.read_text(encoding="utf-8") == "preserve"
+    assert not pending_path.exists()
+
+
+def test_launcher_finds_a_store_python_legacy_pending_update(tmp_path: Path) -> None:
+    source_launcher = Path(__file__).parents[1] / "tools" / "run.ps1"
+    install = tmp_path / "install"
+    tools = install / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(source_launcher, tools / "run.ps1")
+    (install / "run.cmd").write_text("old", encoding="utf-8")
+    (install / "pyproject.toml").write_text("old", encoding="utf-8")
+
+    local_app_data = tmp_path / "local-app-data"
+    updates_root = (
+        local_app_data
+        / "Packages"
+        / "PythonSoftwareFoundation.Python.3.12_test"
+        / "LocalCache"
+        / "Local"
+        / "TradeRouter"
+        / "updates"
+    )
+    payload = updates_root / "v0.2.0-test" / "payload"
+    payload_tools = payload / "tools"
+    payload_tools.mkdir(parents=True)
+    shutil.copy2(source_launcher, payload_tools / "run.ps1")
+    new_run = b"@echo off\necho store-update-applied\n"
+    new_project = b'[project]\nversion = "0.2.0"\n'
+    (payload / "run.cmd").write_bytes(new_run)
+    (payload / "pyproject.toml").write_bytes(new_project)
+    rows = [
+        {
+            "path": path.relative_to(payload).as_posix(),
+            "sha256": updates._sha256(path),
+        }
+        for path in (
+            payload / "run.cmd",
+            payload / "pyproject.toml",
+            payload_tools / "run.ps1",
+        )
+    ]
+    (payload / "release-manifest.json").write_text(
+        json.dumps({"format": 1, "version": "0.2.0", "files": rows}),
+        encoding="utf-8",
+    )
+    updates_root.mkdir(parents=True, exist_ok=True)
+    pending_path = updates_root / "pending-update.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "version": "0.2.0",
+                "install_root": str(install),
+                "payload_root": str(payload),
+                "archive_sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    environment = os.environ.copy()
+    environment["LOCALAPPDATA"] = str(local_app_data)
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(tools / "run.ps1"),
+            "-ApplyUpdateOnly",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (install / "run.cmd").read_bytes() == new_run
+    assert (install / "pyproject.toml").read_bytes() == new_project
     assert not pending_path.exists()
 
 
