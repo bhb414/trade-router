@@ -637,7 +637,6 @@ button:disabled { cursor: default; opacity: .45; }
 .strategy-block-title span { color: #697586; font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .strategy-block-node.connection .strategy-block-title { background: #dbe6ef; }
 .strategy-block-node.target .strategy-block-title { background: #e0e6ed; }
-.strategy-block-node.calculation .strategy-block-title { background: #dce8e8; }
 .strategy-block-node.risk .strategy-block-title { background: #e5e1dc; }
 .strategy-block-node.schedule .strategy-block-title { background: #dfe8e3; }
 .strategy-block-node.event .strategy-block-title { background: #e3e2ea; }
@@ -679,7 +678,8 @@ button:disabled { cursor: default; opacity: .45; }
 .block-condition-row { overflow: hidden; border: 1px solid #c8ced8; border-radius: 6px; background: white; }
 .block-condition-expression { display: grid; grid-template-columns: minmax(0, 1fr) 84px minmax(0, 1fr); gap: 5px; padding: 7px; }
 .block-condition-control,
-.block-condition-detail input {
+.block-condition-operand input,
+.block-condition-operand select {
   min-width: 0;
   height: 28px;
   padding: 0 6px;
@@ -689,15 +689,20 @@ button:disabled { cursor: default; opacity: .45; }
   color: #344054;
   font-size: 10px;
 }
-.block-condition-detail { display: flex; align-items: center; gap: 5px; padding: 0 7px 7px; color: #697586; font-size: 9px; }
-.block-condition-detail input { width: 52px; }
+.block-condition-operands { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 0 7px 7px; }
+.block-condition-operand { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 7px; border: 1px solid #e0e4ea; border-radius: 5px; background: #f8fafb; }
+.block-condition-operand > strong { grid-column: 1 / -1; color: #566377; font-size: 9px; }
+.block-condition-operand label { display: grid; gap: 3px; min-width: 0; color: #697586; font-size: 8px; }
+.block-condition-operand input,
+.block-condition-operand select { width: 100%; }
+.block-condition-operand-hint { grid-column: 1 / -1; color: #7a8594; font-size: 8px; line-height: 1.45; }
+.block-condition-row-footer { display: flex; justify-content: flex-end; padding: 0 7px 7px; }
 .block-condition-remove { margin-left: auto; border: 0; background: transparent; color: #9a5060; font-size: 9px; cursor: pointer; }
 .block-condition-remove:disabled { opacity: .38; cursor: default; }
 .block-condition-add { justify-self: start; }
 .block-condition-group-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .block-condition-group-actions .danger-text { margin-left: auto; color: #9a5060; }
 .block-condition-empty { margin: 0; padding: 5px 2px; color: #697586; font-size: 10px; line-height: 1.45; }
-.block-calculation-hint { margin: 0; padding: 9px 10px; border-top: 1px solid #e2e5e9; color: #647184; font-size: 9px; line-height: 1.5; }
 .block-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 10px; }
 .block-flow.vertical { flex-direction: column; align-items: stretch; flex-wrap: nowrap; }
 .block-flow.vertical .block-flow-arrow { align-self: center; line-height: 1; }

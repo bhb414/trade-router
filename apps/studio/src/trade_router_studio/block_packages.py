@@ -43,6 +43,20 @@ class BlockStrategySettings(BaseModel):
     _validate_times = field_validator("start_time", "end_time")(_validate_clock)
 
 
+def _normalize_managed_bar_interval(value: str) -> str:
+    candidate = value.strip().lower()
+    if candidate in {"1d", "d", "day"}:
+        return "1d"
+    if candidate == "1h":
+        candidate = "60m"
+    if not candidate.endswith("m") or not candidate[:-1].isdigit():
+        raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
+    minutes = int(candidate[:-1])
+    if not 1 <= minutes <= 120:
+        raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
+    return f"{minutes}m"
+
+
 class BlockTradeCondition(BaseModel):
     """One broker-neutral comparison used by a managed block strategy."""
 
@@ -61,6 +75,18 @@ class BlockTradeCondition(BaseModel):
     value: Decimal = Decimal("0")
     left_offset: int = Field(default=0, ge=0, le=200)
     right_offset: int = Field(default=0, ge=0, le=200)
+    left_bar_interval: str = Field(default="3m", max_length=16)
+    left_bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
+    left_bollinger_period: int = Field(default=55, ge=2, le=2_000)
+    left_bollinger_stddev: Decimal = Field(default=Decimal("1.04"), gt=0, le=Decimal("20"))
+    right_bar_interval: str = Field(default="3m", max_length=16)
+    right_bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
+    right_bollinger_period: int = Field(default=55, ge=2, le=2_000)
+    right_bollinger_stddev: Decimal = Field(default=Decimal("1.04"), gt=0, le=Decimal("20"))
+
+    _validate_intervals = field_validator(
+        "left_bar_interval", "right_bar_interval",
+    )(_normalize_managed_bar_interval)
 
 
 DEFAULT_SELL_CONDITIONS = (
@@ -70,32 +96,12 @@ DEFAULT_SELL_CONDITIONS = (
 )
 
 
-def _normalize_managed_bar_interval(value: str) -> str:
-    candidate = value.strip().lower()
-    if candidate in {"1d", "d", "day"}:
-        return "1d"
-    if candidate == "1h":
-        candidate = "60m"
-    if not candidate.endswith("m") or not candidate[:-1].isdigit():
-        raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
-    minutes = int(candidate[:-1])
-    if not 1 <= minutes <= 120:
-        raise ValueError("관리형 블록 전략은 1분봉부터 120분봉과 일봉을 지원합니다.")
-    return f"{minutes}m"
-
-
 class BlockConditionGroup(BaseModel):
     """One OR group. Multiple groups are combined with AND by the compiler."""
 
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
-    bar_interval: str = Field(default="3m", max_length=16)
-    bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
-    bollinger_period: int = Field(default=55, ge=2, le=2_000)
-    bollinger_stddev: Decimal = Field(default=Decimal("1.04"), gt=0, le=Decimal("20"))
     conditions: list[BlockTradeCondition] = Field(min_length=1, max_length=20)
-
-    _validate_interval = field_validator("bar_interval")(_normalize_managed_bar_interval)
 
 
 def _legacy_condition_groups(
@@ -123,6 +129,45 @@ def _legacy_condition_groups(
         }
         for index, group in enumerate(groups, start=1)
     ]
+
+
+def _condition_mapping(value: object) -> dict[str, object]:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _embed_condition_calculations(
+    groups: object,
+    *,
+    prefix: str,
+    common: dict[str, object],
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for group_index, raw_group in enumerate(list(groups or []), start=1):
+        group = _condition_mapping(raw_group)
+        calculation = {
+            "bar_interval": group.get("bar_interval", common["bar_interval"]),
+            "bar_data_mode": group.get("bar_data_mode", common["bar_data_mode"]),
+            "bollinger_period": group.get("bollinger_period", common["bollinger_period"]),
+            "bollinger_stddev": group.get("bollinger_stddev", common["bollinger_stddev"]),
+        }
+        conditions: list[dict[str, object]] = []
+        for raw_condition in list(group.get("conditions") or []):
+            condition = _condition_mapping(raw_condition)
+            for side in ("left", "right"):
+                condition.setdefault(f"{side}_bar_interval", calculation["bar_interval"])
+                condition.setdefault(f"{side}_bar_data_mode", calculation["bar_data_mode"])
+                condition.setdefault(f"{side}_bollinger_period", calculation["bollinger_period"])
+                condition.setdefault(f"{side}_bollinger_stddev", calculation["bollinger_stddev"])
+            conditions.append(condition)
+        normalized.append(
+            {
+                "id": group.get("id") or f"{prefix}-{group_index}",
+                "conditions": conditions,
+            }
+        )
+    return normalized
 
 
 class ConditionBollingerBlockSettings(BaseModel):
@@ -211,6 +256,12 @@ class ConditionBollingerBlockSettings(BaseModel):
                 prefix="sell",
                 **common,
             )
+        values["buy_condition_groups"] = _embed_condition_calculations(
+            values.get("buy_condition_groups"), prefix="buy", common=common
+        )
+        values["sell_condition_groups"] = _embed_condition_calculations(
+            values.get("sell_condition_groups"), prefix="sell", common=common
+        )
         return values
 
     @field_validator("bar_interval")
@@ -248,30 +299,33 @@ class ConditionBollingerBlockSettings(BaseModel):
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("매수·매도 조건 블록 ID는 서로 달라야 합니다.")
         for group in (*self.buy_condition_groups, *self.sell_condition_groups):
-            required_bars = 1
             for condition in group.conditions:
-                offset = max(condition.left_offset, condition.right_offset)
-                if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
-                    offset += 1
-                uses_bollinger = condition.left.startswith("bollinger_") or condition.right.startswith("bollinger_")
-                required_bars = max(
-                    required_bars,
-                    offset + (group.bollinger_period if uses_bollinger else 1),
-                )
-            if group.bar_interval == "1d":
-                if required_bars > 400:
-                    raise ValueError(
-                        "일봉 조건에 필요한 이력은 한 번에 최대 400봉까지 지원합니다."
+                for side in ("left", "right"):
+                    metric = getattr(condition, side)
+                    if metric in {"value", "average_price"}:
+                        continue
+                    offset = getattr(condition, f"{side}_offset")
+                    if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
+                        offset += 1
+                    period = getattr(condition, f"{side}_bollinger_period")
+                    required_bars = offset + (
+                        period if metric.startswith("bollinger_") else 1
                     )
-                continue
-            interval_minutes = int(group.bar_interval[:-1])
-            # The KIS minute-history adapter deliberately performs at most twelve
-            # 120-row calls per evaluation so one strategy cannot monopolize the
-            # shared API queue. Reject block settings that can never fit that bound.
-            if required_bars * interval_minutes > 1_440:
-                raise ValueError(
-                    "선택한 봉 주기·지표 기간·N봉 전 값에 필요한 이력이 관리형 1회 조회 범위를 초과합니다."
-                )
+                    interval = getattr(condition, f"{side}_bar_interval")
+                    if interval == "1d":
+                        if required_bars > 400:
+                            raise ValueError(
+                                "일봉 조건에 필요한 이력은 한 번에 최대 400봉까지 지원합니다."
+                            )
+                        continue
+                    interval_minutes = int(interval[:-1])
+                    # The KIS minute-history adapter deliberately performs at most twelve
+                    # 120-row calls per evaluation so one strategy cannot monopolize the
+                    # shared API queue. Reject settings that can never fit that bound.
+                    if required_bars * interval_minutes > 1_440:
+                        raise ValueError(
+                            "선택한 봉 주기·지표 기간·N봉 전 값에 필요한 이력이 관리형 1회 조회 범위를 초과합니다."
+                        )
         return self
 
 
@@ -515,9 +569,50 @@ class ManagedBlockStrategy(Strategy):
         return unique
 
     @staticmethod
-    def _bollinger_values(bars, offset, group):
-        period = int(group["bollinger_period"])
-        stddev = Decimal(str(group["bollinger_stddev"]))
+    def _condition_source(condition, side):
+        return {
+            "metric": condition[side],
+            "bar_interval": condition[f"{side}_bar_interval"],
+            "bar_data_mode": condition[f"{side}_bar_data_mode"],
+            "bollinger_period": int(condition[f"{side}_bollinger_period"]),
+            "bollinger_stddev": Decimal(str(condition[f"{side}_bollinger_stddev"])),
+            "offset": int(condition.get(f"{side}_offset", 0)),
+        }
+
+    @staticmethod
+    def _source_uses_bars(source):
+        return source["metric"] not in {"value", "average_price"}
+
+    @staticmethod
+    def _source_key(source):
+        return source["bar_interval"], source["bar_data_mode"] == "COMPLETE_ONLY"
+
+    @classmethod
+    def _required_source_bars(cls, source, *, crossing=False):
+        if not cls._source_uses_bars(source):
+            return 0
+        offset = source["offset"] + (1 if crossing else 0)
+        period = source["bollinger_period"] if source["metric"].startswith("bollinger_") else 1
+        return offset + period
+
+    @classmethod
+    def _condition_requests(cls, condition):
+        requests = {}
+        crossing = condition["operator"] in {"CROSS_UP", "CROSS_DOWN"}
+        for side in ("left", "right"):
+            if side == "right" and condition["right"] == "value":
+                continue
+            source = cls._condition_source(condition, side)
+            required = cls._required_source_bars(source, crossing=crossing)
+            if required:
+                key = cls._source_key(source)
+                requests[key] = max(requests.get(key, 0), required)
+        return requests
+
+    @staticmethod
+    def _bollinger_values(bars, offset, source):
+        period = int(source["bollinger_period"])
+        stddev = Decimal(str(source["bollinger_stddev"]))
         end = len(bars) - offset
         start = end - period
         if start < 0 or end <= 0:
@@ -528,7 +623,9 @@ class ManagedBlockStrategy(Strategy):
         deviation = stddev * variance.sqrt()
         return mean + deviation, mean, mean - deviation
 
-    def _indicator_value(self, metric, bars, offset, average_price, group):
+    def _indicator_value(self, metric, bars, offset, average_price, source):
+        if metric == "average_price":
+            return average_price if average_price and average_price > 0 else None
         index = len(bars) - 1 - offset
         if index < 0:
             return None
@@ -536,32 +633,39 @@ class ManagedBlockStrategy(Strategy):
         if metric in {"open", "high", "low", "close", "volume"}:
             return getattr(bar, metric)
         if metric in {"bollinger_upper", "bollinger_middle", "bollinger_lower"}:
-            values = self._bollinger_values(bars, offset, group)
+            values = self._bollinger_values(bars, offset, source)
             if values is None:
                 return None
             return values[{"bollinger_upper": 0, "bollinger_middle": 1, "bollinger_lower": 2}[metric]]
-        if metric == "average_price":
-            return average_price if average_price and average_price > 0 else None
         if metric == "profit_rate":
             if not average_price or average_price <= 0:
                 return None
             return (bar.close / average_price - Decimal("1")) * Decimal("100")
         return None
 
-    def _condition_values(self, condition, bars, average_price, group, extra_offset=0):
-        left = self._indicator_value(
-            condition["left"], bars, int(condition.get("left_offset", 0)) + extra_offset, average_price, group
+    def _condition_operand_value(self, condition, side, bars_by_request, average_price, extra_offset=0):
+        if side == "right" and condition["right"] == "value":
+            return Decimal(str(condition.get("value", "0")))
+        source = self._condition_source(condition, side)
+        bars = ()
+        if self._source_uses_bars(source):
+            bars = bars_by_request.get(self._source_key(source), ())
+        return self._indicator_value(
+            source["metric"],
+            bars,
+            source["offset"] + extra_offset,
+            average_price,
+            source,
         )
-        if condition["right"] == "value":
-            right = Decimal(str(condition.get("value", "0")))
-        else:
-            right = self._indicator_value(
-                condition["right"], bars, int(condition.get("right_offset", 0)) + extra_offset, average_price, group
-            )
-        return left, right
 
-    def _condition_matches(self, condition, bars, average_price, group):
-        left, right = self._condition_values(condition, bars, average_price, group)
+    def _condition_values(self, condition, bars_by_request, average_price, extra_offset=0):
+        return (
+            self._condition_operand_value(condition, "left", bars_by_request, average_price, extra_offset),
+            self._condition_operand_value(condition, "right", bars_by_request, average_price, extra_offset),
+        )
+
+    def _condition_matches(self, condition, bars_by_request, average_price):
+        left, right = self._condition_values(condition, bars_by_request, average_price)
         if left is None or right is None:
             return False
         operator = condition["operator"]
@@ -575,7 +679,7 @@ class ManagedBlockStrategy(Strategy):
             return left >= right
         if operator == "EQ":
             return left == right
-        previous_left, previous_right = self._condition_values(condition, bars, average_price, group, 1)
+        previous_left, previous_right = self._condition_values(condition, bars_by_request, average_price, 1)
         if previous_left is None or previous_right is None:
             return False
         if operator == "CROSS_UP":
@@ -584,61 +688,41 @@ class ManagedBlockStrategy(Strategy):
             return previous_left >= previous_right and left < right
         return False
 
-    @staticmethod
-    def _required_bar_count(group):
-        required = 1
-        for item in group["conditions"]:
-            offset = max(int(item.get("left_offset", 0)), int(item.get("right_offset", 0)))
-            if item["operator"] in {"CROSS_UP", "CROSS_DOWN"}:
-                offset += 1
-            uses_bollinger = item["left"].startswith("bollinger_") or item["right"].startswith("bollinger_")
-            required = max(required, offset + (int(group["bollinger_period"]) if uses_bollinger else 1))
-        return required
-
-    def _condition_group_result(self, ctx, code, group, bars, *, average_price=None, side):
-        required = self._required_bar_count(group)
-        complete_only = group["bar_data_mode"] == "COMPLETE_ONLY"
-        if len(bars) < required:
-            mode_text = "완성 봉" if complete_only else "현재 포함 봉"
-            ctx.log.info(
-                f"{code} {side} 판단 보류: {group['bar_interval']} {mode_text} {len(bars)}/{required}개"
-            )
-            return False, []
+    def _condition_group_result(self, group, bars_by_request, *, average_price=None):
         matched = [
             item for item in group["conditions"]
-            if self._condition_matches(item, bars, average_price, group)
+            if self._condition_matches(item, bars_by_request, average_price)
         ]
         # A condition block is OR. Every condition block must pass (AND).
         return bool(matched), matched
 
     async def _condition_groups_result(self, ctx, code, groups, *, average_price=None, side):
-        requests = {}
-        for group in groups:
-            key = (group["bar_interval"], group["bar_data_mode"] == "COMPLETE_ONLY")
-            requests[key] = max(requests.get(key, 0), self._required_bar_count(group))
         bars_by_request = {}
-        for (interval, complete_only), required in requests.items():
-            try:
-                bars_by_request[(interval, complete_only)] = await ctx.market.bars(
-                    code,
-                    interval,
-                    count=required,
-                    venue=Venue(MARKET_VENUE),
-                    complete_only=complete_only,
-                )
-            except RouterError as exc:
-                ctx.log.warning(f"{code} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
-                return False, []
+        fetched_counts = {}
         matched_groups = []
         for group in groups:
-            key = (group["bar_interval"], group["bar_data_mode"] == "COMPLETE_ONLY")
+            group_requests = {}
+            for condition in group["conditions"]:
+                for key, required in self._condition_requests(condition).items():
+                    group_requests[key] = max(group_requests.get(key, 0), required)
+            for key, required in group_requests.items():
+                if fetched_counts.get(key, 0) >= required:
+                    continue
+                try:
+                    bars_by_request[key] = await ctx.market.bars(
+                        code,
+                        key[0],
+                        count=required,
+                        venue=Venue(MARKET_VENUE),
+                        complete_only=key[1],
+                    )
+                    fetched_counts[key] = required
+                except RouterError as exc:
+                    bars_by_request[key] = ()
+                    fetched_counts[key] = required
+                    ctx.log.warning(f"{code} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
             passed, matched = self._condition_group_result(
-                ctx,
-                code,
-                group,
-                bars_by_request[key],
-                average_price=average_price,
-                side=side,
+                group, bars_by_request, average_price=average_price
             )
             if not passed:
                 return False, matched_groups
@@ -660,23 +744,38 @@ class ManagedBlockStrategy(Strategy):
         return quote.price
 
     async def on_start(self, ctx):
-        buy_group_text = ", ".join(
-            f"{group['bar_interval']}·{'완성봉' if group['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
+        buy_sources = [
+            self._condition_source(condition, side)
             for group in BUY_CONDITION_GROUPS
-        ) or "추가 조건 없음"
-        sell_group_text = ", ".join(
-            f"{group['bar_interval']}·{'완성봉' if group['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
+            for condition in group["conditions"]
+            for side in ("left", "right")
+            if not (side == "right" and condition["right"] == "value")
+        ]
+        sell_sources = [
+            self._condition_source(condition, side)
             for group in SELL_CONDITION_GROUPS
-        )
-        ctx.log.info(f"매수 조건 블록: {buy_group_text} · 그룹 내부 OR / 그룹 간 AND")
-        ctx.log.info(f"매도 조건 블록: {sell_group_text} · 그룹 내부 OR / 그룹 간 AND")
+            for condition in group["conditions"]
+            for side in ("left", "right")
+            if not (side == "right" and condition["right"] == "value")
+        ]
+        buy_source_text = ", ".join(dict.fromkeys(
+            f"{item['bar_interval']}·{'완성봉' if item['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
+            for item in buy_sources if self._source_uses_bars(item)
+        )) or "봉 계산 없음"
+        sell_source_text = ", ".join(dict.fromkeys(
+            f"{item['bar_interval']}·{'완성봉' if item['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
+            for item in sell_sources if self._source_uses_bars(item)
+        )) or "봉 계산 없음"
+        ctx.log.info(f"매수 조건 블록: {buy_source_text} · 블록 내부 OR / 블록 간 순차 AND")
+        ctx.log.info(f"매도 조건 블록: {sell_source_text} · 블록 내부 OR / 블록 간 순차 AND")
         ctx.scheduler.every(
             seconds=BUY_SCAN_SECONDS,
             schedule_id="condition-scan",
             between=(BUY_START_TIME, BUY_END_TIME),
             aligned=True,
         )
-        if any(group["bar_data_mode"] == "INCLUDE_CURRENT" for group in SELL_CONDITION_GROUPS):
+        bar_sell_sources = [item for item in sell_sources if self._source_uses_bars(item)]
+        if not bar_sell_sources or any(item["bar_data_mode"] == "INCLUDE_CURRENT" for item in bar_sell_sources):
             ctx.scheduler.every(
                 seconds=BUY_SCAN_SECONDS,
                 schedule_id="condition-sell-live",
@@ -684,7 +783,7 @@ class ManagedBlockStrategy(Strategy):
                 aligned=True,
             )
         else:
-            intervals = list(dict.fromkeys(group["bar_interval"] for group in SELL_CONDITION_GROUPS))
+            intervals = list(dict.fromkeys(item["bar_interval"] for item in bar_sell_sources))
             for index, interval in enumerate(intervals, start=1):
                 if interval == "1d":
                     ctx.scheduler.daily_at(
