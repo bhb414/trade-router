@@ -1,4 +1,5 @@
 const LOG_CLEAR_STORAGE_KEY = "trade-router.log-clear-cursors.v1";
+const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v1";
 
 const state = {
   view: "dashboard",
@@ -191,6 +192,58 @@ function rememberLogClearCursor(name, cursor) {
   if (!name || !Number.isSafeInteger(value) || value < 0) return;
   state.clearedLogCursors[name] = value;
   persistLogClearCursors();
+}
+
+function cloneBlockLayout(layout) {
+  const nodes = {};
+  Object.entries(layout?.nodes || {}).forEach(([id, point]) => {
+    const x = Number(point?.x);
+    const y = Number(point?.y);
+    if (Number.isFinite(x) && Number.isFinite(y)) nodes[id] = { x, y };
+  });
+  const viewport = layout?.viewport || {};
+  return {
+    nodes,
+    viewport: {
+      x: Number.isFinite(Number(viewport.x)) ? Number(viewport.x) : 24,
+      y: Number.isFinite(Number(viewport.y)) ? Number(viewport.y) : 24,
+      zoom: Math.min(2, Math.max(.4, Number(viewport.zoom) || .75)),
+    },
+  };
+}
+
+function blockLayoutIdentity(name) {
+  const workspace = String(state.systemStatus?.workspace || "default-workspace");
+  return `${workspace}\u0000${name}`;
+}
+
+function storedBlockLayout(name) {
+  if (!name) return null;
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(BLOCK_LAYOUT_STORAGE_KEY) || "null");
+    const layout = saved?.[blockLayoutIdentity(name)];
+    return layout && typeof layout === "object" ? cloneBlockLayout(layout) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function persistBlockLayout() {
+  if (!state.selected || !state.blockPackage?.layout) return;
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(BLOCK_LAYOUT_STORAGE_KEY) || "{}") || {};
+    saved[blockLayoutIdentity(state.selected)] = cloneBlockLayout(state.blockPackage.layout);
+    window.localStorage.setItem(BLOCK_LAYOUT_STORAGE_KEY, JSON.stringify(saved));
+  } catch (_) {}
+}
+
+function forgetBlockLayout(name) {
+  if (!name) return;
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(BLOCK_LAYOUT_STORAGE_KEY) || "{}") || {};
+    delete saved[blockLayoutIdentity(name)];
+    window.localStorage.setItem(BLOCK_LAYOUT_STORAGE_KEY, JSON.stringify(saved));
+  } catch (_) {}
 }
 
 function forgetLogClearCursor(name) {
@@ -1696,6 +1749,7 @@ async function loadBlockEditorData(name) {
   ]);
   state.blockPackage = blockPackage;
   normalizeManagedBlockSettings(state.blockPackage.settings);
+  prepareBlockVisualLayout(name);
   state.providers = providers;
   state.connections = connections;
   state.accounts = accounts;
@@ -1717,7 +1771,7 @@ function conditionJoin(text = "또는 (OR)") {
   return join;
 }
 
-const CONDITION_GRAPH_DEFAULTS = {
+const LEGACY_CONDITION_GRAPH_DEFAULTS = {
   connection: { x: 70, y: 80 },
   target: { x: 470, y: 80 },
   buyConditions: { x: 850, y: 80 },
@@ -1728,6 +1782,19 @@ const CONDITION_GRAPH_DEFAULTS = {
   buySchedule: { x: 70, y: 1150 },
   sellSchedule: { x: 450, y: 1150 },
   closeSchedule: { x: 830, y: 1150 },
+};
+
+const CONDITION_GRAPH_DEFAULTS = {
+  connection: { x: 80, y: 90 },
+  target: { x: 560, y: 90 },
+  buyConditions: { x: 1040, y: 90 },
+  buySchedule: { x: 560, y: 520 },
+  buyRules: { x: 1040, y: 520 },
+  buyOrder: { x: 1060, y: 790 },
+  sellSchedule: { x: 80, y: 1100 },
+  sellConditions: { x: 500, y: 940 },
+  sellOrder: { x: 1100, y: 1120 },
+  closeSchedule: { x: 1100, y: 1490 },
 };
 
 const CONDITION_GRAPH_EDGES = [
@@ -1741,7 +1808,31 @@ const CONDITION_GRAPH_EDGES = [
   ["closeSchedule", "sellOrder", "장 마감"],
 ];
 
-const CONDITION_GRAPH_SIZE = { width: 1580, height: 1450 };
+const CONDITION_GRAPH_SIZE = { width: 1580, height: 1760 };
+
+function graphLayoutMatches(nodes, preset) {
+  const entries = Object.entries(preset);
+  return entries.every(([id, point]) => (
+    Number(nodes?.[id]?.x) === point.x && Number(nodes?.[id]?.y) === point.y
+  ));
+}
+
+function prepareBlockVisualLayout(name) {
+  if (!state.blockPackage || state.blockPackage.template !== "condition-bollinger-v1") return;
+  const localLayout = storedBlockLayout(name);
+  if (localLayout) {
+    state.blockPackage.layout = localLayout;
+    return;
+  }
+  const layout = cloneBlockLayout(state.blockPackage.layout);
+  const nodeCount = Object.keys(layout.nodes).length;
+  if (!nodeCount || graphLayoutMatches(layout.nodes, LEGACY_CONDITION_GRAPH_DEFAULTS)) {
+    layout.nodes = Object.fromEntries(
+      Object.entries(CONDITION_GRAPH_DEFAULTS).map(([id, point]) => [id, { ...point }])
+    );
+  }
+  state.blockPackage.layout = layout;
+}
 
 function ensureBlockLayout() {
   if (!state.blockPackage) return null;
@@ -1899,11 +1990,13 @@ function bindBlockNodeDrag(node, world, edgeLayer, running) {
     const viewport = ensureBlockLayout().viewport;
     const start = blockNodePosition(node.dataset.blockNode);
     const origin = { x: event.clientX, y: event.clientY };
+    let moved = false;
     handle.setPointerCapture(event.pointerId);
     node.classList.add("dragging");
     const move = moveEvent => {
       const x = start.x + (moveEvent.clientX - origin.x) / viewport.zoom;
       const y = start.y + (moveEvent.clientY - origin.y) / viewport.zoom;
+      moved ||= Math.abs(x - start.x) >= .1 || Math.abs(y - start.y) >= .1;
       state.blockPackage.layout.nodes[node.dataset.blockNode] = {
         x: Math.round(x * 10) / 10,
         y: Math.round(y * 10) / 10,
@@ -1917,7 +2010,7 @@ function bindBlockNodeDrag(node, world, edgeLayer, running) {
       handle.removeEventListener("pointermove", move);
       handle.removeEventListener("pointerup", end);
       handle.removeEventListener("pointercancel", end);
-      setDirty(true);
+      if (moved) persistBlockLayout();
     };
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", end);
@@ -1935,11 +2028,13 @@ function bindBlockCanvasPan(world) {
     const viewport = ensureBlockLayout().viewport;
     const start = { x: viewport.x, y: viewport.y };
     const origin = { x: event.clientX, y: event.clientY };
+    let moved = false;
     canvas.setPointerCapture(event.pointerId);
     canvas.classList.add("panning");
     const move = moveEvent => {
       viewport.x = start.x + moveEvent.clientX - origin.x;
       viewport.y = start.y + moveEvent.clientY - origin.y;
+      moved ||= Math.abs(viewport.x - start.x) >= .1 || Math.abs(viewport.y - start.y) >= .1;
       applyBlockViewport(world);
     };
     const end = () => {
@@ -1947,7 +2042,7 @@ function bindBlockCanvasPan(world) {
       canvas.removeEventListener("pointermove", move);
       canvas.removeEventListener("pointerup", end);
       canvas.removeEventListener("pointercancel", end);
-      setDirty(true);
+      if (moved) persistBlockLayout();
     };
     canvas.addEventListener("pointermove", move);
     canvas.addEventListener("pointerup", end);
@@ -1969,8 +2064,8 @@ function bindBlockCanvasPan(world) {
       viewport.y -= event.shiftKey ? 0 : event.deltaY;
     }
     applyBlockViewport(world);
-    window.clearTimeout(canvas._blockViewDirtyTimer);
-    canvas._blockViewDirtyTimer = window.setTimeout(() => setDirty(true), 180);
+    window.clearTimeout(canvas._blockViewPersistTimer);
+    canvas._blockViewPersistTimer = window.setTimeout(persistBlockLayout, 180);
   };
   canvas._blockPanHandler = panHandler;
   canvas._blockWheelHandler = wheelHandler;
@@ -1991,7 +2086,7 @@ function setBlockZoom(nextZoom) {
   viewport.x = centerX - worldX * viewport.zoom;
   viewport.y = centerY - worldY * viewport.zoom;
   applyBlockViewport(world);
-  setDirty(true);
+  persistBlockLayout();
 }
 
 function fitBlockGraph() {
@@ -2012,18 +2107,18 @@ function fitBlockGraph() {
   viewport.x = (elements.blockCanvas.clientWidth - (maxX - minX) * zoom) / 2 - minX * zoom;
   viewport.y = (elements.blockCanvas.clientHeight - (maxY - minY) * zoom) / 2 - minY * zoom;
   applyBlockViewport(world);
-  setDirty(true);
+  persistBlockLayout();
 }
 
 function resetBlockGraphLayout() {
   if (!state.blockPackage) return;
+  const viewport = { ...ensureBlockLayout().viewport };
   state.blockPackage.layout = {
     nodes: Object.fromEntries(Object.entries(CONDITION_GRAPH_DEFAULTS).map(([id, point]) => [id, { ...point }])),
-    viewport: { x: 24, y: 24, zoom: 1 },
+    viewport,
   };
-  setDirty(true);
+  persistBlockLayout();
   renderStrategyBlocks();
-  window.requestAnimationFrame(fitBlockGraph);
 }
 
 function createGraphSectionLabel(world, text, x, y) {
@@ -2055,10 +2150,10 @@ function renderConditionBollingerBlocks(parsed, running) {
   world.style.height = `${CONDITION_GRAPH_SIZE.height}px`;
   const edgeLayer = createBlockEdgeLayer();
   world.append(edgeLayer);
-  createGraphSectionLabel(world, "연결 · 종목 데이터", 70, 38);
-  createGraphSectionLabel(world, "매수 판단 · 주문", 470, 428);
-  createGraphSectionLabel(world, "보유종목 매도 판단", 70, 718);
-  createGraphSectionLabel(world, "실행 일정", 70, 1108);
+  createGraphSectionLabel(world, "연결 · 종목 데이터", 80, 42);
+  createGraphSectionLabel(world, "매수 일정 · 판단 · 주문", 560, 472);
+  createGraphSectionLabel(world, "보유종목 매도", 80, 892);
+  createGraphSectionLabel(world, "장 마감", 1100, 1442);
 
   const nodes = [
     { id: "connection", title: "전략 연결", meta: "계좌 · API", tone: "connection", width: 330,
@@ -2449,6 +2544,7 @@ async function deleteStrategy() {
   const deletedName = state.selected;
   await api(`/api/strategies/${encodeURIComponent(state.selected)}`, { method: "DELETE" });
   forgetLogClearCursor(deletedName);
+  forgetBlockLayout(deletedName);
   state.selected = null;
   state.strategySummary = null;
   state.blockPackage = null;
@@ -3305,7 +3401,7 @@ function closeNewStrategyModal() {
 async function exportBlockStrategy() {
   if (!state.selected || state.strategyType !== "block") return;
   if (state.dirty) await saveStrategy();
-  const payload = await api(
+  const payload = state.blockPackage || await api(
     `/api/strategies/${encodeURIComponent(state.selected)}/block-package`,
   );
   const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], {

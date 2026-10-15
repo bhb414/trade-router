@@ -479,7 +479,7 @@ button:disabled { cursor: default; opacity: .45; }
 .block-canvas.graph-mode.panning { cursor: grabbing; }
 .block-canvas-world {
   width: 1580px;
-  height: 1450px;
+  height: 1760px;
   position: absolute;
   top: 0;
   left: 0;
@@ -488,7 +488,7 @@ button:disabled { cursor: default; opacity: .45; }
 }
 .block-edge-layer {
   width: 1580px;
-  height: 1450px;
+  height: 1760px;
   position: absolute;
   inset: 0;
   z-index: 0;
