@@ -6,6 +6,7 @@ import threading
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -56,7 +57,11 @@ class AsyncTradeRouter:
         token = session_token or os.environ.get("TRADE_ROUTER_SESSION_TOKEN", "")
         headers = {
             "Authorization": f"Bearer {token}",
-            "X-Trade-Router-Strategy": strategy.id,
+            # HTTP header values must be ASCII. Strategy identifiers are user
+            # supplied and may contain Korean or other Unicode characters, so
+            # keep the diagnostic header reversible without preventing the
+            # strategy process from starting.
+            "X-Trade-Router-Strategy": quote(strategy.id, safe=""),
         }
         self._headers = headers
         self._http = http_client or httpx.AsyncClient(

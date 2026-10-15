@@ -263,6 +263,24 @@ def test_async_client_read_timeout_covers_scheduler_long_poll() -> None:
         asyncio.run(client.close())
 
 
+def test_async_client_encodes_unicode_strategy_id_for_http_header() -> None:
+    client = AsyncTradeRouter(
+        strategy=StrategyConfig(
+            id="볼린저 돌파",
+            trading_account="account",
+            market_sources={"primary": "source"},
+        ),
+        base_url="http://127.0.0.1:9",
+        session_token="test-session",
+    )
+    try:
+        assert client._headers["X-Trade-Router-Strategy"] == (  # noqa: SLF001
+            "%EB%B3%BC%EB%A6%B0%EC%A0%80%20%EB%8F%8C%ED%8C%8C"
+        )
+    finally:
+        asyncio.run(client.close())
+
+
 def test_async_order_sdk_uses_common_order_endpoint() -> None:
     async def run() -> None:
         def handler(request: httpx.Request) -> httpx.Response:
