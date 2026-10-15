@@ -9,14 +9,16 @@ description = "Local Python trading workspace with a unified broker API"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=44,<47",
     "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
     "tzdata>=2025.2",
     "uvicorn>=0.34,<1",
+    "websockets>=14,<16",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.28,<1",
     "pytest>=8.3,<9",
 ]
 

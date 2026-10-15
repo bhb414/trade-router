@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import threading
@@ -10,7 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from trade_router import AccessToken, ConnectionTarget, TokenScopeKey
+
 from .paths import WorkspacePaths
+from .broker_policies import rest_rate_limit_profile, websocket_rate_limit_profile
 
 
 PROVIDERS: dict[str, dict[str, Any]] = {
@@ -20,6 +24,10 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "key_label": "App Key",
         "secret_label": "App Secret",
         "account_product_code": True,
+        "targets": [
+            {"id": "PAPER", "name": "모의투자"},
+            {"id": "LIVE", "name": "실전"},
+        ],
     },
     "namuh": {
         "id": "namuh",
@@ -27,6 +35,10 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "key_label": "App Key",
         "secret_label": "App Secret Key",
         "account_product_code": False,
+        "targets": [
+            {"id": "PAPER", "name": "모의투자"},
+            {"id": "LIVE", "name": "실전"},
+        ],
     },
 }
 
@@ -133,7 +145,24 @@ class SettingsStore:
         self._lock = threading.RLock()
 
     def providers(self) -> list[dict[str, Any]]:
-        return list(PROVIDERS.values())
+        return [
+            {
+                **provider,
+                "targets": [
+                    {
+                        **target,
+                        "rest_rate_limit": rest_rate_limit_profile(
+                            provider["id"], target["id"]
+                        ),
+                        "websocket_rate_limit": websocket_rate_limit_profile(
+                            provider["id"], target["id"]
+                        ),
+                    }
+                    for target in provider["targets"]
+                ],
+            }
+            for provider in PROVIDERS.values()
+        ]
 
     def list_connections(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -143,19 +172,84 @@ class SettingsStore:
                 {
                     **connection,
                     "has_credentials": connection["id"] in secrets["connections"],
+                    "rest_rate_limit": rest_rate_limit_profile(
+                        str(connection["provider"]),
+                        str(connection["target"]),
+                    ),
+                    "websocket_rate_limit": websocket_rate_limit_profile(
+                        str(connection["provider"]),
+                        str(connection["target"]),
+                    ),
                 }
                 for connection in state["connections"]
             ]
 
+    def get_connection(self, connection_id: str) -> dict[str, Any]:
+        with self._lock:
+            connection = next(
+                (
+                    item
+                    for item in self._load_state()["connections"]
+                    if item["id"] == connection_id
+                ),
+                None,
+            )
+            if connection is None:
+                raise SettingsError("API 연결을 찾을 수 없습니다.")
+            return dict(connection)
+
+    def rate_limit_identity(self, connection_id: str) -> str:
+        """Opaque scope shared by every connection using the same API key.
+
+        The App Key never leaves encrypted settings or appears in diagnostics.
+        The target remains part of the identity because KIS live and paper use
+        different gateways and different official pacing.
+        """
+
+        with self._lock:
+            connection = self.get_connection(connection_id)
+            credentials = self.get_credentials(connection_id)
+            return _connection_scope_identity(
+                str(connection["provider"]),
+                str(connection["target"]),
+                str(credentials["app_key"]),
+            )
+
+    def resolve_connection(self, reference: str) -> dict[str, Any]:
+        clean = reference.strip()
+        with self._lock:
+            matches = [
+                item
+                for item in self._load_state()["connections"]
+                if item["id"] == clean or item["label"].casefold() == clean.casefold()
+            ]
+            if not matches:
+                raise SettingsError("API 연결을 찾을 수 없습니다.")
+            if len(matches) > 1:
+                raise SettingsError("API 연결 이름이 중복되었습니다.")
+            return dict(matches[0])
+
     def add_connection(
-        self, *, provider: str, label: str, app_key: str, app_secret: str
+        self,
+        *,
+        provider: str,
+        target: str,
+        label: str,
+        app_key: str,
+        app_secret: str,
+        realtime_user_id: str = "",
     ) -> dict[str, Any]:
         provider = provider.strip().lower()
+        target = target.strip().upper()
         label = label.strip()
         app_key = app_key.strip()
         app_secret = app_secret.strip()
+        realtime_user_id = realtime_user_id.strip()
         if provider not in PROVIDERS:
             raise SettingsError("지원하지 않는 증권사입니다.")
+        supported_targets = {item["id"] for item in PROVIDERS[provider]["targets"]}
+        if target not in supported_targets:
+            raise SettingsError("선택한 증권사가 지원하는 접속 대상을 선택하세요.")
         if not label:
             raise SettingsError("API 연결 이름을 입력하세요.")
         if not app_key or not app_secret:
@@ -168,6 +262,7 @@ class SettingsStore:
             connection = {
                 "id": f"api-{uuid.uuid4().hex[:12]}",
                 "provider": provider,
+                "target": target,
                 "label": label,
                 "created_at": datetime.now().astimezone().isoformat(),
             }
@@ -175,11 +270,17 @@ class SettingsStore:
             secrets["connections"][connection["id"]] = {
                 "app_key": app_key,
                 "app_secret": app_secret,
+                "realtime_user_id": realtime_user_id,
             }
             state["connections"].append(connection)
             self._write_secrets(secrets)
             self._write_state(state)
-            return {**connection, "has_credentials": True}
+            return {
+                **connection,
+                "has_credentials": True,
+                "rest_rate_limit": rest_rate_limit_profile(provider, target),
+                "websocket_rate_limit": websocket_rate_limit_profile(provider, target),
+            }
 
     def remove_connection(self, connection_id: str) -> None:
         with self._lock:
@@ -187,13 +288,46 @@ class SettingsStore:
             if any(account["connection_id"] == connection_id for account in state["accounts"]):
                 raise SettingsError("이 API 연결을 사용하는 계좌를 먼저 삭제하세요.")
             before = len(state["connections"])
+            removed_connection = next(
+                (
+                    item
+                    for item in state["connections"]
+                    if item["id"] == connection_id
+                ),
+                None,
+            )
             state["connections"] = [
                 item for item in state["connections"] if item["id"] != connection_id
             ]
-            if len(state["connections"]) == before:
+            if len(state["connections"]) == before or removed_connection is None:
                 raise SettingsError("API 연결을 찾을 수 없습니다.")
             secrets = self._load_secrets()
+            removed_credentials = secrets["connections"].get(connection_id, {})
+            removed_scope = _connection_scope_identity(
+                str(removed_connection["provider"]),
+                str(removed_connection["target"]),
+                str(removed_credentials.get("app_key") or ""),
+            )
             secrets["connections"].pop(connection_id, None)
+            shared_scope_remains = any(
+                item["id"] != connection_id
+                and _connection_scope_identity(
+                    str(item["provider"]),
+                    str(item["target"]),
+                    str(
+                        secrets["connections"].get(item["id"], {}).get("app_key")
+                        or ""
+                    ),
+                )
+                == removed_scope
+                for item in state["connections"]
+            )
+            secrets["tokens"] = {
+                key: value
+                for key, value in secrets["tokens"].items()
+                if f":{connection_id}:" not in key
+                and (shared_scope_remains or f":{removed_scope}:" not in key)
+            }
             self._write_secrets(secrets)
             self._write_state(state)
 
@@ -203,6 +337,39 @@ class SettingsStore:
             if not credentials:
                 raise SettingsError("저장된 API 인증정보가 없습니다.")
             return dict(credentials)
+
+    def load_token(self, scope: TokenScopeKey) -> AccessToken | None:
+        with self._lock:
+            payload = self._load_secrets()["tokens"].get(scope.storage_key)
+            if not payload:
+                return None
+            try:
+                issued_at = payload.get("issued_at")
+                return AccessToken(
+                    value=payload["value"],
+                    token_type=payload.get("token_type", "Bearer"),
+                    expires_at=datetime.fromisoformat(payload["expires_at"]),
+                    issued_at=datetime.fromisoformat(issued_at) if issued_at else None,
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+
+    def save_token(self, scope: TokenScopeKey, token: AccessToken) -> None:
+        with self._lock:
+            secrets = self._load_secrets()
+            secrets["tokens"][scope.storage_key] = {
+                "value": token.value,
+                "token_type": token.token_type,
+                "expires_at": token.expires_at.isoformat(),
+                "issued_at": token.issued_at.isoformat() if token.issued_at else None,
+            }
+            self._write_secrets(secrets)
+
+    def delete_token(self, scope: TokenScopeKey) -> None:
+        with self._lock:
+            secrets = self._load_secrets()
+            secrets["tokens"].pop(scope.storage_key, None)
+            self._write_secrets(secrets)
 
     def list_accounts(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -218,12 +385,50 @@ class SettingsStore:
                 result.append(
                     {
                         **account,
+                        "risk_limits": dict(account.get("risk_limits", {})),
+                        "cost_rates": dict(account.get("cost_rates", {})),
                         "provider": connection.get("provider"),
+                        "target": connection.get("target"),
                         "connection_label": connection.get("label", "삭제된 연결"),
                         "masked_account": _mask_account(account_number),
                     }
                 )
             return result
+
+    def get_account(self, reference: str) -> dict[str, Any]:
+        clean = reference.strip()
+        with self._lock:
+            state = self._load_state()
+            account = next(
+                (
+                    item
+                    for item in state["accounts"]
+                    if item["id"] == clean or item["alias"].casefold() == clean.casefold()
+                ),
+                None,
+            )
+            if account is None:
+                raise SettingsError("거래 계좌를 찾을 수 없습니다.")
+            connection = next(
+                item
+                for item in state["connections"]
+                if item["id"] == account["connection_id"]
+            )
+            return {
+                **account,
+                "risk_limits": dict(account.get("risk_limits", {})),
+                "cost_rates": dict(account.get("cost_rates", {})),
+                "provider": connection["provider"],
+                "target": connection["target"],
+                "connection_label": connection["label"],
+            }
+
+    def get_account_number(self, account_id: str) -> str:
+        with self._lock:
+            account = self._load_secrets()["accounts"].get(account_id)
+            if not account or not account.get("account_number"):
+                raise SettingsError("저장된 계좌번호가 없습니다.")
+            return str(account["account_number"])
 
     def add_account(
         self,
@@ -232,6 +437,8 @@ class SettingsStore:
         connection_id: str,
         account_number: str,
         product_code: str = "",
+        risk_limits: dict[str, str | int | None] | None = None,
+        cost_rates: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
         alias = alias.strip()
         account_number = "".join(character for character in account_number if character.isalnum())
@@ -258,6 +465,16 @@ class SettingsStore:
                 "alias": alias,
                 "connection_id": connection_id,
                 "product_code": product_code if connection["provider"] == "kis" else "",
+                "risk_limits": {
+                    key: value
+                    for key, value in (risk_limits or {}).items()
+                    if value not in {None, ""}
+                },
+                "cost_rates": {
+                    key: str(value)
+                    for key, value in (cost_rates or {}).items()
+                    if value not in {None, ""}
+                },
                 "created_at": datetime.now().astimezone().isoformat(),
             }
             secrets = self._load_secrets()
@@ -268,9 +485,45 @@ class SettingsStore:
             return {
                 **account,
                 "provider": connection["provider"],
+                "target": connection["target"],
                 "connection_label": connection["label"],
                 "masked_account": _mask_account(account_number),
             }
+
+    def update_account_risk_limits(
+        self,
+        reference: str,
+        risk_limits: dict[str, str | int | None],
+    ) -> dict[str, Any]:
+        allowed = {
+            "max_order_amount",
+            "max_daily_buy_amount",
+            "max_exposure",
+            "max_open_orders",
+        }
+        if set(risk_limits) - allowed:
+            raise SettingsError("지원하지 않는 계좌 위험 한도 항목이 있습니다.")
+        normalized = {
+            key: value
+            for key, value in risk_limits.items()
+            if value not in {None, ""}
+        }
+        with self._lock:
+            state = self._load_state()
+            account = next(
+                (
+                    item
+                    for item in state["accounts"]
+                    if item["id"] == reference
+                    or item["alias"].casefold() == reference.casefold()
+                ),
+                None,
+            )
+            if account is None:
+                raise SettingsError("거래 계좌를 찾을 수 없습니다.")
+            account["risk_limits"] = normalized
+            self._write_state(state)
+            return self.get_account(account["id"])
 
     def remove_account(self, account_id: str) -> None:
         with self._lock:
@@ -288,22 +541,40 @@ class SettingsStore:
 
     def _load_state(self) -> dict[str, Any]:
         if not self._state_path.exists():
-            return {"version": 1, "connections": [], "accounts": []}
+            return {"version": 2, "connections": [], "accounts": []}
         payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        connections = [
+            self._normalize_connection(dict(item))
+            for item in payload.get("connections", [])
+        ]
         return {
-            "version": 1,
-            "connections": list(payload.get("connections", [])),
+            "version": 2,
+            "connections": connections,
             "accounts": list(payload.get("accounts", [])),
         }
 
+    @staticmethod
+    def _normalize_connection(connection: dict[str, Any]) -> dict[str, Any]:
+        if connection.get("target") in {"PAPER", "LIVE"}:
+            return connection
+        provider = connection.get("provider")
+        label = str(connection.get("label", "")).casefold()
+        if provider == "kis" and any(word in label for word in ("mock", "paper", "모의")):
+            connection["target"] = "PAPER"
+        else:
+            connection["target"] = "LIVE"
+        connection["target_inferred"] = True
+        return connection
+
     def _load_secrets(self) -> dict[str, dict[str, Any]]:
         if not self._secret_path.exists():
-            return {"connections": {}, "accounts": {}}
+            return {"connections": {}, "accounts": {}, "tokens": {}}
         decrypted = self._protector.unprotect(self._secret_path.read_bytes())
         payload = json.loads(decrypted.decode("utf-8"))
         return {
             "connections": dict(payload.get("connections", {})),
             "accounts": dict(payload.get("accounts", {})),
+            "tokens": dict(payload.get("tokens", {})),
         }
 
     def _write_state(self, state: dict[str, Any]) -> None:
@@ -331,3 +602,11 @@ def _mask_account(value: str) -> str:
     if len(value) <= 8:
         return f"{'*' * (len(value) - 4)}{value[-4:]}"
     return f"{value[:2]}{'*' * (len(value) - 6)}{value[-4:]}"
+
+
+def _connection_scope_identity(provider: str, target: str, app_key: str) -> str:
+    material = "\0".join(
+        (provider.lower(), target.upper(), app_key)
+    ).encode("utf-8")
+    fingerprint = hashlib.sha256(material).hexdigest()[:24]
+    return f"{provider.lower()}:{target.lower()}:key-{fingerprint}"

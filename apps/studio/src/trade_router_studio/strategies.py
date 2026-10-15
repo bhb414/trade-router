@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import os
 import re
 import sys
@@ -8,9 +9,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .paths import WorkspacePaths
+from .sessions import StrategySessionRegistry
 
 
 MAX_SOURCE_BYTES = 512 * 1024
@@ -23,15 +26,35 @@ class StrategyNameError(ValueError):
 
 
 @dataclass(slots=True)
+class StrategyLogEntry:
+    sequence: int
+    timestamp: datetime
+    level: str
+    message: str
+
+    def as_dict(self) -> dict[str, str | int]:
+        return {
+            "sequence": self.sequence,
+            "timestamp": self.timestamp.isoformat(),
+            "level": self.level,
+            "message": self.message,
+        }
+
+
+@dataclass(slots=True)
 class StrategyProcess:
     name: str
     process: asyncio.subprocess.Process | None = None
     reader_task: asyncio.Task[None] | None = None
-    logs: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_LOG_LINES))
+    logs: deque[StrategyLogEntry] = field(
+        default_factory=lambda: deque(maxlen=MAX_LOG_LINES)
+    )
     started_at: datetime | None = None
     stopped_at: datetime | None = None
     exit_code: int | None = None
     stop_requested: bool = False
+    runtime_managed: bool = False
+    next_log_sequence: int = 0
 
     @property
     def running(self) -> bool:
@@ -39,8 +62,18 @@ class StrategyProcess:
 
 
 class StrategyManager:
-    def __init__(self, paths: WorkspacePaths) -> None:
+    def __init__(
+        self,
+        paths: WorkspacePaths,
+        sessions: StrategySessionRegistry | None = None,
+        *,
+        router_url: str = "http://127.0.0.1:8890",
+        on_exit: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         self.paths = paths
+        self._sessions = sessions
+        self._router_url = router_url
+        self._on_exit = on_exit
         self._states: dict[str, StrategyProcess] = {}
         self._lock = asyncio.Lock()
 
@@ -104,20 +137,38 @@ class StrategyManager:
             state = self._states.setdefault(name, StrategyProcess(name=name))
             if state.running:
                 return self._describe(name, state)
-            state.logs.append("--- starting strategy ---")
+            self._append_log(state, "system", "전략을 시작했습니다.")
             state.started_at = datetime.now().astimezone()
             state.stopped_at = None
             state.exit_code = None
             state.stop_requested = False
+            source = path.read_text(encoding="utf-8")
+            state.runtime_managed = _uses_strategy_runtime(source)
             environment = os.environ.copy()
             environment["PYTHONUNBUFFERED"] = "1"
+            environment["PYTHONIOENCODING"] = "utf-8"
+            environment["PYTHONUTF8"] = "1"
             environment["TRADE_ROUTER_HOME"] = str(self.paths.root)
+            environment["TRADE_ROUTER_URL"] = self._router_url
+            environment["TRADE_ROUTER_STRATEGY_NAME"] = name
+            if self._sessions is not None:
+                environment["TRADE_ROUTER_SESSION_TOKEN"] = self._sessions.issue(name)
+            command = (
+                [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "trade_router_studio.strategy_worker",
+                    str(path),
+                ]
+                if state.runtime_managed
+                else [sys.executable, "-u", str(path)]
+            )
             process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-u",
-                str(path),
+                *command,
                 cwd=str(self.paths.strategies),
                 env=environment,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -132,14 +183,26 @@ class StrategyManager:
             if state is None or not state.running:
                 return self._describe(name, state)
             assert state.process is not None
-            state.logs.append("--- stopping strategy ---")
+            self._append_log(state, "system", "전략 중지를 요청했습니다.")
             state.stop_requested = True
-            state.process.terminate()
+            if state.runtime_managed and state.process.stdin is not None:
+                state.process.stdin.write(b"stop\n")
+                await state.process.stdin.drain()
+            else:
+                state.process.terminate()
             try:
                 await asyncio.wait_for(state.process.wait(), timeout=5)
             except TimeoutError:
-                state.logs.append("--- forced stop after timeout ---")
-                state.process.kill()
+                self._append_log(
+                    state,
+                    "warning",
+                    "정상 종료 대기 시간이 지나 프로세스를 종료합니다.",
+                )
+                state.process.terminate()
+                try:
+                    await asyncio.wait_for(state.process.wait(), timeout=2)
+                except TimeoutError:
+                    state.process.kill()
                 await state.process.wait()
             if state.reader_task:
                 await state.reader_task
@@ -158,10 +221,11 @@ class StrategyManager:
         self.resolve(name)
         state = self._states.get(name)
         lines = list(state.logs) if state else []
-        safe_after = min(max(after, 0), len(lines))
+        visible = [entry for entry in lines if entry.sequence > after]
         return {
-            "lines": lines[safe_after:],
-            "next": len(lines),
+            "lines": [entry.message for entry in visible],
+            "entries": [entry.as_dict() for entry in visible],
+            "next": state.next_log_sequence if state else 0,
             "running": bool(state and state.running),
             "exit_code": state.exit_code if state else None,
         }
@@ -170,13 +234,67 @@ class StrategyManager:
         assert state.process is not None
         assert state.process.stdout is not None
         while line := await state.process.stdout.readline():
-            state.logs.append(line.decode("utf-8", errors="replace").rstrip())
+            decoded = self._decode_output(line).rstrip()
+            level, message = self._classify_output(decoded)
+            self._append_log(state, level, message)
         state.exit_code = await state.process.wait()
+        if self._sessions is not None:
+            self._sessions.revoke_strategy(state.name)
+        if self._on_exit is not None:
+            await self._on_exit(state.name)
         state.stopped_at = datetime.now().astimezone()
         if state.stop_requested:
-            state.logs.append("--- strategy stopped by user ---")
+            self._append_log(state, "success", "사용자 요청으로 전략을 중지했습니다.")
         else:
-            state.logs.append(f"--- strategy exited ({state.exit_code}) ---")
+            level = "success" if state.exit_code == 0 else "error"
+            self._append_log(
+                state,
+                level,
+                f"전략 프로세스가 종료되었습니다. 종료 코드 {state.exit_code}",
+            )
+
+    @staticmethod
+    def _append_log(state: StrategyProcess, level: str, message: str) -> None:
+        if not message:
+            return
+        state.next_log_sequence += 1
+        state.logs.append(
+            StrategyLogEntry(
+                sequence=state.next_log_sequence,
+                timestamp=datetime.now().astimezone(),
+                level=level,
+                message=message,
+            )
+        )
+
+    @staticmethod
+    def _decode_output(value: bytes) -> str:
+        for encoding in ("utf-8", "cp949"):
+            try:
+                return value.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return value.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _classify_output(line: str) -> tuple[str, str]:
+        if line.startswith("INFO "):
+            return "info", line[5:]
+        if line.startswith("WARNING "):
+            return "warning", line[8:]
+        if line.startswith("ERROR "):
+            return "error", line[6:]
+        ready = re.fullmatch(
+            r"--- runtime strategy ready \((\d+) schedules\) ---", line
+        )
+        if ready:
+            return (
+                "success",
+                f"스케줄 {ready.group(1)}개를 등록하고 실행 준비를 마쳤습니다.",
+            )
+        if line.startswith("Traceback ") or line.startswith("  File "):
+            return "error", line
+        return "output", line
 
     @staticmethod
     def _describe(
@@ -189,4 +307,21 @@ class StrategyManager:
             "stopped_at": state.stopped_at.isoformat() if state and state.stopped_at else None,
             "exit_code": state.exit_code if state else None,
             "stop_requested": bool(state and state.stop_requested),
+            "runtime_managed": bool(state and state.runtime_managed),
         }
+
+
+def _uses_strategy_runtime(source: str) -> bool:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            if isinstance(base, ast.Name) and base.id == "Strategy":
+                return True
+            if isinstance(base, ast.Attribute) and base.attr == "Strategy":
+                return True
+    return False

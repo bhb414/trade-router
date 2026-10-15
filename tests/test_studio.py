@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
-from trade_router_studio.app import create_app
-from trade_router_studio.paths import WorkspacePaths
-from trade_router_studio.strategies import StrategyManager, StrategyNameError
+from trade_router import (
+    AccessToken,
+    Balance,
+    ConnectionTarget,
+    InstrumentId,
+    Position,
+    TokenScopeKey,
+)
+from trade_router_studio.app import _strategy_performance, create_app
+from trade_router_studio.paths import LEGACY_EXAMPLE_STRATEGY, WorkspacePaths
+from trade_router_studio.strategies import (
+    MAX_LOG_LINES,
+    StrategyManager,
+    StrategyNameError,
+    StrategyProcess,
+)
 
 
 def workspace(root: Path) -> WorkspacePaths:
@@ -20,13 +36,89 @@ def workspace(root: Path) -> WorkspacePaths:
     )
 
 
+def test_workspace_replaces_only_the_obsolete_bundled_example(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    example = paths.strategies / "example_strategy.py"
+    example.write_text(LEGACY_EXAMPLE_STRATEGY, encoding="utf-8")
+
+    paths.ensure()
+
+    source = example.read_text(encoding="utf-8")
+    assert "class ExampleStrategy(Strategy):" in source
+    assert "waiting for a broker connection" not in source
+
+
+def test_workspace_preserves_a_user_edited_example(tmp_path: Path) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.strategies.mkdir(parents=True)
+    example = paths.strategies / "example_strategy.py"
+    source = LEGACY_EXAMPLE_STRATEGY + "\n# my change\n"
+    example.write_text(source, encoding="utf-8")
+
+    paths.ensure()
+
+    assert example.read_text(encoding="utf-8") == source
+
+
+def test_removing_last_shared_key_alias_removes_its_encrypted_token(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    settings = app.state.settings
+    first = settings.add_connection(
+        provider="kis",
+        target="PAPER",
+        label="first",
+        app_key="shared-key",
+        app_secret="shared-secret",
+    )
+    second = settings.add_connection(
+        provider="kis",
+        target="PAPER",
+        label="second",
+        app_key="shared-key",
+        app_secret="shared-secret",
+    )
+    scope = TokenScopeKey(
+        "kis",
+        settings.rate_limit_identity(first["id"]),
+        ConnectionTarget.PAPER,
+    )
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    settings.save_token(
+        scope,
+        AccessToken("encrypted-token", now + timedelta(hours=1), issued_at=now),
+    )
+
+    settings.remove_connection(first["id"])
+    assert settings.load_token(scope) is not None
+    settings.remove_connection(second["id"])
+    assert settings.load_token(scope) is None
+
+
 def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
     app = create_app(workspace(tmp_path / "workspace"))
+    process_actions: list[str] = []
+    app.state.process_control = process_actions.append
     with TestClient(app) as client:
         status = client.get("/api/status")
         assert status.status_code == 200
         assert status.headers["cache-control"] == "no-store, max-age=0"
-        assert status.json()["strategy_count"] == 1
+        static_script = client.get("/static/app.js")
+        assert static_script.status_code == 200
+        assert static_script.headers["cache-control"] == "no-store, max-age=0"
+        page = client.get("/")
+        assert 'id="order-permission-button"' in page.text
+        assert 'role="switch"' in page.text
+        assert status.json()["instance_id"]
+        assert status.json()["instance_started_at"]
+        assert status.json()["strategy_count"] == 2
+        assert (app.state.workspace.strategies / "kis_condition_bollinger.py").is_file()
+        assert status.json()["unresolved_orders"] == 0
+        doctor = client.get("/api/system/doctor")
+        assert doctor.status_code == 200
+        assert doctor.json()["order_submission_enabled"] is False
 
         created = client.put(
             "/api/strategies/my_strategy.py",
@@ -35,6 +127,234 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert created.status_code == 200
         loaded = client.get("/api/strategies/my_strategy.py")
         assert loaded.json()["source"] == "print('ready')\n"
+
+        restart = client.post("/api/system/restart")
+        shutdown = client.post("/api/system/shutdown")
+        assert restart.status_code == 200
+        assert shutdown.status_code == 200
+        assert process_actions == ["restart", "shutdown"]
+
+
+def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+
+    async def balance(_account: str) -> Balance:
+        return Balance(
+            cash=Decimal("25000"),
+            withdrawable_cash=Decimal("25000"),
+            total_value=Decimal("125000"),
+            positions=(
+                Position(
+                    instrument=InstrumentId("005930"),
+                    quantity=Decimal("10"),
+                    available_quantity=Decimal("10"),
+                    average_price=Decimal("9000"),
+                    market_price=Decimal("10000"),
+                ),
+            ),
+            as_of=datetime.now(ZoneInfo("Asia/Seoul")),
+        )
+
+    app.state.connections.balance = balance
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "dashboard-source",
+                "app_key": "dashboard-key",
+                "app_secret": "dashboard-secret",
+            },
+        ).json()
+        client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "dashboard-account",
+                "connection_id": connection["id"],
+                "account_number": "12345678",
+                "product_code": "01",
+                "max_daily_buy_amount": "100000",
+                "max_exposure": "200000",
+                "max_open_orders": 3,
+            },
+        )
+
+        payload = client.get("/api/dashboard?refresh=true").json()
+
+    assert payload["summary"]["total_assets"] == "125000"
+    assert payload["summary"]["cash"] == "25000"
+    assert payload["summary"]["unrealized_profit"] == "10000"
+    assert payload["summary"]["live_assets"] == "0"
+    assert payload["summary"]["paper_assets"] == "125000"
+    assert payload["summary"]["paper_unrealized_profit"] == "10000"
+    assert payload["summary"]["account_count"] == 1
+    assert payload["summary"]["valued_accounts"] == 1
+    assert payload["summary"]["unresolved_orders"] == 0
+    account = payload["accounts"][0]
+    assert account["state"] == "ok"
+    assert account["position_count"] == 1
+    assert account["limits"]["max_exposure"]["used"] == "100000"
+    assert account["limits"]["max_exposure"]["percent"] == 50.0
+    assert payload["services"][0]["state"] == "connected"
+    results = {item["id"]: item for item in payload["service_results"]}
+    assert results["account"]["snapshot_success"] == 1
+    assert results["account"]["total"] == 1
+    assert results["account"]["success"] == 1
+    assert results["router"]["state"] == "ok"
+    assert "key-" not in str(payload)
+
+
+def test_strategy_performance_uses_router_owned_fills_and_current_price() -> None:
+    rows = [
+        {
+            "created_at": "2026-10-15T09:00:00+09:00",
+            "request": {"code": "005930", "side": "BUY"},
+            "filled_quantity": "2",
+            "average_fill_price": "100",
+        },
+        {
+            "created_at": "2026-10-15T10:00:00+09:00",
+            "request": {"code": "005930", "side": "SELL"},
+            "filled_quantity": "1",
+            "average_fill_price": "120",
+        },
+    ]
+    account = {
+        "positions": [
+            {"code": "005930", "market_price": "150", "average_price": "100"}
+        ]
+    }
+
+    result = _strategy_performance(rows, account)
+
+    assert result["realized_profit"] == "20"
+    assert result["unrealized_profit"] == "50"
+    assert result["estimated_profit"] == "70"
+    assert result["estimated_return_percent"] == "35.00"
+    assert result["matched_sales"] == 1
+    assert result["winning_sales"] == 1
+    assert result["includes_fees"] is False
+
+
+def test_strategy_performance_subtracts_commission_and_tax() -> None:
+    rows = [
+        {
+            "created_at": "2026-10-15T09:00:00+09:00",
+            "request": {"code": "005930", "side": "BUY"},
+            "filled_quantity": "1",
+            "average_fill_price": "100",
+            "commission": "1",
+            "tax": "0",
+            "costs_complete": True,
+        },
+        {
+            "created_at": "2026-10-15T10:00:00+09:00",
+            "request": {"code": "005930", "side": "SELL"},
+            "filled_quantity": "1",
+            "average_fill_price": "120",
+            "commission": "1",
+            "tax": "2",
+            "costs_complete": True,
+        },
+    ]
+    result = _strategy_performance(rows, {"positions": []})
+    assert result["realized_profit"] == "16"
+    assert result["commission"] == "2"
+    assert result["tax"] == "2"
+    assert result["includes_fees"] is True
+
+
+def test_stopped_strategy_summary_reads_config_without_executing_it(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+
+    async def balance(_account: str) -> Balance:
+        return Balance(
+            cash=Decimal("500000"),
+            withdrawable_cash=Decimal("500000"),
+            total_value=Decimal("500000"),
+            positions=(),
+            as_of=datetime.now(ZoneInfo("Asia/Seoul")),
+        )
+
+    app.state.connections.balance = balance
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "summary-source",
+                "app_key": "summary-key",
+                "app_secret": "summary-secret",
+            },
+        ).json()
+        client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "summary-account",
+                "connection_id": connection["id"],
+                "account_number": "12345678",
+                "product_code": "01",
+            },
+        )
+        source = '''from decimal import Decimal
+from trade_router import RiskLimits, Strategy, StrategyConfig
+
+raise RuntimeError("must not execute")
+
+ACCOUNT = "summary-account"
+SOURCE = "summary-source"
+MAX_ORDER = Decimal("50000")
+
+class SummaryStrategy(Strategy):
+    config = StrategyConfig(
+        id="summary-strategy",
+        trading_account=ACCOUNT,
+        market_sources={"primary": SOURCE},
+        limits=RiskLimits(
+            max_order_amount=MAX_ORDER,
+            max_daily_buy_amount=Decimal("150000"),
+            max_open_orders=2,
+        ),
+    )
+'''
+        client.put("/api/strategies/summary.py", json={"source": source})
+
+        payload = client.get("/api/strategies/summary.py/summary").json()
+
+    assert payload["strategy_id"] == "summary-strategy"
+    assert payload["trading_account"] == "summary-account"
+    assert payload["market_sources"] == {"primary": "summary-source"}
+    assert payload["running"] is False
+    assert payload["limits"]["max_order_amount"]["limit"] == "50000"
+    assert payload["limits"]["max_daily_buy_amount"]["limit"] == "150000"
+    assert payload["limits"]["max_open_orders"]["limit"] == "2"
+    assert payload["performance"] == {
+        "estimated_profit": "0",
+        "estimated_return_percent": None,
+        "realized_profit": "0",
+        "unrealized_profit": "0",
+        "filled_buy_amount": "0",
+        "filled_sell_amount": "0",
+        "matched_sales": 0,
+        "winning_sales": 0,
+        "win_rate": None,
+        "unpriced_codes": [],
+        "includes_fees": False,
+        "commission": "0",
+        "tax": "0",
+        "total_costs": "0",
+        "costs_complete": False,
+    }
+    assert [item["label"] for item in payload["service_results"]] == [
+        "시세 데이터",
+        "스케줄러",
+        "계좌 조회",
+        "주문 처리",
+    ]
 
 
 def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
@@ -45,6 +365,7 @@ def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
             "/api/settings/connections",
             json={
                 "provider": "kis",
+                "target": "PAPER",
                 "label": "KIS main",
                 "app_key": "test-app-key",
                 "app_secret": "test-app-secret",
@@ -52,6 +373,21 @@ def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
         )
         assert connection.status_code == 201
         connection_payload = connection.json()
+        assert connection_payload["target"] == "PAPER"
+        assert connection_payload["rest_rate_limit"]["requests_per_second"] == 1
+        assert connection_payload["rest_rate_limit"]["minimum_interval_ms"] == 1000
+        assert (
+            connection_payload["websocket_rate_limit"][
+                "max_subscriptions_per_session"
+            ]
+            == 41
+        )
+        assert (
+            connection_payload["websocket_rate_limit"][
+                "control_messages_per_second"
+            ]
+            == 1
+        )
         assert "app_key" not in connection_payload
         assert "app_secret" not in connection_payload
 
@@ -62,10 +398,15 @@ def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
                 "connection_id": connection_payload["id"],
                 "account_number": "12345678",
                 "product_code": "01",
+                "max_order_amount": "500000",
+                "max_daily_buy_amount": "1000000",
+                "max_open_orders": 3,
             },
         )
         assert account.status_code == 201
         assert account.json()["masked_account"] == "****5678"
+        assert account.json()["risk_limits"]["max_order_amount"] == "500000"
+        assert account.json()["risk_limits"]["max_open_orders"] == 3
         assert "account_number" not in account.json()
 
         stored_text = (paths.config / "settings.json").read_text(encoding="utf-8")
@@ -76,6 +417,130 @@ def test_settings_api_keeps_secrets_out_of_responses(tmp_path: Path) -> None:
         status = client.get("/api/status").json()
         assert status["registered_apis"] == 1
         assert status["registered_accounts"] == 1
+
+        providers = client.get("/api/settings/providers").json()
+        kis = next(item for item in providers if item["id"] == "kis")
+        live = next(item for item in kis["targets"] if item["id"] == "LIVE")
+        assert live["rest_rate_limit"]["requests_per_second"] == 18
+        assert live["websocket_rate_limit"]["control_messages_per_second"] == 1
+        namuh = next(item for item in providers if item["id"] == "namuh")
+        assert namuh["targets"][0]["rest_rate_limit"]["requests_per_second"] == 4
+        assert (
+            namuh["targets"][0]["websocket_rate_limit"][
+                "operating_max_sessions_per_key"
+            ]
+            == 2
+        )
+
+
+def test_connection_registration_can_check_authentication_immediately(
+    tmp_path: Path,
+) -> None:
+    paths = workspace(tmp_path / "workspace")
+    app = create_app(paths)
+
+    async def connected(connection_id: str) -> dict[str, object]:
+        return {
+            "connection_id": connection_id,
+            "state": "connected",
+            "expires_at": "2026-10-16T09:00:00+09:00",
+            "message": "접근 토큰을 확인했습니다.",
+        }
+
+    app.state.connections.check = connected
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/settings/connections?check=true",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "checked immediately",
+                "app_key": "test-app-key",
+                "app_secret": "test-app-secret",
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["connection_status"]["state"] == "connected"
+
+
+def test_strategy_order_toggle_is_available_while_stopped_and_persists(
+    tmp_path: Path,
+) -> None:
+    paths = workspace(tmp_path / "workspace")
+    app = create_app(paths)
+    with TestClient(app) as client:
+        initial = client.get(
+            "/api/strategies/example_strategy.py/order-permission"
+        ).json()
+        assert initial == {
+            "available": True,
+            "armed": False,
+            "strategy_id": None,
+            "running": False,
+        }
+
+        armed = client.post(
+            "/api/strategies/example_strategy.py/arm-orders"
+        )
+        assert armed.status_code == 200
+        assert armed.json()["armed"] is True
+        assert client.get(
+            "/api/strategies/example_strategy.py/order-permission"
+        ).json()["armed"] is True
+
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "toggle-source",
+                "app_key": "toggle-key",
+                "app_secret": "toggle-secret",
+            },
+        ).json()
+        client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "toggle-account",
+                "connection_id": connection["id"],
+                "account_number": "12345678",
+                "product_code": "01",
+            },
+        )
+        token = app.state.sessions.issue("example_strategy.py")
+        registered = client.post(
+            "/api/v1/strategy/manifest",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "strategy_id": "stopped-toggle-strategy",
+                "trading_account": "toggle-account",
+                "market_sources": {"primary": "toggle-source"},
+            },
+        )
+        assert registered.status_code == 200
+        runtime_permissions = client.get("/api/runtime/order-permissions").json()
+        actual = next(
+            item
+            for item in runtime_permissions
+            if item["scope_type"] == "strategy"
+            and item["scope_id"] == "stopped-toggle-strategy"
+        )
+        assert actual["armed"] is True
+
+    restarted = create_app(paths)
+    with TestClient(restarted) as client:
+        restored = client.get(
+            "/api/strategies/example_strategy.py/order-permission"
+        ).json()
+        assert restored["available"] is True
+        assert restored["armed"] is True
+        assert restored["running"] is False
+        disarmed = client.post(
+            "/api/strategies/example_strategy.py/disarm-orders"
+        )
+        assert disarmed.status_code == 200
+        assert disarmed.json()["armed"] is False
 
 
 def test_strategy_name_cannot_escape_workspace(tmp_path: Path) -> None:
@@ -104,9 +569,51 @@ def test_strategy_process_captures_output(tmp_path: Path) -> None:
             await asyncio.sleep(0.025)
         logs = manager.logs("once.py")
         assert any("hello from strategy" in line for line in logs["lines"])
+        assert any(
+            entry["message"] == "hello from strategy"
+            and entry["level"] == "output"
+            and entry["timestamp"]
+            for entry in logs["entries"]
+        )
         assert logs["exit_code"] == 0
 
     asyncio.run(run())
+
+
+def test_strategy_process_decodes_korean_output(tmp_path: Path) -> None:
+    async def run() -> None:
+        paths = workspace(tmp_path / "workspace")
+        paths.ensure()
+        manager = StrategyManager(paths)
+        await manager.save("korean.py", "print('전략 연결 확인', flush=True)\n")
+        await manager.start("korean.py")
+        for _ in range(40):
+            if not manager.details("korean.py")["running"]:
+                break
+            await asyncio.sleep(0.025)
+        logs = manager.logs("korean.py")
+        assert "전략 연결 확인" in logs["lines"]
+
+    asyncio.run(run())
+
+
+def test_strategy_log_cursor_remains_monotonic_after_ring_buffer_rollover(
+    tmp_path: Path,
+) -> None:
+    paths = workspace(tmp_path / "workspace")
+    paths.ensure()
+    manager = StrategyManager(paths)
+    state = StrategyProcess(name="example_strategy.py")
+    manager._states[state.name] = state
+
+    for index in range(MAX_LOG_LINES):
+        manager._append_log(state, "output", f"old-{index}")
+    cursor = manager.logs(state.name)["next"]
+    manager._append_log(state, "output", "new-after-clear")
+
+    result = manager.logs(state.name, cursor)
+    assert result["lines"] == ["new-after-clear"]
+    assert result["next"] == cursor + 1
 
 
 def test_user_stop_is_not_reported_as_strategy_failure(tmp_path: Path) -> None:
@@ -120,8 +627,78 @@ def test_user_stop_is_not_reported_as_strategy_failure(tmp_path: Path) -> None:
         assert result["running"] is False
         assert result["stop_requested"] is True
         assert any(
-            "stopped by user" in line
+            "사용자 요청으로 전략을 중지했습니다." in line
             for line in manager.logs("running.py")["lines"]
         )
 
     asyncio.run(run())
+
+
+def test_strategy_runtime_api_requires_session_and_schedules_events(tmp_path: Path) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    with TestClient(app) as client:
+        unauthorized = client.get(
+            "/api/v1/market/quote",
+            params={"source": "missing", "code": "005930"},
+        )
+        assert unauthorized.status_code == 401
+
+        token = app.state.sessions.issue("central-scheduler.py")
+        headers = {"Authorization": f"Bearer {token}"}
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "schedule-source",
+                "app_key": "schedule-key",
+                "app_secret": "schedule-secret",
+            },
+        ).json()
+        client.post(
+            "/api/settings/accounts",
+            json={
+                "alias": "schedule-account",
+                "connection_id": connection["id"],
+                "account_number": "12345678",
+                "product_code": "01",
+            },
+        )
+        manifest = client.post(
+            "/api/v1/strategy/manifest",
+            headers=headers,
+            json={
+                "strategy_id": "central-scheduler",
+                "trading_account": "schedule-account",
+                "market_sources": {"primary": "schedule-source"},
+            },
+        )
+        assert manifest.status_code == 200
+        registered = client.post(
+            "/api/v1/strategy/schedules",
+            headers=headers,
+            json={
+                "schedules": [
+                    {
+                        "id": "one-second",
+                        "kind": "INTERVAL",
+                        "interval_seconds": 1,
+                        "aligned": True,
+                    }
+                ]
+            },
+        )
+        assert registered.status_code == 200
+        event = client.get(
+            "/api/v1/strategy/events/next",
+            headers=headers,
+            params={"timeout": 2},
+        )
+        assert event.status_code == 200
+        assert event.json()["event"]["schedule_id"] == "one-second"
+        today = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+        service_results = app.state.runtime_store.service_results(
+            today, source="central-scheduler.py"
+        )
+        assert service_results["scheduler"]["success"] >= 2
+        assert service_results["scheduler"]["last_operation"] == "deliver"

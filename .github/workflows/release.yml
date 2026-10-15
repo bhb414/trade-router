@@ -1,0 +1,41 @@
+name: Release Windows ZIP
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install and test
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -e ".[dev]"
+          python -m pytest -q
+
+      - name: Build verified release ZIP
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          python tools/build_release.py --version $version --output dist
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName }
+          gh release create "${{ github.ref_name }}" $assets --verify-tag --generate-notes --title "Trade Router ${{ github.ref_name }}"
