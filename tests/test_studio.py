@@ -609,16 +609,23 @@ def test_connection_edit_never_returns_or_replaces_api_secrets(
         ).json()
         edited = client.put(
             f"/api/settings/connections/{connection['id']}",
-            json={"label": "after", "realtime_user_id": "new-hts"},
+            json={
+                "provider": "namuh",
+                "target": "LIVE",
+                "label": "after",
+                "realtime_user_id": "new-hts",
+            },
         )
         listed = client.get("/api/settings/connections").json()
 
     assert edited.status_code == 200
     assert edited.json()["label"] == "after"
+    assert edited.json()["provider"] == "namuh"
+    assert edited.json()["target"] == "LIVE"
     assert edited.json()["has_realtime_user_id"] is True
+    assert edited.json()["realtime_user_id"] == "new-hts"
     assert "app_key" not in edited.json()
     assert "app_secret" not in edited.json()
-    assert "realtime_user_id" not in edited.json()
     assert "app_key" not in listed[0]
     assert "app_secret" not in listed[0]
     assert app.state.settings.get_credentials(connection["id"]) == {
@@ -643,6 +650,16 @@ def test_kis_account_accepts_grouped_number_and_edit_preserves_identity(
                 "app_secret": "secret",
             },
         ).json()
+        replacement = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "LIVE",
+                "label": "account-edit-replacement",
+                "app_key": "replacement-key",
+                "app_secret": "replacement-secret",
+            },
+        ).json()
         created = client.post(
             "/api/settings/accounts",
             json={
@@ -653,14 +670,21 @@ def test_kis_account_accepts_grouped_number_and_edit_preserves_identity(
         )
         edited = client.put(
             f"/api/settings/accounts/{created.json()['id']}",
-            json={"max_exposure": "150000", "sell_tax_rate": "0.0015"},
+            json={
+                "alias": "live-main",
+                "connection_id": replacement["id"],
+                "max_exposure": "150000",
+                "sell_tax_rate": "0.0015",
+            },
         )
 
     assert created.status_code == 201
     assert created.json()["product_code"] == "01"
     assert app.state.settings.get_account_number(created.json()["id"]) == "12345678"
     assert edited.status_code == 200
-    assert edited.json()["alias"] == "paper-main"
+    assert edited.json()["alias"] == "live-main"
+    assert edited.json()["connection_id"] == replacement["id"]
+    assert app.state.settings.get_account("paper-main")["alias"] == "live-main"
     assert edited.json()["risk_limits"]["max_exposure"] == "150000"
     assert edited.json()["cost_rates"]["sell_tax_rate"] == "0.0015"
     assert app.state.settings.get_account_number(created.json()["id"]) == "12345678"

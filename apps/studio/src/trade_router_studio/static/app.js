@@ -14,6 +14,8 @@ const state = {
   accounts: [],
   selectedConnectionId: null,
   selectedAccountId: null,
+  connectionFormMode: null,
+  accountFormMode: null,
   connectionStatuses: {},
   capabilities: [],
   orderPermissions: [],
@@ -1719,16 +1721,19 @@ function formatAccountNumberInput() {
 }
 
 function renderConnectionForm() {
+  const detail = document.querySelector("#connection-detail");
+  detail.hidden = state.connectionFormMode === null;
+  if (detail.hidden) return;
   const connection = state.connections.find(item => item.id === state.selectedConnectionId);
-  const editing = Boolean(connection);
+  const editing = state.connectionFormMode === "edit" && Boolean(connection);
   const provider = connection?.provider || elements.connectionProvider.value || state.providers[0]?.id || "";
   elements.connectionProvider.value = provider;
   refreshProviderFields();
   if (connection) elements.connectionTarget.value = connection.target;
   refreshConnectionRateHint();
 
-  elements.connectionProvider.disabled = editing;
-  elements.connectionTarget.disabled = editing;
+  elements.connectionProvider.disabled = false;
+  elements.connectionTarget.disabled = false;
   document.querySelector("#connection-label").value = connection?.label || "";
   const keyField = document.querySelector("#connection-key-field");
   const secretField = document.querySelector("#connection-secret-field");
@@ -1742,30 +1747,31 @@ function renderConnectionForm() {
   secretInput.value = "";
   document.querySelector("#connection-credentials-locked").hidden = !editing;
   const realtime = document.querySelector("#connection-realtime-user-id");
-  realtime.value = "";
-  realtime.placeholder = editing && connection?.has_realtime_user_id
-    ? "저장됨 · 변경할 때만 새 HTS ID 입력"
-    : "KIS 실시간 주문·체결 통보용";
+  realtime.value = editing ? connection?.realtime_user_id || "" : "";
+  realtime.placeholder = "KIS 실시간 주문·체결 통보용";
   document.querySelector("#connection-realtime-user-hint").textContent = editing
-    ? "비워두면 저장된 HTS ID를 유지합니다. App Key와 App Secret은 새 API로 다시 등록할 때만 변경할 수 있습니다."
+    ? "HTS ID를 포함한 연결 설정을 변경할 수 있습니다. App Key와 App Secret은 유지됩니다."
     : "비워두면 시세·호가 WebSocket만 사용하고 주문·체결은 REST로 확인합니다.";
   document.querySelector("#connection-form-title").textContent = editing ? connection.label : "새 API 등록";
   document.querySelector("#connection-form-description").textContent = editing
-    ? "연결 이름과 HTS ID를 변경할 수 있습니다. 인증 키는 표시하지 않습니다."
+    ? "증권사·접속 대상·이름·HTS ID를 변경할 수 있습니다. 인증 키는 표시하지 않습니다."
     : "증권사 인증정보를 새로 저장합니다.";
   document.querySelector("#connection-submit-button").textContent = editing ? "변경 저장" : "API 등록";
 }
 
 function renderAccountForm() {
+  const detail = document.querySelector("#account-detail");
+  detail.hidden = state.accountFormMode === null;
+  if (detail.hidden) return;
   const account = state.accounts.find(item => item.id === state.selectedAccountId);
-  const editing = Boolean(account);
+  const editing = state.accountFormMode === "edit" && Boolean(account);
   if (account) elements.accountConnection.value = account.connection_id;
-  elements.accountConnection.disabled = editing;
+  elements.accountConnection.disabled = false;
   const alias = document.querySelector("#account-alias");
   alias.value = account?.alias || "";
-  alias.disabled = editing;
+  alias.disabled = false;
   document.querySelector("#account-alias-hint").textContent = editing
-    ? "계좌 별칭은 전략 연결에 사용되므로 변경할 수 없습니다."
+    ? "별칭을 변경해도 기존 전략의 이전 별칭은 호환 이름으로 유지됩니다."
     : "전략에서 사용할 계좌 이름입니다.";
   const accountNumber = document.querySelector("#account-number");
   accountNumber.value = "";
@@ -1783,7 +1789,7 @@ function renderAccountForm() {
   document.querySelector("#account-sell-tax-rate").value = costs.sell_tax_rate ?? "";
   document.querySelector("#account-form-title").textContent = editing ? account.alias : "새 계좌 등록";
   document.querySelector("#account-form-description").textContent = editing
-    ? `${account.connection_label}에 연결된 계좌의 번호와 위험 한도를 편집합니다.`
+    ? "사용할 API·별칭·계좌번호·한도와 비용 설정을 편집합니다."
     : "API 연결과 거래 계좌를 연결합니다.";
   document.querySelector("#account-submit-button").textContent = editing ? "변경 저장" : "계좌 등록";
   refreshAccountFields();
@@ -1791,18 +1797,21 @@ function renderAccountForm() {
 
 function selectConnectionForEdit(connection) {
   state.selectedConnectionId = connection.id;
+  state.connectionFormMode = "edit";
   renderConnectionForm();
   renderConnectionList();
 }
 
 function selectAccountForEdit(account) {
   state.selectedAccountId = account.id;
+  state.accountFormMode = "edit";
   renderAccountForm();
   renderAccountList();
 }
 
 function startNewConnection() {
   state.selectedConnectionId = null;
+  state.connectionFormMode = "new";
   renderConnectionForm();
   renderConnectionList();
   document.querySelector("#connection-label").focus();
@@ -1810,9 +1819,24 @@ function startNewConnection() {
 
 function startNewAccount() {
   state.selectedAccountId = null;
+  state.accountFormMode = "new";
   renderAccountForm();
   renderAccountList();
   document.querySelector("#account-alias").focus();
+}
+
+function closeConnectionForm() {
+  state.connectionFormMode = null;
+  state.selectedConnectionId = null;
+  renderConnectionForm();
+  renderConnectionList();
+}
+
+function closeAccountForm() {
+  state.accountFormMode = null;
+  state.selectedAccountId = null;
+  renderAccountForm();
+  renderAccountList();
 }
 
 function renderConnectionList() {
@@ -1830,16 +1854,6 @@ function renderConnectionList() {
     const provider = selectedProvider(connection.provider);
     const item = document.createElement("div");
     item.className = `registered-item${state.selectedConnectionId === connection.id ? " active" : ""}`;
-    item.tabIndex = 0;
-    item.setAttribute("role", "button");
-    item.setAttribute("aria-label", `${connection.label} API 편집`);
-    item.addEventListener("click", () => selectConnectionForEdit(connection));
-    item.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        selectConnectionForEdit(connection);
-      }
-    });
     const information = document.createElement("div");
     information.className = "registered-copy";
     const title = document.createElement("strong");
@@ -1876,6 +1890,11 @@ function renderConnectionList() {
     rateLimitText.textContent = `${formatRateLimits(connection.rest_rate_limit, connection.websocket_rate_limit)} · API 키별 자동 관리`;
     const actions = document.createElement("div");
     actions.className = "registered-actions";
+    const edit = document.createElement("button");
+    edit.className = "button quiet compact";
+    edit.type = "button";
+    edit.textContent = "편집";
+    edit.addEventListener("click", () => selectConnectionForEdit(connection));
     const check = document.createElement("button");
     check.className = "button quiet compact";
     check.type = "button";
@@ -1893,7 +1912,7 @@ function renderConnectionList() {
       event.stopPropagation();
       removeConnection(connection);
     });
-    actions.append(check, remove);
+    actions.append(edit, check, remove);
     item.append(information, actions);
     list.append(item);
   }
@@ -1913,16 +1932,6 @@ function renderAccountList() {
   for (const account of state.accounts) {
     const item = document.createElement("div");
     item.className = `registered-item${state.selectedAccountId === account.id ? " active" : ""}`;
-    item.tabIndex = 0;
-    item.setAttribute("role", "button");
-    item.setAttribute("aria-label", `${account.alias} 계좌 편집`);
-    item.addEventListener("click", () => selectAccountForEdit(account));
-    item.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        selectAccountForEdit(account);
-      }
-    });
     const information = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = account.alias;
@@ -1956,6 +1965,11 @@ function renderAccountList() {
     information.append(permissionText);
     const actions = document.createElement("div");
     actions.className = "registered-actions";
+    const edit = document.createElement("button");
+    edit.className = "button quiet compact";
+    edit.type = "button";
+    edit.textContent = "편집";
+    edit.addEventListener("click", () => selectAccountForEdit(account));
     const permissionButton = document.createElement("button");
     permissionButton.className = `permission-toggle account-permission-toggle${permission?.armed ? " on" : ""}`;
     permissionButton.type = "button";
@@ -1988,7 +2002,7 @@ function renderAccountList() {
       event.stopPropagation();
       removeAccount(account);
     });
-    actions.append(permissionButton, remove);
+    actions.append(permissionButton, edit, remove);
     item.append(information, actions);
     list.append(item);
   }
@@ -2028,9 +2042,11 @@ function renderSettings() {
   document.querySelector("#account-form .settings-submit").disabled = !state.connections.length;
   if (state.selectedConnectionId && !state.connections.some(item => item.id === state.selectedConnectionId)) {
     state.selectedConnectionId = null;
+    state.connectionFormMode = null;
   }
   if (state.selectedAccountId && !state.accounts.some(item => item.id === state.selectedAccountId)) {
     state.selectedAccountId = null;
+    state.accountFormMode = null;
   }
   renderConnectionForm();
   renderAccountForm();
@@ -2059,12 +2075,18 @@ async function loadSettings() {
 }
 
 async function openSettings(tabName = "general") {
+  state.connectionFormMode = null;
+  state.accountFormMode = null;
+  state.selectedConnectionId = null;
+  state.selectedAccountId = null;
   await loadSettings();
   activateSettingsTab(tabName);
   elements.settingsModal.hidden = false;
   const focusTarget = tabName === "general"
     ? document.querySelector("#update-button")
-    : tabName === "apis" ? elements.connectionProvider : elements.accountConnection;
+    : tabName === "apis"
+      ? document.querySelector("#new-connection-button")
+      : document.querySelector("#new-account-button");
   window.setTimeout(() => focusTarget?.focus(), 0);
 }
 
@@ -2076,7 +2098,7 @@ async function removeConnection(connection) {
   if (!window.confirm(`${connection.label} API 등록을 삭제할까요?`)) return;
   try {
     await api(`/api/settings/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" });
-    if (state.selectedConnectionId === connection.id) state.selectedConnectionId = null;
+    if (state.selectedConnectionId === connection.id) closeConnectionForm();
     await Promise.all([loadSettings(), refreshStatus()]);
     notify("API 등록을 삭제했습니다.");
   } catch (error) { notify(error.message, true); }
@@ -2108,7 +2130,7 @@ async function removeAccount(account) {
   if (!window.confirm(`${account.alias} 계좌 등록을 삭제할까요?`)) return;
   try {
     await api(`/api/settings/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
-    if (state.selectedAccountId === account.id) state.selectedAccountId = null;
+    if (state.selectedAccountId === account.id) closeAccountForm();
     await Promise.all([loadSettings(), refreshStatus(), refreshDashboard(true)]);
     notify("계좌 등록을 삭제했습니다.");
   } catch (error) { notify(error.message, true); }
@@ -2473,6 +2495,8 @@ elements.accountConnection.addEventListener("change", refreshAccountFields);
 document.querySelector("#account-number").addEventListener("input", formatAccountNumberInput);
 document.querySelector("#new-connection-button").addEventListener("click", startNewConnection);
 document.querySelector("#new-account-button").addEventListener("click", startNewAccount);
+document.querySelector("#connection-cancel-button").addEventListener("click", closeConnectionForm);
+document.querySelector("#account-cancel-button").addEventListener("click", closeAccountForm);
 
 document.querySelector("#connection-form").addEventListener("submit", async event => {
   event.preventDefault();
@@ -2486,8 +2510,10 @@ document.querySelector("#connection-form").addEventListener("submit", async even
       result = await api(`/api/settings/connections/${encodeURIComponent(editing.id)}`, {
         method: "PUT",
         body: JSON.stringify({
+          provider: elements.connectionProvider.value,
+          target: elements.connectionTarget.value,
           label: document.querySelector("#connection-label").value,
-          realtime_user_id: document.querySelector("#connection-realtime-user-id").value || null,
+          realtime_user_id: document.querySelector("#connection-realtime-user-id").value,
         }),
       });
     } else {
@@ -2502,8 +2528,9 @@ document.querySelector("#connection-form").addEventListener("submit", async even
           realtime_user_id: document.querySelector("#connection-realtime-user-id").value,
         }),
       });
-      state.selectedConnectionId = result.id;
     }
+    state.selectedConnectionId = null;
+    state.connectionFormMode = null;
     await Promise.all([loadSettings(), refreshStatus(), refreshDashboard(true)]);
     if (editing) {
       notify("API 설정을 변경했습니다. 저장된 인증 키는 그대로 유지됩니다.");
@@ -2524,6 +2551,8 @@ document.querySelector("#account-form").addEventListener("submit", async event =
   try {
     const editing = state.accounts.find(item => item.id === state.selectedAccountId);
     const payload = {
+      connection_id: elements.accountConnection.value,
+      alias: document.querySelector("#account-alias").value,
       account_number: document.querySelector("#account-number").value || null,
       product_code: document.querySelector("#account-product-code").value || null,
       max_order_amount: positiveNumberOrNull("#account-max-order"),
@@ -2545,12 +2574,11 @@ document.querySelector("#account-form").addEventListener("submit", async event =
         method: "POST",
         body: JSON.stringify({
           ...payload,
-        connection_id: elements.accountConnection.value,
-        alias: document.querySelector("#account-alias").value,
         }),
       });
-      state.selectedAccountId = saved.id;
     }
+    state.selectedAccountId = null;
+    state.accountFormMode = null;
     await Promise.all([loadSettings(), refreshStatus(), refreshDashboard(true)]);
     notify(editing ? "계좌 설정을 변경했습니다." : "계좌를 등록했습니다.");
   } catch (error) { notify(error.message, true); }

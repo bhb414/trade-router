@@ -328,7 +328,7 @@
               </div>
               <div class="registered-list" id="connection-list"></div>
             </div>
-            <section class="settings-detail">
+            <section class="settings-detail" id="connection-detail" hidden>
               <header class="settings-detail-heading">
                 <div><strong id="connection-form-title">새 API 등록</strong><span id="connection-form-description">증권사 인증정보를 새로 저장합니다.</span></div>
               </header>
@@ -363,7 +363,10 @@
                   <input id="connection-realtime-user-id" autocomplete="off" placeholder="KIS 실시간 주문·체결 통보용">
                   <small id="connection-realtime-user-hint">비워두면 시세·호가 WebSocket만 사용하고 주문·체결은 REST로 확인합니다.</small>
                 </label>
-                <button class="button primary settings-submit" id="connection-submit-button">API 등록</button>
+                <div class="settings-form-actions">
+                  <button class="button" id="connection-cancel-button" type="button">닫기</button>
+                  <button class="button primary settings-submit" id="connection-submit-button">API 등록</button>
+                </div>
               </form>
             </section>
           </div>
@@ -382,7 +385,7 @@
               </div>
               <div class="registered-list" id="account-list"></div>
             </div>
-            <section class="settings-detail">
+            <section class="settings-detail" id="account-detail" hidden>
               <header class="settings-detail-heading">
                 <div><strong id="account-form-title">새 계좌 등록</strong><span id="account-form-description">API 연결과 거래 계좌를 연결합니다.</span></div>
               </header>
@@ -434,7 +437,10 @@
                   <input id="account-sell-tax-rate" inputmode="decimal" placeholder="증권사·시장에 맞게 입력">
                   <small>0.0015는 0.15%입니다. 비워두면 손익에 비용 미확정으로 표시합니다.</small>
                 </label>
-                <button class="button primary settings-submit" id="account-submit-button">계좌 등록</button>
+                <div class="settings-form-actions">
+                  <button class="button" id="account-cancel-button" type="button">닫기</button>
+                  <button class="button primary settings-submit" id="account-submit-button">계좌 등록</button>
+                </div>
               </form>
             </section>
           </div>

@@ -189,6 +189,11 @@ class SettingsStore:
                             "realtime_user_id"
                         )
                     ),
+                    "realtime_user_id": str(
+                        secrets["connections"].get(connection["id"], {}).get(
+                            "realtime_user_id", ""
+                        )
+                    ),
                     "rest_rate_limit": rest_rate_limit_profile(
                         str(connection["provider"]),
                         str(connection["target"]),
@@ -238,7 +243,13 @@ class SettingsStore:
             matches = [
                 item
                 for item in self._load_state()["connections"]
-                if item["id"] == clean or item["label"].casefold() == clean.casefold()
+                if item["id"] == clean
+                or item["label"].casefold() == clean.casefold()
+                or clean.casefold()
+                in {
+                    str(alias).casefold()
+                    for alias in item.get("previous_labels", [])
+                }
             ]
             if not matches:
                 raise SettingsError("API 연결을 찾을 수 없습니다.")
@@ -274,7 +285,15 @@ class SettingsStore:
 
         with self._lock:
             state = self._load_state()
-            if any(item["label"].casefold() == label.casefold() for item in state["connections"]):
+            if any(
+                item["label"].casefold() == label.casefold()
+                or label.casefold()
+                in {
+                    str(alias).casefold()
+                    for alias in item.get("previous_labels", [])
+                }
+                for item in state["connections"]
+            ):
                 raise SettingsError("같은 이름의 API 연결이 이미 있습니다.")
             connection = {
                 "id": f"api-{uuid.uuid4().hex[:12]}",
@@ -304,12 +323,21 @@ class SettingsStore:
         self,
         connection_id: str,
         *,
+        provider: str,
+        target: str,
         label: str,
         realtime_user_id: str | None = None,
     ) -> dict[str, Any]:
         """Update public connection metadata without exposing or replacing keys."""
 
+        provider = provider.strip().lower()
+        target = target.strip().upper()
         label = label.strip()
+        if provider not in PROVIDERS:
+            raise SettingsError("지원하지 않는 증권사입니다.")
+        supported_targets = {item["id"] for item in PROVIDERS[provider]["targets"]}
+        if target not in supported_targets:
+            raise SettingsError("선택한 증권사가 지원하는 접속 대상을 선택하세요.")
         if not label:
             raise SettingsError("API 연결 이름을 입력하세요.")
         with self._lock:
@@ -322,10 +350,52 @@ class SettingsStore:
                 raise SettingsError("API 연결을 찾을 수 없습니다.")
             if any(
                 item["id"] != connection_id
-                and item["label"].casefold() == label.casefold()
+                and (
+                    item["label"].casefold() == label.casefold()
+                    or label.casefold()
+                    in {
+                        str(alias).casefold()
+                        for alias in item.get("previous_labels", [])
+                    }
+                )
                 for item in state["connections"]
             ):
                 raise SettingsError("같은 이름의 API 연결이 이미 있습니다.")
+            old_label = str(connection["label"])
+            provider_changed = str(connection["provider"]) != provider
+            if provider_changed:
+                secrets = self._load_secrets()
+                for account in state["accounts"]:
+                    if account["connection_id"] != connection_id:
+                        continue
+                    saved = secrets["accounts"].get(account["id"], {})
+                    try:
+                        normalized_number, normalized_product = _normalize_account_identity(
+                            provider,
+                            str(saved.get("account_number") or ""),
+                            str(account.get("product_code") or ""),
+                        )
+                    except SettingsError as exc:
+                        raise SettingsError(
+                            "이 API를 사용하는 계좌번호가 변경할 증권사 형식과 맞지 않습니다. "
+                            "계좌를 다른 API로 옮긴 뒤 증권사를 변경하세요."
+                        ) from exc
+                    saved["account_number"] = normalized_number
+                    account["product_code"] = normalized_product
+                self._write_secrets(secrets)
+            if old_label.casefold() != label.casefold():
+                previous_labels = [
+                    str(value)
+                    for value in connection.get("previous_labels", [])
+                    if str(value).casefold() != label.casefold()
+                ]
+                if old_label and old_label.casefold() not in {
+                    value.casefold() for value in previous_labels
+                }:
+                    previous_labels.append(old_label)
+                connection["previous_labels"] = previous_labels
+            connection["provider"] = provider
+            connection["target"] = target
             connection["label"] = label
             secrets = self._load_secrets()
             credentials = secrets["connections"].get(connection_id)
@@ -339,6 +409,7 @@ class SettingsStore:
                 **connection,
                 "has_credentials": True,
                 "has_realtime_user_id": bool(credentials.get("realtime_user_id")),
+                "realtime_user_id": str(credentials.get("realtime_user_id") or ""),
                 "rest_rate_limit": rest_rate_limit_profile(
                     str(connection["provider"]), str(connection["target"])
                 ),
@@ -473,7 +544,13 @@ class SettingsStore:
                 (
                     item
                     for item in state["accounts"]
-                    if item["id"] == clean or item["alias"].casefold() == clean.casefold()
+                    if item["id"] == clean
+                    or item["alias"].casefold() == clean.casefold()
+                    or clean.casefold()
+                    in {
+                        str(alias).casefold()
+                        for alias in item.get("previous_aliases", [])
+                    }
                 ),
                 None,
             )
@@ -522,7 +599,15 @@ class SettingsStore:
             )
             if connection is None:
                 raise SettingsError("등록된 API 연결을 선택하세요.")
-            if any(item["alias"].casefold() == alias.casefold() for item in state["accounts"]):
+            if any(
+                item["alias"].casefold() == alias.casefold()
+                or alias.casefold()
+                in {
+                    str(value).casefold()
+                    for value in item.get("previous_aliases", [])
+                }
+                for item in state["accounts"]
+            ):
                 raise SettingsError("같은 별칭의 계좌가 이미 있습니다.")
             account_number, product_code = _normalize_account_identity(
                 str(connection["provider"]), account_number, product_code
@@ -564,11 +649,16 @@ class SettingsStore:
         self,
         reference: str,
         *,
+        alias: str,
+        connection_id: str,
         account_number: str | None = None,
         product_code: str | None = None,
         risk_limits: dict[str, str | int | None] | None = None,
         cost_rates: dict[str, str | None] | None = None,
     ) -> dict[str, Any]:
+        alias = alias.strip()
+        if not alias:
+            raise SettingsError("계좌 별칭을 입력하세요.")
         allowed_limits = {
             "max_order_amount",
             "max_daily_buy_amount",
@@ -597,19 +687,45 @@ class SettingsStore:
             )
             if account is None:
                 raise SettingsError("거래 계좌를 찾을 수 없습니다.")
+            if any(
+                item["id"] != account["id"]
+                and (
+                    item["alias"].casefold() == alias.casefold()
+                    or alias.casefold()
+                    in {
+                        str(value).casefold()
+                        for value in item.get("previous_aliases", [])
+                    }
+                )
+                for item in state["accounts"]
+            ):
+                raise SettingsError("같은 별칭의 계좌가 이미 있습니다.")
             connection = next(
-                item
-                for item in state["connections"]
-                if item["id"] == account["connection_id"]
+                (
+                    item
+                    for item in state["connections"]
+                    if item["id"] == connection_id
+                ),
+                None,
             )
+            if connection is None:
+                raise SettingsError("등록된 API 연결을 선택하세요.")
             secrets = self._load_secrets()
             saved_secret = secrets["accounts"].get(account["id"])
             if saved_secret is None:
                 raise SettingsError("저장된 계좌번호가 없습니다.")
-            if account_number is not None and account_number.strip():
+            connection_changed = account["connection_id"] != connection_id
+            identity_value = (
+                account_number
+                if account_number is not None and account_number.strip()
+                else str(saved_secret["account_number"])
+            )
+            if (
+                account_number is not None and account_number.strip()
+            ) or connection_changed:
                 normalized_number, normalized_product = _normalize_account_identity(
                     str(connection["provider"]),
-                    account_number,
+                    identity_value,
                     product_code if product_code is not None else account.get("product_code", ""),
                 )
                 saved_secret["account_number"] = normalized_number
@@ -622,6 +738,20 @@ class SettingsStore:
                     product_code,
                 )
                 account["product_code"] = normalized_product
+            old_alias = str(account["alias"])
+            if old_alias.casefold() != alias.casefold():
+                previous_aliases = [
+                    str(value)
+                    for value in account.get("previous_aliases", [])
+                    if str(value).casefold() != alias.casefold()
+                ]
+                if old_alias and old_alias.casefold() not in {
+                    value.casefold() for value in previous_aliases
+                }:
+                    previous_aliases.append(old_alias)
+                account["previous_aliases"] = previous_aliases
+            account["alias"] = alias
+            account["connection_id"] = connection_id
             account["risk_limits"] = {
                 key: value
                 for key, value in (risk_limits or {}).items()

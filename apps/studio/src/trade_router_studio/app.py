@@ -66,6 +66,8 @@ class ConnectionRegistration(BaseModel):
 
 
 class ConnectionUpdate(BaseModel):
+    provider: str
+    target: str
     label: str
     realtime_user_id: str | None = None
 
@@ -85,6 +87,8 @@ class AccountRegistration(BaseModel):
 
 
 class AccountUpdate(BaseModel):
+    alias: str
+    connection_id: str
     account_number: str | None = None
     product_code: str | None = None
     max_order_amount: Decimal | None = Field(default=None, gt=0)
@@ -1083,8 +1087,41 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         body: ConnectionUpdate,
     ) -> dict[str, object]:
         try:
+            existing = settings.get_connection(connection_id)
+            identity_changed = (
+                str(existing["provider"]) != body.provider.strip().lower()
+                or str(existing["target"]) != body.target.strip().upper()
+            )
+            if identity_changed:
+                active = []
+                for strategy_name, manifest in sessions.manifests().items():
+                    references = list(manifest.market_sources.values())
+                    try:
+                        account = settings.get_account(manifest.trading_account)
+                    except SettingsError:
+                        account = None
+                    uses_account = account is not None and account["connection_id"] == connection_id
+                    uses_market = False
+                    for reference in references:
+                        try:
+                            resolved = settings.resolve_connection(reference)
+                        except SettingsError:
+                            continue
+                        if resolved["id"] == connection_id:
+                            uses_market = True
+                            break
+                    if uses_account or uses_market:
+                        active.append(strategy_name)
+                if active:
+                    raise SettingsError(
+                        "이 API를 사용하는 실행 중 전략을 먼저 중지하세요: "
+                        + ", ".join(sorted(active))
+                    )
+                await connection_runtime.invalidate(connection_id)
             return settings.update_connection(
                 connection_id,
+                provider=body.provider,
+                target=body.target,
                 label=body.label,
                 realtime_user_id=body.realtime_user_id,
             )
@@ -1404,7 +1441,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             )
         manifest = StrategyManifest(
             strategy_id=body.strategy_id,
-            trading_account=body.trading_account,
+            trading_account=str(account["alias"]),
             market_sources=dict(body.market_sources),
             required_capabilities={
                 alias: tuple(values)
@@ -1434,7 +1471,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             message="전략 실행 설정을 등록했습니다.",
             details={
                 "strategy_id": body.strategy_id,
-                "trading_account": body.trading_account,
+                "trading_account": account["alias"],
                 "market_source_aliases": sorted(body.market_sources),
                 "risk_limits": {
                     key: (str(value) if isinstance(value, Decimal) else value)
@@ -2585,8 +2622,35 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         body: AccountUpdate,
     ) -> dict[str, object]:
         try:
-            return settings.update_account(
+            existing = settings.get_account(account_id)
+            identity_changed = (
+                str(existing["alias"]).casefold() != body.alias.strip().casefold()
+                or str(existing["connection_id"]) != body.connection_id
+                or bool(body.account_number and body.account_number.strip())
+                or body.product_code is not None
+            )
+            if identity_changed:
+                aliases = {
+                    str(existing["alias"]).casefold(),
+                    *{
+                        str(value).casefold()
+                        for value in existing.get("previous_aliases", [])
+                    },
+                }
+                active = [
+                    name
+                    for name, manifest in sessions.manifests().items()
+                    if manifest.trading_account.casefold() in aliases
+                ]
+                if active:
+                    raise SettingsError(
+                        "이 계좌를 사용하는 실행 중 전략을 먼저 중지하세요: "
+                        + ", ".join(sorted(active))
+                    )
+            updated = settings.update_account(
                 account_id,
+                alias=body.alias,
+                connection_id=body.connection_id,
                 account_number=body.account_number,
                 product_code=body.product_code,
                 risk_limits={
@@ -2625,6 +2689,13 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                     ),
                 },
             )
+            old_alias = str(existing["alias"])
+            new_alias = str(updated["alias"])
+            if old_alias != new_alias:
+                journal().rename_account_alias(old_alias, new_alias)
+            if identity_changed:
+                order_engine().disarm_account(new_alias)
+            return updated
         except SettingsError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

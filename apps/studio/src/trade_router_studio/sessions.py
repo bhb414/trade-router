@@ -87,6 +87,12 @@ class StrategySessionRegistry:
         with self._lock:
             return self._manifests.get(strategy_name)
 
+    def manifests(self) -> dict[str, StrategyManifest]:
+        """Return the active strategy manifests without exposing session tokens."""
+
+        with self._lock:
+            return dict(self._manifests)
+
     def strategy_names(self, strategy_id: str) -> list[str]:
         normalized = strategy_id.casefold()
         with self._lock:

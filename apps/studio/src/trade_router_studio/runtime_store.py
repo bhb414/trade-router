@@ -789,6 +789,56 @@ class RuntimeStore:
                 (scope_type, scope_id),
             )
 
+    def rename_account_alias(self, old_alias: str, new_alias: str) -> None:
+        """Move account-owned runtime history to a renamed settings alias."""
+
+        old = old_alias.strip()
+        new = new_alias.strip()
+        if not old or not new or old == new:
+            return
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE order_ledger SET account_alias = ? WHERE account_alias = ?",
+                (new, old),
+            )
+            self._connection.execute(
+                "UPDATE order_provider_ids SET account_alias = ? WHERE account_alias = ?",
+                (new, old),
+            )
+            self._connection.execute(
+                "UPDATE provider_events SET account_alias = ? WHERE account_alias = ?",
+                (new, old),
+            )
+            previous = self._connection.execute(
+                """
+                SELECT armed FROM order_permissions
+                WHERE scope_type = 'account' AND scope_id = ?
+                """,
+                (old,),
+            ).fetchone()
+            if previous is not None:
+                self._connection.execute(
+                    """
+                    INSERT INTO order_permissions(scope_type, scope_id, armed, updated_at)
+                    VALUES ('account', ?, ?, ?)
+                    ON CONFLICT(scope_type, scope_id) DO UPDATE SET
+                        armed = excluded.armed,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        new,
+                        int(previous["armed"]),
+                        datetime.now(SEOUL).isoformat(),
+                    ),
+                )
+                self._connection.execute(
+                    """
+                    DELETE FROM order_permissions
+                    WHERE scope_type = 'account' AND scope_id = ?
+                    """,
+                    (old,),
+                )
+
     def has_order_permission(self, scope_type: str, scope_id: str) -> bool:
         with self._lock:
             row = self._connection.execute(

@@ -1012,6 +1012,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border-radius: 8px;
   background: var(--panel-soft);
 }
+.settings-detail[hidden] { display: none; }
 .settings-detail-heading {
   min-height: 48px;
   display: flex;
@@ -1051,7 +1052,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .settings-form input:focus, .settings-form select:focus { border-color: #8eaeef; box-shadow: 0 0 0 3px var(--blue-soft); }
 .settings-form input:disabled, .settings-form select:disabled { background: #eef1f5; color: #667085; cursor: not-allowed; }
 .settings-form small { color: var(--muted); font-size: 10px; font-weight: 400; }
-.settings-submit { width: 100%; margin-top: 2px; }
+.settings-form-actions { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; margin-top: 2px; }
+.settings-submit { width: 100%; }
 .credential-locked-notice {
   display: grid;
   gap: 3px;
@@ -1086,14 +1088,13 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .registered-empty { padding: 48px 14px; color: var(--muted); text-align: center; font-size: 12px; }
 .registered-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   align-items: center;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 7px;
   background: white;
-  cursor: pointer;
   transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
 }
 .registered-item:hover { border-color: #aebed8; background: #fbfcff; }
@@ -1109,7 +1110,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .registered-copy > strong, .registered-item > div:first-child > strong { font-size: 13px; }
 .registered-copy > span, .registered-item > div:first-child > span { margin-top: 3px; color: var(--muted); font-size: 11px; }
 .registered-item .connection-check-status.connected { color: #087443; }
-.registered-actions { display: flex; gap: 6px; align-items: center; }
+.registered-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; }
 .registered-remove {
   height: 28px;
   padding: 0 8px;
