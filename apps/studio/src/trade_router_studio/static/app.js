@@ -10,6 +10,7 @@ const state = {
   blockConditions: [],
   blockConditionKey: null,
   blockConditionError: null,
+  blockGraphRedraw: null,
   strategySearch: "",
   dirty: false,
   strategies: [],
@@ -50,6 +51,11 @@ const elements = {
   blockCanvas: document.querySelector("#block-canvas"),
   blockSummary: document.querySelector("#block-editor-summary"),
   blockExport: document.querySelector("#block-export-button"),
+  blockZoomOut: document.querySelector("#block-zoom-out"),
+  blockZoomLabel: document.querySelector("#block-zoom-label"),
+  blockZoomIn: document.querySelector("#block-zoom-in"),
+  blockFit: document.querySelector("#block-fit"),
+  blockAutoLayout: document.querySelector("#block-auto-layout"),
   blockImportFile: document.querySelector("#block-import-file"),
   strategyCode: document.querySelector("#strategy-code"),
   strategySearch: document.querySelector("#strategy-search"),
@@ -1445,114 +1451,313 @@ function conditionJoin(text = "또는 (OR)") {
   return join;
 }
 
+const CONDITION_GRAPH_DEFAULTS = {
+  connection: { x: 70, y: 80 },
+  target: { x: 470, y: 80 },
+  buyRules: { x: 470, y: 320 },
+  buyOrder: { x: 880, y: 350 },
+  takeProfit: { x: 70, y: 650 },
+  stopLoss: { x: 420, y: 650 },
+  bollinger: { x: 770, y: 650 },
+  sellOrder: { x: 1190, y: 690 },
+  buySchedule: { x: 70, y: 1010 },
+  sellSchedule: { x: 450, y: 1010 },
+  closeSchedule: { x: 830, y: 1010 },
+};
+
+const CONDITION_GRAPH_EDGES = [
+  ["connection", "target", "대상 연결"],
+  ["target", "buyRules", "후보"],
+  ["buyRules", "buyOrder", "AND"],
+  ["takeProfit", "sellOrder", "OR"],
+  ["stopLoss", "sellOrder", "OR"],
+  ["bollinger", "sellOrder", "OR"],
+  ["buySchedule", "target", "주기"],
+  ["sellSchedule", "bollinger", "봉 마감"],
+  ["closeSchedule", "sellOrder", "장 마감"],
+];
+
+function ensureBlockLayout() {
+  if (!state.blockPackage) return null;
+  state.blockPackage.layout ||= {};
+  state.blockPackage.layout.nodes ||= {};
+  state.blockPackage.layout.viewport ||= { x: 24, y: 24, zoom: .75 };
+  const viewport = state.blockPackage.layout.viewport;
+  viewport.x = Number.isFinite(Number(viewport.x)) ? Number(viewport.x) : 24;
+  viewport.y = Number.isFinite(Number(viewport.y)) ? Number(viewport.y) : 24;
+  viewport.zoom = Math.min(2, Math.max(.4, Number(viewport.zoom) || .75));
+  return state.blockPackage.layout;
+}
+
+function blockNodePosition(id) {
+  const layout = ensureBlockLayout();
+  const saved = layout?.nodes?.[id];
+  const fallback = CONDITION_GRAPH_DEFAULTS[id] || { x: 40, y: 40 };
+  return {
+    x: Number.isFinite(Number(saved?.x)) ? Number(saved.x) : fallback.x,
+    y: Number.isFinite(Number(saved?.y)) ? Number(saved.y) : fallback.y,
+  };
+}
+
+function applyBlockViewport(world) {
+  const viewport = ensureBlockLayout()?.viewport || { x: 24, y: 24, zoom: .75 };
+  world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`;
+  elements.blockCanvas.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`;
+  elements.blockCanvas.style.backgroundSize = `${18 * viewport.zoom}px ${18 * viewport.zoom}px`;
+  if (elements.blockZoomLabel) elements.blockZoomLabel.textContent = `${Math.round(viewport.zoom * 100)}%`;
+}
+
+function drawBlockGraphEdges(world, edgeLayer) {
+  [...edgeLayer.children].forEach(child => {
+    if (child.tagName.toLowerCase() !== "defs") child.remove();
+  });
+  edgeLayer.setAttribute("viewBox", "0 0 1580 1290");
+  for (const [fromId, toId, label] of CONDITION_GRAPH_EDGES) {
+    const from = world.querySelector(`[data-block-node="${fromId}"]`);
+    const to = world.querySelector(`[data-block-node="${toId}"]`);
+    if (!from || !to) continue;
+    const x1 = from.offsetLeft + from.offsetWidth;
+    const y1 = from.offsetTop + Math.min(45, from.offsetHeight / 2);
+    const x2 = to.offsetLeft;
+    const y2 = to.offsetTop + Math.min(45, to.offsetHeight / 2);
+    const bend = Math.max(70, Math.abs(x2 - x1) * .42);
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+    path.setAttribute("class", "block-edge-path");
+    path.setAttribute("marker-end", "url(#block-edge-arrow)");
+    edgeLayer.append(path);
+    if (label) {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", String((x1 + x2) / 2));
+      text.setAttribute("y", String((y1 + y2) / 2 - 7));
+      text.setAttribute("class", "block-edge-label");
+      text.textContent = label;
+      edgeLayer.append(text);
+    }
+  }
+}
+
+function createBlockEdgeLayer() {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "block-edge-layer");
+  svg.setAttribute("aria-hidden", "true");
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+  marker.setAttribute("id", "block-edge-arrow");
+  marker.setAttribute("viewBox", "0 0 10 10");
+  marker.setAttribute("refX", "8");
+  marker.setAttribute("refY", "5");
+  marker.setAttribute("markerWidth", "6");
+  marker.setAttribute("markerHeight", "6");
+  marker.setAttribute("orient", "auto-start-reverse");
+  const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  arrow.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+  marker.append(arrow);
+  defs.append(marker);
+  svg.append(defs);
+  return svg;
+}
+
+function bindBlockNodeDrag(node, world, edgeLayer, running) {
+  const handle = node.querySelector(".strategy-block-title");
+  if (!handle || running) return;
+  handle.addEventListener("pointerdown", event => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const viewport = ensureBlockLayout().viewport;
+    const start = blockNodePosition(node.dataset.blockNode);
+    const origin = { x: event.clientX, y: event.clientY };
+    handle.setPointerCapture(event.pointerId);
+    node.classList.add("dragging");
+    const move = moveEvent => {
+      const x = start.x + (moveEvent.clientX - origin.x) / viewport.zoom;
+      const y = start.y + (moveEvent.clientY - origin.y) / viewport.zoom;
+      state.blockPackage.layout.nodes[node.dataset.blockNode] = {
+        x: Math.round(x * 10) / 10,
+        y: Math.round(y * 10) / 10,
+      };
+      node.style.left = `${x}px`;
+      node.style.top = `${y}px`;
+      drawBlockGraphEdges(world, edgeLayer);
+    };
+    const end = () => {
+      node.classList.remove("dragging");
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+      setDirty(true);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  });
+}
+
+function bindBlockCanvasPan(world) {
+  const canvas = elements.blockCanvas;
+  if (canvas._blockPanHandler) canvas.removeEventListener("pointerdown", canvas._blockPanHandler);
+  if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
+  const panHandler = event => {
+    if (event.button !== 0 || event.target.closest(".strategy-block-node")) return;
+    event.preventDefault();
+    const viewport = ensureBlockLayout().viewport;
+    const start = { x: viewport.x, y: viewport.y };
+    const origin = { x: event.clientX, y: event.clientY };
+    canvas.setPointerCapture(event.pointerId);
+    canvas.classList.add("panning");
+    const move = moveEvent => {
+      viewport.x = start.x + moveEvent.clientX - origin.x;
+      viewport.y = start.y + moveEvent.clientY - origin.y;
+      applyBlockViewport(world);
+    };
+    const end = () => {
+      canvas.classList.remove("panning");
+      canvas.removeEventListener("pointermove", move);
+      canvas.removeEventListener("pointerup", end);
+      canvas.removeEventListener("pointercancel", end);
+      setDirty(true);
+    };
+    canvas.addEventListener("pointermove", move);
+    canvas.addEventListener("pointerup", end);
+    canvas.addEventListener("pointercancel", end);
+  };
+  const wheelHandler = event => {
+    event.preventDefault();
+    const viewport = ensureBlockLayout().viewport;
+    if (event.ctrlKey || event.metaKey) {
+      const rect = canvas.getBoundingClientRect();
+      const worldX = (event.clientX - rect.left - viewport.x) / viewport.zoom;
+      const worldY = (event.clientY - rect.top - viewport.y) / viewport.zoom;
+      const next = Math.min(2, Math.max(.4, viewport.zoom * Math.exp(-event.deltaY * .0015)));
+      viewport.x = event.clientX - rect.left - worldX * next;
+      viewport.y = event.clientY - rect.top - worldY * next;
+      viewport.zoom = next;
+    } else {
+      viewport.x -= event.deltaX + (event.shiftKey ? event.deltaY : 0);
+      viewport.y -= event.shiftKey ? 0 : event.deltaY;
+    }
+    applyBlockViewport(world);
+    window.clearTimeout(canvas._blockViewDirtyTimer);
+    canvas._blockViewDirtyTimer = window.setTimeout(() => setDirty(true), 180);
+  };
+  canvas._blockPanHandler = panHandler;
+  canvas._blockWheelHandler = wheelHandler;
+  canvas.addEventListener("pointerdown", panHandler);
+  canvas.addEventListener("wheel", wheelHandler, { passive: false });
+}
+
+function setBlockZoom(nextZoom) {
+  const world = elements.blockCanvas.querySelector(".block-canvas-world");
+  if (!world || !state.blockPackage) return;
+  const viewport = ensureBlockLayout().viewport;
+  const rect = elements.blockCanvas.getBoundingClientRect();
+  const centerX = rect.width / 2;
+  const centerY = rect.height / 2;
+  const worldX = (centerX - viewport.x) / viewport.zoom;
+  const worldY = (centerY - viewport.y) / viewport.zoom;
+  viewport.zoom = Math.min(2, Math.max(.4, nextZoom));
+  viewport.x = centerX - worldX * viewport.zoom;
+  viewport.y = centerY - worldY * viewport.zoom;
+  applyBlockViewport(world);
+  setDirty(true);
+}
+
+function fitBlockGraph() {
+  const world = elements.blockCanvas.querySelector(".block-canvas-world");
+  const nodes = [...(world?.querySelectorAll(".strategy-block-node") || [])];
+  if (!world || !nodes.length || !state.blockPackage) return;
+  const minX = Math.min(...nodes.map(node => node.offsetLeft));
+  const minY = Math.min(...nodes.map(node => node.offsetTop));
+  const maxX = Math.max(...nodes.map(node => node.offsetLeft + node.offsetWidth));
+  const maxY = Math.max(...nodes.map(node => node.offsetTop + node.offsetHeight));
+  const padding = 46;
+  const zoom = Math.min(1.25, Math.max(.4, Math.min(
+    (elements.blockCanvas.clientWidth - padding * 2) / (maxX - minX),
+    (elements.blockCanvas.clientHeight - padding * 2) / (maxY - minY),
+  )));
+  const viewport = ensureBlockLayout().viewport;
+  viewport.zoom = zoom;
+  viewport.x = (elements.blockCanvas.clientWidth - (maxX - minX) * zoom) / 2 - minX * zoom;
+  viewport.y = (elements.blockCanvas.clientHeight - (maxY - minY) * zoom) / 2 - minY * zoom;
+  applyBlockViewport(world);
+  setDirty(true);
+}
+
+function resetBlockGraphLayout() {
+  if (!state.blockPackage) return;
+  state.blockPackage.layout = {
+    nodes: Object.fromEntries(Object.entries(CONDITION_GRAPH_DEFAULTS).map(([id, point]) => [id, { ...point }])),
+    viewport: { x: 24, y: 24, zoom: 1 },
+  };
+  setDirty(true);
+  renderStrategyBlocks();
+  window.requestAnimationFrame(fitBlockGraph);
+}
+
+function createGraphSectionLabel(world, text, x, y) {
+  const label = document.createElement("div");
+  label.className = "block-graph-section-label";
+  label.textContent = text;
+  label.style.left = `${x}px`;
+  label.style.top = `${y}px`;
+  world.append(label);
+}
+
 function renderConditionBollingerBlocks(parsed, running) {
   const fields = new Map(parsed.fields.map(field => [field.settingKey, field]));
   const take = (...keys) => keys.map(key => fields.get(key)).filter(Boolean);
+  const world = document.createElement("div");
+  world.className = "block-canvas-world";
+  const edgeLayer = createBlockEdgeLayer();
+  world.append(edgeLayer);
+  createGraphSectionLabel(world, "연결 · 대상", 70, 38);
+  createGraphSectionLabel(world, "조건검색 매수", 470, 278);
+  createGraphSectionLabel(world, "매도 조건 · OR", 70, 608);
+  createGraphSectionLabel(world, "실행 일정", 70, 968);
 
-  const connectionLane = createBlockLane(
-    "연결과 대상",
-    "등록된 계좌·API·HTS 조건식을 선택합니다.",
-    2,
-  );
-  connectionLane.append(createStrategyBlockNode({
-    title: "전략 연결",
-    meta: "등록 설정 사용",
-    tone: "connection",
-    fields: take("strategy_id", "trading_account", "condition_source", "hts_user_id", "route"),
-  }, running));
-  connectionLane.append(createStrategyBlockNode({
-    title: "HTS 조건검색 결과",
-    meta: state.blockConditionError
-      ? "조건식 조회 실패"
-      : `${state.blockConditions.length}개 조건식`,
-    tone: "target",
-    fields: take("condition_id"),
-    actions: ["조건검색 포함 종목만 신규 매수 후보"],
-  }, running));
-  elements.blockCanvas.append(connectionLane);
+  const nodes = [
+    { id: "connection", title: "전략 연결", meta: "계좌 · API", tone: "connection", width: 330,
+      fields: take("strategy_id", "trading_account", "condition_source", "hts_user_id", "route") },
+    { id: "target", title: "HTS 조건검색", meta: state.blockConditionError ? "조회 실패" : `${state.blockConditions.length}개`, tone: "target", width: 320,
+      fields: take("condition_id"), actions: ["검색 결과를 신규 매수 후보로 전달"] },
+    { id: "buyRules", title: "매수 조건", meta: "AND", tone: "risk", width: 340,
+      fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
+      actions: ["미보유", "미체결 없음", "가능 수량 ≥ 1", "운용 예산 이내"] },
+    { id: "buyOrder", title: "매수 주문", meta: "중앙 주문 처리", tone: "event", width: 300,
+      actions: ["멱등성 예약", "위험 검사", "시장가 매수", "상태 조정"], vertical: true },
+    { id: "takeProfit", title: "익절", meta: "평균 매수가", tone: "risk", width: 290,
+      fields: take("use_take_profit", "take_profit_multiplier") },
+    { id: "stopLoss", title: "손절", meta: "평균 매수가", tone: "risk", width: 290,
+      fields: take("use_stop_loss", "stop_loss_multiplier") },
+    { id: "bollinger", title: "볼린저 상단선 미만", meta: "완성 봉", tone: "risk", width: 340,
+      fields: take("use_bollinger_exit", "bar_interval", "bollinger_period", "bollinger_stddev") },
+    { id: "sellOrder", title: "매도 주문", meta: "OR 충족", tone: "event", width: 300,
+      actions: ["전략 소유 수량", "시장가 매도", "상태 조정"], vertical: true },
+    { id: "buySchedule", title: "조건검색 일정", meta: "정각 반복", tone: "schedule", width: 320,
+      fields: take("buy_scan_seconds", "buy_start_time", "buy_end_time") },
+    { id: "sellSchedule", title: "매도 판단 일정", meta: "봉 마감", tone: "schedule", width: 320,
+      fields: take("sell_start_time", "sell_end_time") },
+    { id: "closeSchedule", title: "장 마감 청산", meta: "정시 · 재확인", tone: "schedule", width: 360,
+      fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time") },
+  ];
 
-  const buyLane = createBlockLane(
-    "매수 흐름",
-    "조건검색 결과를 계좌와 예산 규칙으로 거른 뒤 주문합니다.",
-    2,
-  );
-  buyLane.append(createStrategyBlockNode({
-    title: "매수 조건",
-    meta: "AND",
-    tone: "risk",
-    fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
-    actions: ["미보유", "미체결 없음", "주문 가능 수량 ≥ 1", "운용 예산 이내"],
-    vertical: true,
-  }, running));
-  buyLane.append(createStrategyBlockNode({
-    title: "매수 실행",
-    meta: "중앙 주문 처리",
-    tone: "event",
-    actions: ["멱등성 키 예약", "위험 한도 확인", "시장가 매수", "주문 상태 조정"],
-    vertical: true,
-  }, running));
-  elements.blockCanvas.append(buyLane);
-
-  const sellLane = createBlockLane(
-    "매도 조건",
-    "사용 중인 조건 중 하나라도 충족하면 전략 보유 수량을 매도합니다.",
-    3,
-    "conditions",
-  );
-  sellLane.append(createStrategyBlockNode({
-    title: "익절",
-    meta: "평균 매수가 기준",
-    tone: "risk",
-    fields: take("use_take_profit", "take_profit_multiplier"),
-  }, running));
-  sellLane.append(conditionJoin());
-  sellLane.append(createStrategyBlockNode({
-    title: "손절",
-    meta: "평균 매수가 기준",
-    tone: "risk",
-    fields: take("use_stop_loss", "stop_loss_multiplier"),
-  }, running));
-  sellLane.append(conditionJoin());
-  sellLane.append(createStrategyBlockNode({
-    title: "볼린저 상단선 미만",
-    meta: "완성 봉 종가",
-    tone: "risk",
-    fields: take("use_bollinger_exit", "bar_interval", "bollinger_period", "bollinger_stddev"),
-  }, running));
-  sellLane.append(createStrategyBlockNode({
-    title: "매도 실행",
-    meta: "OR 충족",
-    tone: "event",
-    actions: ["전략 소유 수량 확인", "시장가 매도", "주문 상태 조정"],
-    vertical: true,
-  }, running));
-  elements.blockCanvas.append(sellLane);
-
-  const scheduleLane = createBlockLane(
-    "실행 일정",
-    "정각 주기·완성 봉·장 마감 일정을 중앙 스케줄러가 실행합니다.",
-    3,
-    "schedule-config",
-  );
-  scheduleLane.append(createStrategyBlockNode({
-    title: "조건검색·매수",
-    meta: "정각 맞춤 반복",
-    tone: "schedule",
-    fields: take("buy_scan_seconds", "buy_start_time", "buy_end_time"),
-  }, running));
-  scheduleLane.append(createStrategyBlockNode({
-    title: "보유종목 매도 판단",
-    meta: "완성 봉마다",
-    tone: "schedule",
-    fields: take("sell_start_time", "sell_end_time"),
-  }, running));
-  scheduleLane.append(createStrategyBlockNode({
-    title: "장 마감 청산",
-    meta: "정시·재확인",
-    tone: "schedule",
-    fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"),
-  }, running));
-  elements.blockCanvas.append(scheduleLane);
+  for (const definition of nodes) {
+    const node = createStrategyBlockNode(definition, running);
+    const point = blockNodePosition(definition.id);
+    node.classList.add("graph-node");
+    node.dataset.blockNode = definition.id;
+    node.style.width = `${definition.width}px`;
+    node.style.left = `${point.x}px`;
+    node.style.top = `${point.y}px`;
+    world.append(node);
+    bindBlockNodeDrag(node, world, edgeLayer, running);
+  }
+  elements.blockCanvas.append(world);
+  bindBlockCanvasPan(world);
+  applyBlockViewport(world);
+  state.blockGraphRedraw = () => drawBlockGraphEdges(world, edgeLayer);
+  window.requestAnimationFrame(state.blockGraphRedraw);
 }
 
 function renderStrategyBlocks() {
@@ -1561,6 +1766,10 @@ function renderStrategyBlocks() {
   const parsed = currentBlockModel();
   const running = Boolean(selectedState()?.running);
   elements.blockCanvas.replaceChildren();
+  elements.blockCanvas.classList.toggle(
+    "graph-mode",
+    parsed.template === "condition-bollinger-v1" && Boolean(state.blockPackage),
+  );
   elements.blockSummary.textContent = `${parsed.fields.length}개 설정 · ${parsed.schedules.length}개 일정 · ${parsed.handlers.length}개 실행 흐름`;
   state.blockSource = source;
 
@@ -2838,6 +3047,17 @@ elements.blockImportFile.addEventListener("change", event => {
 elements.blockExport.addEventListener("click", () => {
   exportBlockStrategy().catch(error => notify(error.message, true));
 });
+elements.blockZoomOut?.addEventListener("click", () => {
+  const zoom = ensureBlockLayout()?.viewport?.zoom || 1;
+  setBlockZoom(zoom / 1.15);
+});
+elements.blockZoomIn?.addEventListener("click", () => {
+  const zoom = ensureBlockLayout()?.viewport?.zoom || 1;
+  setBlockZoom(zoom * 1.15);
+});
+elements.blockZoomLabel?.addEventListener("click", () => setBlockZoom(1));
+elements.blockFit?.addEventListener("click", fitBlockGraph);
+elements.blockAutoLayout?.addEventListener("click", resetBlockGraphLayout);
 elements.newStrategyModal.addEventListener("click", event => {
   if (event.target === elements.newStrategyModal) closeNewStrategyModal();
 });

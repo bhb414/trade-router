@@ -103,6 +103,27 @@ class ConditionBollingerBlockSettings(BaseModel):
         return self
 
 
+class BlockNodePosition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    x: float = Field(ge=-10_000, le=10_000)
+    y: float = Field(ge=-10_000, le=10_000)
+
+
+class BlockViewport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    x: float = Field(default=24, ge=-20_000, le=20_000)
+    y: float = Field(default=24, ge=-20_000, le=20_000)
+    zoom: float = Field(default=0.75, ge=0.4, le=2)
+
+
+class BlockEditorLayout(BaseModel):
+    """Visual-only node positions. The compiler intentionally ignores them."""
+
+    model_config = ConfigDict(extra="forbid")
+    nodes: dict[str, BlockNodePosition] = Field(default_factory=dict)
+    viewport: BlockViewport = Field(default_factory=BlockViewport)
+
+
 class BlockStrategyPackage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     format: Literal[1] = 1
@@ -110,6 +131,7 @@ class BlockStrategyPackage(BaseModel):
     template: Literal[BAR_OBSERVER_TEMPLATE, CONDITION_BOLLINGER_TEMPLATE]
     name: str = Field(min_length=1, max_length=120)
     settings: BlockStrategySettings | ConditionBollingerBlockSettings
+    layout: BlockEditorLayout = Field(default_factory=BlockEditorLayout)
 
     @model_validator(mode="after")
     def validate_template_settings(self) -> "BlockStrategyPackage":
@@ -154,12 +176,31 @@ def _literal(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _render_bar_observer(settings: BlockStrategySettings) -> str:
+def _layout_literal(layout: BlockEditorLayout | None) -> str:
+    payload = (layout or BlockEditorLayout()).model_dump(mode="json")
+    return _literal(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _layout_from_constants(constants: dict[str, object]) -> BlockEditorLayout:
+    raw = constants.get("BLOCK_LAYOUT_JSON")
+    if not isinstance(raw, str) or not raw:
+        return BlockEditorLayout()
+    try:
+        return BlockEditorLayout.model_validate(json.loads(raw))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return BlockEditorLayout()
+
+
+def _render_bar_observer(
+    settings: BlockStrategySettings,
+    layout: BlockEditorLayout | None = None,
+) -> str:
     return f'''"""Trade Router가 관리하는 블록 전략 실행 파일."""
 
 from trade_router import Strategy, StrategyConfig
 
 BLOCK_TEMPLATE = "{BAR_OBSERVER_TEMPLATE}"
+BLOCK_LAYOUT_JSON = {_layout_literal(layout)}
 STRATEGY_ID = {_literal(settings.strategy_id)}
 TRADING_ACCOUNT = {_literal(settings.trading_account)}
 MARKET_SOURCE = {_literal(settings.market_source)}
@@ -201,6 +242,7 @@ from decimal import Decimal
 from trade_router import OrderStatus, RiskLimits, RouterError, Strategy, StrategyConfig, Venue
 
 BLOCK_TEMPLATE = __BLOCK_TEMPLATE__
+BLOCK_LAYOUT_JSON = __BLOCK_LAYOUT_JSON__
 STRATEGY_ID = __STRATEGY_ID__
 TRADING_ACCOUNT = __TRADING_ACCOUNT__
 CONDITION_SOURCE = __CONDITION_SOURCE__
@@ -479,9 +521,13 @@ class ManagedBlockStrategy(Strategy):
 '''
 
 
-def _render_condition_bollinger(settings: ConditionBollingerBlockSettings) -> str:
+def _render_condition_bollinger(
+    settings: ConditionBollingerBlockSettings,
+    layout: BlockEditorLayout | None = None,
+) -> str:
     replacements = {
         "__BLOCK_TEMPLATE__": _literal(CONDITION_BOLLINGER_TEMPLATE),
+        "__BLOCK_LAYOUT_JSON__": _layout_literal(layout),
         "__STRATEGY_ID__": _literal(settings.strategy_id),
         "__TRADING_ACCOUNT__": _literal(settings.trading_account),
         "__CONDITION_SOURCE__": _literal(settings.condition_source),
@@ -520,14 +566,15 @@ def compile_block_strategy(
     settings: BlockStrategySettings | ConditionBollingerBlockSettings,
     *,
     template: str | None = None,
+    layout: BlockEditorLayout | None = None,
 ) -> str:
     if isinstance(settings, ConditionBollingerBlockSettings):
         if template not in {None, CONDITION_BOLLINGER_TEMPLATE}:
             raise ValueError("Block template and settings do not match.")
-        return _render_condition_bollinger(settings)
+        return _render_condition_bollinger(settings, layout)
     if template not in {None, BAR_OBSERVER_TEMPLATE}:
         raise ValueError("Block template and settings do not match.")
-    return _render_bar_observer(settings)
+    return _render_bar_observer(settings, layout)
 
 
 # Compatibility name for older extensions. New code should use the explicit
@@ -601,7 +648,12 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
     if any(value is None for value in required.values()):
         raise ValueError("This condition/Bollinger block has unsupported fields.")
     settings = ConditionBollingerBlockSettings.model_validate(required)
-    return BlockStrategyPackage(name=name, template=CONDITION_BOLLINGER_TEMPLATE, settings=settings)
+    return BlockStrategyPackage(
+        name=name,
+        template=CONDITION_BOLLINGER_TEMPLATE,
+        settings=settings,
+        layout=_layout_from_constants(constants),
+    )
 
 
 def _bar_observer_package(name: str, tree: ast.Module, constants: dict[str, object]) -> BlockStrategyPackage:
@@ -624,7 +676,12 @@ def _bar_observer_package(name: str, tree: ast.Module, constants: dict[str, obje
     if any(value is None for value in required.values()):
         raise ValueError("This block strategy uses unsupported blocks.")
     settings = BlockStrategySettings.model_validate(required)
-    return BlockStrategyPackage(name=name, template=BAR_OBSERVER_TEMPLATE, settings=settings)
+    return BlockStrategyPackage(
+        name=name,
+        template=BAR_OBSERVER_TEMPLATE,
+        settings=settings,
+        layout=_layout_from_constants(constants),
+    )
 
 
 def block_package_from_source(name: str, source: str) -> BlockStrategyPackage:

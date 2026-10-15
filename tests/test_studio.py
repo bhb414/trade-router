@@ -258,6 +258,9 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert package["settings"]["bar_interval"] == "3m"
         assert package["settings"]["total_operating_budget"] == "150000"
         assert package["settings"]["use_take_profit"] is True
+        assert package["layout"]["viewport"]["zoom"] == 0.75
+        package["layout"]["nodes"]["target"] = {"x": 412.5, "y": 93.0}
+        package["layout"]["viewport"] = {"x": 18.0, "y": 27.0, "zoom": 0.9}
         package["settings"]["use_take_profit"] = False
         saved_package = client.put(
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package",
@@ -269,6 +272,12 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         ).json()["source"]
         assert "USE_TAKE_PROFIT = False" in compiled_block
         assert "if USE_TAKE_PROFIT and" in compiled_block
+        assert "BLOCK_LAYOUT_JSON" in compiled_block
+        saved_layout = client.get(
+            "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package"
+        ).json()["layout"]
+        assert saved_layout["nodes"]["target"] == {"x": 412.5, "y": 93.0}
+        assert saved_layout["viewport"]["zoom"] == 0.9
         package["settings"]["use_take_profit"] = True
         package["name"] = "가져온 블록 예제"
         imported = client.post("/api/strategies/import-block", json=package)

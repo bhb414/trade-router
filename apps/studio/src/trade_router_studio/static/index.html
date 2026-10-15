@@ -182,16 +182,23 @@
             </div>
             <div class="block-editor-actions">
               <span id="block-editor-summary">분석 전</span>
+              <div class="block-zoom-controls" aria-label="블록 캔버스 보기">
+                <button type="button" id="block-zoom-out" title="축소">−</button>
+                <button type="button" id="block-zoom-label" title="100%로 초기화">100%</button>
+                <button type="button" id="block-zoom-in" title="확대">＋</button>
+                <button type="button" id="block-fit" title="전체 블록 맞춤">맞춤</button>
+                <button type="button" id="block-auto-layout" title="기본 배치로 정렬">정렬</button>
+              </div>
               <button class="button quiet compact" id="block-export-button" type="button">내보내기</button>
             </div>
           </header>
           <div class="block-editor-notice" id="block-editor-notice">
             블록 전략은 이 화면에서 제공하는 블록과 필드만 편집할 수 있습니다. 실행용 코드는 Trade Router가 자동으로 관리합니다.
           </div>
-          <div class="block-canvas" id="block-canvas" aria-live="polite"></div>
+          <div class="block-canvas" id="block-canvas" aria-live="polite" tabindex="0" aria-label="블록 전략 캔버스"></div>
           <footer class="block-editor-status">
-            <span>블록 변경은 아직 초안입니다. 상단의 저장을 눌러 파일에 반영하세요.</span>
-            <span>실행 코드 자동 관리</span>
+            <span>제목줄 드래그: 블록 이동 · 빈 공간 드래그: 캔버스 이동 · Ctrl+휠: 확대/축소</span>
+            <span>연결 흐름을 실행 코드로 자동 변환</span>
           </footer>
         </section>
         <section class="strategy-code" id="strategy-code" hidden>

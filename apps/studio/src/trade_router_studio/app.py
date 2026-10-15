@@ -2795,7 +2795,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 )
             return await manager.save(
                 name,
-                compile_block_strategy(package.settings, template=package.template),
+                compile_block_strategy(
+                    package.settings,
+                    template=package.template,
+                    layout=package.layout,
+                ),
                 strategy_type="block",
             )
         except StrategyNameError as exc:
@@ -3020,7 +3024,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 ) from exc
             # Block strategies always run the server-owned template.  The browser
             # only supplies validated settings extracted from its block canvas.
-            source = compile_block_strategy(package.settings, template=package.template)
+            source = compile_block_strategy(
+                package.settings,
+                template=package.template,
+                layout=package.layout,
+            )
         try:
             return await manager.save(
                 name,
@@ -3052,6 +3060,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             source = compile_block_strategy(
                 normalized.settings,
                 template=normalized.template,
+                layout=normalized.layout,
             )
             return await manager.save(name, source)
         except StrategyNameError as exc:
