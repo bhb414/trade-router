@@ -339,7 +339,7 @@ class BlockViewport(BaseModel):
     model_config = ConfigDict(extra="forbid")
     x: float = Field(default=24, ge=-20_000, le=20_000)
     y: float = Field(default=24, ge=-20_000, le=20_000)
-    zoom: float = Field(default=0.75, ge=0.4, le=2)
+    zoom: float = Field(default=0.75, ge=0.2, le=2)
 
 
 class BlockEditorLayout(BaseModel):
@@ -529,12 +529,23 @@ BUY_CONDITIONS = tuple(json.loads(BUY_CONDITIONS_JSON))
 SELL_CONDITIONS = tuple(json.loads(SELL_CONDITIONS_JSON))
 BUY_CONDITION_GROUPS = tuple(json.loads(BUY_CONDITION_GROUPS_JSON))
 SELL_CONDITION_GROUPS = tuple(json.loads(SELL_CONDITION_GROUPS_JSON))
+BAR_METRICS = {
+    "open", "high", "low", "close", "volume", "profit_rate",
+    "bollinger_upper", "bollinger_middle", "bollinger_lower",
+}
+NEEDS_BARS = any(
+    condition.get(side) in BAR_METRICS
+    for groups in (BUY_CONDITION_GROUPS, SELL_CONDITION_GROUPS)
+    for group in groups
+    for condition in group["conditions"]
+    for side in ("left", "right")
+)
 DISCOVERY_CAPABILITY = {
     "HTS_CONDITION": "conditions",
     "RANKING": "rankings",
 }.get(TARGET_SOURCE)
 REQUIRED_CAPABILITIES = tuple(
-    item for item in (DISCOVERY_CAPABILITY, "quotes", "bars") if item
+    item for item in (DISCOVERY_CAPABILITY, "quotes", "bars" if NEEDS_BARS else None) if item
 )
 
 
@@ -688,43 +699,33 @@ class ManagedBlockStrategy(Strategy):
             return previous_left >= previous_right and left < right
         return False
 
-    def _condition_group_result(self, group, bars_by_request, *, average_price=None):
-        matched = [
-            item for item in group["conditions"]
-            if self._condition_matches(item, bars_by_request, average_price)
-        ]
-        # A condition block is OR. Every condition block must pass (AND).
-        return bool(matched), matched
-
     async def _condition_groups_result(self, ctx, code, groups, *, average_price=None, side):
         bars_by_request = {}
         fetched_counts = {}
         matched_groups = []
         for group in groups:
-            group_requests = {}
+            matched = []
             for condition in group["conditions"]:
                 for key, required in self._condition_requests(condition).items():
-                    group_requests[key] = max(group_requests.get(key, 0), required)
-            for key, required in group_requests.items():
-                if fetched_counts.get(key, 0) >= required:
-                    continue
-                try:
-                    bars_by_request[key] = await ctx.market.bars(
-                        code,
-                        key[0],
-                        count=required,
-                        venue=Venue(MARKET_VENUE),
-                        complete_only=key[1],
-                    )
-                    fetched_counts[key] = required
-                except RouterError as exc:
-                    bars_by_request[key] = ()
-                    fetched_counts[key] = required
-                    ctx.log.warning(f"{code} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
-            passed, matched = self._condition_group_result(
-                group, bars_by_request, average_price=average_price
-            )
-            if not passed:
+                    if fetched_counts.get(key, 0) >= required:
+                        continue
+                    try:
+                        bars_by_request[key] = await ctx.market.bars(
+                            code,
+                            key[0],
+                            count=required,
+                            venue=Venue(MARKET_VENUE),
+                            complete_only=key[1],
+                        )
+                        fetched_counts[key] = required
+                    except RouterError as exc:
+                        bars_by_request[key] = ()
+                        fetched_counts[key] = required
+                        ctx.log.warning(f"{code} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
+                if self._condition_matches(condition, bars_by_request, average_price):
+                    matched.append(condition)
+                    break
+            if not matched:
                 return False, matched_groups
             matched_groups.append(matched)
         return True, matched_groups

@@ -675,6 +675,7 @@ button:disabled { cursor: default; opacity: .45; }
 .strategy-block-field select:disabled,
 .strategy-block-field textarea:disabled { background: #eef0f3; color: #7c8798; }
 .block-condition-editor { display: grid; gap: 7px; padding: 9px 10px 10px; border-top: 1px solid #dfe3e8; }
+.block-condition-evaluation-hint { margin: 0; color: #697586; font-size: 9px; line-height: 1.45; }
 .block-condition-row { overflow: hidden; border: 1px solid #c8ced8; border-radius: 6px; background: white; }
 .block-condition-expression { display: grid; grid-template-columns: minmax(0, 1fr) 84px minmax(0, 1fr); gap: 5px; padding: 7px; }
 .block-condition-control,

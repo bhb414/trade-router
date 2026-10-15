@@ -212,7 +212,7 @@ function cloneBlockLayout(layout) {
     viewport: {
       x: Number.isFinite(Number(viewport.x)) ? Number(viewport.x) : 24,
       y: Number.isFinite(Number(viewport.y)) ? Number(viewport.y) : 24,
-      zoom: Math.min(2, Math.max(.4, Number(viewport.zoom) || .75)),
+      zoom: Math.min(2, Math.max(.2, Number(viewport.zoom) || .75)),
     },
   };
 }
@@ -1528,7 +1528,7 @@ const BLOCK_CONDITION_METRICS = [
   ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
   ["volume", "거래량"], ["bollinger_upper", "볼린저 상단"],
   ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
-  ["average_price", "평균 매수가"], ["profit_rate", "수익률(%)"],
+  ["average_price", "평균 매수가"], ["profit_rate", "평균가 대비 수익률(%)"],
 ];
 
 const BLOCK_CONDITION_OPERATORS = [
@@ -1700,7 +1700,7 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
   if (metric === "profit_rate") {
     const hint = document.createElement("span");
     hint.className = "block-condition-operand-hint";
-    hint.textContent = "선택한 봉의 종가와 평균 매수가로 계산합니다.";
+    hint.textContent = "선택한 봉의 종가와 평균 매수가로 계산하며 수수료·세금은 포함하지 않습니다.";
     panel.append(hint);
   }
   return panel;
@@ -1715,6 +1715,10 @@ function createConditionEditor(kind, groupIndex, disabled) {
     ? BLOCK_CONDITION_METRICS.filter(([key]) => !["average_price", "profit_rate"].includes(key))
     : BLOCK_CONDITION_METRICS;
   const rightMetrics = [...metrics, ["value", "직접 값"]];
+  const evaluationHint = document.createElement("p");
+  evaluationHint.className = "block-condition-evaluation-hint";
+  evaluationHint.textContent = "위에서부터 확인하며 하나가 충족되면 다음 AND 조건 블록으로 진행합니다.";
+  wrap.append(evaluationHint);
   rows.forEach((condition, index) => {
     const row = document.createElement("div");
     row.className = "block-condition-row";
@@ -2079,7 +2083,7 @@ function ensureBlockLayout() {
   const viewport = state.blockPackage.layout.viewport;
   viewport.x = Number.isFinite(Number(viewport.x)) ? Number(viewport.x) : 24;
   viewport.y = Number.isFinite(Number(viewport.y)) ? Number(viewport.y) : 24;
-  viewport.zoom = Math.min(2, Math.max(.4, Number(viewport.zoom) || .75));
+  viewport.zoom = Math.min(2, Math.max(.2, Number(viewport.zoom) || .75));
   return state.blockPackage.layout;
 }
 
@@ -2299,7 +2303,7 @@ function bindBlockCanvasPan(world) {
       const rect = canvas.getBoundingClientRect();
       const worldX = (event.clientX - rect.left - viewport.x) / viewport.zoom;
       const worldY = (event.clientY - rect.top - viewport.y) / viewport.zoom;
-      const next = Math.min(2, Math.max(.4, viewport.zoom * Math.exp(-event.deltaY * .0015)));
+      const next = Math.min(2, Math.max(.2, viewport.zoom * Math.exp(-event.deltaY * .0015)));
       viewport.x = event.clientX - rect.left - worldX * next;
       viewport.y = event.clientY - rect.top - worldY * next;
       viewport.zoom = next;
@@ -2326,7 +2330,7 @@ function setBlockZoom(nextZoom) {
   const centerY = rect.height / 2;
   const worldX = (centerX - viewport.x) / viewport.zoom;
   const worldY = (centerY - viewport.y) / viewport.zoom;
-  viewport.zoom = Math.min(2, Math.max(.4, nextZoom));
+  viewport.zoom = Math.min(2, Math.max(.2, nextZoom));
   viewport.x = centerX - worldX * viewport.zoom;
   viewport.y = centerY - worldY * viewport.zoom;
   applyBlockViewport(world);
@@ -2342,7 +2346,7 @@ function fitBlockGraph() {
   const maxX = Math.max(...nodes.map(node => node.offsetLeft + node.offsetWidth));
   const maxY = Math.max(...nodes.map(node => node.offsetTop + node.offsetHeight));
   const padding = 46;
-  const zoom = Math.min(1.25, Math.max(.4, Math.min(
+  const zoom = Math.min(1.25, Math.max(.2, Math.min(
     (elements.blockCanvas.clientWidth - padding * 2) / (maxX - minX),
     (elements.blockCanvas.clientHeight - padding * 2) / (maxY - minY),
   )));

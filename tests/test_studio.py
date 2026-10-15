@@ -309,8 +309,7 @@ def test_managed_block_keeps_or_conditions_inside_and_groups_across_timeframes()
     first = package.settings.buy_condition_groups[0].conditions[0]
     assert (first.left_bar_interval, first.right_bar_interval) == ("1m", "3m")
     assert len(package.settings.buy_condition_groups[0].conditions) == 2
-    assert "A condition block is OR. Every condition block must pass (AND)." in source
-    assert "group_requests[key] = max" in source
+    assert "if self._condition_matches(condition, bars_by_request, average_price):" in source
     assert "for group in groups:" in source
 
 
@@ -363,6 +362,71 @@ def test_managed_block_only_fetches_data_for_reached_and_groups() -> None:
 
     assert passed is False
     assert market.calls == [("1m", 1)]
+
+
+def test_managed_block_stops_after_the_first_matching_or_condition() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    groups = (
+        {
+            "id": "or-group",
+            "conditions": (
+                BlockTradeCondition(
+                    left="close", operator="GT", right="value", value=Decimal("0"),
+                    left_bar_interval="1m",
+                ).model_dump(mode="json"),
+                BlockTradeCondition(
+                    left="close", operator="GT", right="bollinger_upper",
+                    left_bar_interval="1m", right_bar_interval="1m",
+                    right_bollinger_period=55,
+                ).model_dump(mode="json"),
+            ),
+        },
+    )
+
+    class Market:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        async def bars(self, code, interval, **kwargs):
+            self.calls.append((interval, kwargs["count"]))
+            return [SimpleNamespace(
+                open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+                close=Decimal("100"), volume=Decimal("1000"),
+            )]
+
+    market = Market()
+    context = SimpleNamespace(
+        market=market,
+        log=SimpleNamespace(warning=lambda message: None),
+    )
+    passed, matched = asyncio.run(
+        strategy._condition_groups_result(context, "005930", groups, side="매수")
+    )
+
+    assert passed is True
+    assert len(matched[0]) == 1
+    assert market.calls == [("1m", 1)]
+
+
+def test_managed_block_does_not_require_bars_for_account_only_conditions() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = []
+    payload["sell_condition_groups"] = [{
+        "id": "account-only",
+        "conditions": [BlockTradeCondition(
+            left="average_price", operator="GT", right="value", value=Decimal("0")
+        ).model_dump(mode="json")],
+    }]
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+
+    assert namespace["NEEDS_BARS"] is False
+    assert "bars" not in namespace["ManagedBlockStrategy"].config.required_capabilities["primary"]
 
 
 def test_legacy_bar_block_package_still_round_trips() -> None:
@@ -512,7 +576,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert len(package["settings"]["sell_condition_groups"]) == 1
         assert package["layout"]["viewport"]["zoom"] == 0.75
         package["layout"]["nodes"]["target"] = {"x": 412.5, "y": 93.0}
-        package["layout"]["viewport"] = {"x": 18.0, "y": 27.0, "zoom": 0.9}
+        package["layout"]["viewport"] = {"x": 18.0, "y": 27.0, "zoom": 0.2}
         package["settings"]["target_source"] = "RANKING"
         package["settings"]["ranking_kind"] = "TRADING_VALUE"
         package["settings"]["buy_order_type"] = "LIMIT"
@@ -546,7 +610,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package"
         ).json()["layout"]
         assert saved_layout["nodes"]["target"] == {"x": 412.5, "y": 93.0}
-        assert saved_layout["viewport"]["zoom"] == 0.9
+        assert saved_layout["viewport"]["zoom"] == 0.2
         package["name"] = "가져온 블록 예제"
         imported = client.post("/api/strategies/import-block", json=package)
         assert imported.status_code == 200
