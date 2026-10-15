@@ -5,6 +5,7 @@ import hashlib
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
@@ -21,6 +22,7 @@ from trade_router import (
 from trade_router_studio.app import _strategy_performance, create_app
 from trade_router_studio.block_packages import (
     BAR_OBSERVER_TEMPLATE,
+    DEFAULT_CONDITION_BOLLINGER_SETTINGS,
     BlockStrategySettings,
     block_package_from_source,
     render_block_strategy,
@@ -125,6 +127,32 @@ def test_workspace_preserves_a_user_edited_block_example(tmp_path: Path) -> None
     paths.ensure()
 
     assert block_example.read_text(encoding="utf-8") == source
+
+
+def test_managed_block_compiles_generic_comparisons() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    bars = [
+        SimpleNamespace(
+            open=Decimal(str(100 + index)), high=Decimal(str(102 + index)),
+            low=Decimal(str(99 + index)), close=Decimal(str(101 + index)),
+            volume=Decimal(str(1_000 + index)),
+        )
+        for index in range(60)
+    ]
+    assert strategy._conditions_match(
+        ({"left": "close", "operator": "GT", "right": "value", "value": "150"},),
+        "ALL", bars,
+    )
+    assert strategy._conditions_match(
+        ({"left": "profit_rate", "operator": "GTE", "right": "value", "value": "3"},),
+        "ALL", bars, Decimal("150"),
+    )
+    assert strategy._required_bar_count((
+        {"left": "close", "operator": "CROSS_UP", "right": "bollinger_upper", "left_offset": 0, "right_offset": 0},
+    )) == DEFAULT_CONDITION_BOLLINGER_SETTINGS.bollinger_period + 1
 
 
 def test_legacy_bar_block_package_still_round_trips() -> None:
@@ -258,10 +286,19 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert package["settings"]["bar_interval"] == "3m"
         assert package["settings"]["total_operating_budget"] == "150000"
         assert package["settings"]["use_take_profit"] is True
+        assert package["settings"]["target_source"] == "HTS_CONDITION"
+        assert package["settings"]["buy_order_type"] == "MARKET"
+        assert len(package["settings"]["sell_conditions"]) == 3
         assert package["layout"]["viewport"]["zoom"] == 0.75
         package["layout"]["nodes"]["target"] = {"x": 412.5, "y": 93.0}
         package["layout"]["viewport"] = {"x": 18.0, "y": 27.0, "zoom": 0.9}
-        package["settings"]["use_take_profit"] = False
+        package["settings"]["target_source"] = "RANKING"
+        package["settings"]["ranking_kind"] = "TRADING_VALUE"
+        package["settings"]["buy_order_type"] = "LIMIT"
+        package["settings"]["buy_conditions"] = [{
+            "left": "close", "operator": "CROSS_UP", "right": "bollinger_upper",
+            "value": "0", "left_offset": 0, "right_offset": 0,
+        }]
         saved_package = client.put(
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package",
             json=package,
@@ -270,15 +307,17 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         compiled_block = client.get(
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py"
         ).json()["source"]
-        assert "USE_TAKE_PROFIT = False" in compiled_block
-        assert "if USE_TAKE_PROFIT and" in compiled_block
+        assert 'TARGET_SOURCE = "RANKING"' in compiled_block
+        assert 'RANKING_KIND = "TRADING_VALUE"' in compiled_block
+        assert 'BUY_ORDER_TYPE = "LIMIT"' in compiled_block
+        assert '"CROSS_UP"' in compiled_block
+        compile(compiled_block, "<managed-block>", "exec")
         assert "BLOCK_LAYOUT_JSON" in compiled_block
         saved_layout = client.get(
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package"
         ).json()["layout"]
         assert saved_layout["nodes"]["target"] == {"x": 412.5, "y": 93.0}
         assert saved_layout["viewport"]["zoom"] == 0.9
-        package["settings"]["use_take_profit"] = True
         package["name"] = "가져온 블록 예제"
         imported = client.post("/api/strategies/import-block", json=package)
         assert imported.status_code == 200

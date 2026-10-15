@@ -645,7 +645,8 @@ button:disabled { cursor: default; opacity: .45; }
 .strategy-block-field:first-child { border-top: 0; }
 .strategy-block-field label { color: #596579; font-size: 10px; font-weight: 700; }
 .strategy-block-field input,
-.strategy-block-field select {
+.strategy-block-field select,
+.strategy-block-field textarea {
   width: 100%;
   min-width: 0;
   height: 29px;
@@ -658,10 +659,33 @@ button:disabled { cursor: default; opacity: .45; }
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+.strategy-block-field textarea { height: auto; min-height: 58px; padding: 7px 8px; resize: vertical; }
 .strategy-block-field input:focus,
-.strategy-block-field select:focus { border-color: #7d9cd9; box-shadow: 0 0 0 3px rgba(36, 99, 235, .12); }
+.strategy-block-field select:focus,
+.strategy-block-field textarea:focus { border-color: #7d9cd9; box-shadow: 0 0 0 3px rgba(36, 99, 235, .12); }
 .strategy-block-field input:disabled,
-.strategy-block-field select:disabled { background: #eef0f3; color: #7c8798; }
+.strategy-block-field select:disabled,
+.strategy-block-field textarea:disabled { background: #eef0f3; color: #7c8798; }
+.block-condition-editor { display: grid; gap: 7px; padding: 9px 10px 10px; border-top: 1px solid #dfe3e8; }
+.block-condition-row { overflow: hidden; border: 1px solid #c8ced8; border-radius: 6px; background: white; }
+.block-condition-expression { display: grid; grid-template-columns: minmax(0, 1fr) 84px minmax(0, 1fr); gap: 5px; padding: 7px; }
+.block-condition-control,
+.block-condition-detail input {
+  min-width: 0;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid #c3cad4;
+  border-radius: 5px;
+  background: #fbfcfd;
+  color: #344054;
+  font-size: 10px;
+}
+.block-condition-detail { display: flex; align-items: center; gap: 5px; padding: 0 7px 7px; color: #697586; font-size: 9px; }
+.block-condition-detail input { width: 52px; }
+.block-condition-remove { margin-left: auto; border: 0; background: transparent; color: #9a5060; font-size: 9px; cursor: pointer; }
+.block-condition-remove:disabled { opacity: .38; cursor: default; }
+.block-condition-add { justify-self: start; }
+.block-condition-empty { margin: 0; padding: 5px 2px; color: #697586; font-size: 10px; line-height: 1.45; }
 .block-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 10px; }
 .block-flow.vertical { flex-direction: column; align-items: stretch; flex-wrap: nowrap; }
 .block-flow.vertical .block-flow-arrow { align-self: center; line-height: 1; }

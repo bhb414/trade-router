@@ -751,10 +751,16 @@ const BLOCK_CONSTANT_META = {
   STRATEGY_ID: ["general", "전략 ID"],
   TRADING_ACCOUNT: ["connection", "거래 계좌"],
   MARKET_SOURCE: ["connection", "시세 연결"],
-  CONDITION_SOURCE: ["connection", "조건검색 연결"],
+  CONDITION_SOURCE: ["connection", "종목·시세 데이터 연결"],
+  TARGET_SOURCE: ["target", "종목 데이터 방식"],
   HTS_USER_ID: ["connection", "HTS 사용자 ID"],
   CONDITION_ID: ["target", "조건식 ID"],
   EXPECTED_CONDITION_NAME: ["target", "조건식 이름"],
+  RANKING_KIND: ["target", "순위 종류"],
+  RANKING_VENUE: ["target", "조회 시장"],
+  RANKING_MARKET: ["target", "시장 구분"],
+  RANKING_LIMIT: ["target", "상위 종목 수"],
+  SYMBOLS: ["target", "지정 종목"],
   SYMBOL: ["target", "종목 코드"],
   CODE: ["target", "종목 코드"],
   ACTIVE_DATE: ["schedule", "실행 날짜"],
@@ -780,6 +786,10 @@ const BLOCK_CONSTANT_META = {
   CLOSE_RETRY_END: ["schedule", "청산 재확인 종료"],
   CLOSE_CONFIRM_TIME: ["schedule", "최종 확인 시각"],
   ORDER_ROUTE: ["connection", "주문 경로"],
+  BUY_ORDER_TYPE: ["risk", "매수 주문 방식"],
+  SELL_ORDER_TYPE: ["risk", "매도 주문 방식"],
+  BUY_CONDITION_LOGIC: ["risk", "매수 조건 결합"],
+  SELL_CONDITION_LOGIC: ["risk", "매도 조건 결합"],
 };
 
 const BLOCK_CATEGORY_META = {
@@ -1035,7 +1045,7 @@ function parseStrategyBlocks(source) {
 
   if (template === "condition-bollinger-v1") {
     const schedulePresentation = {
-      "condition-scan": ["조건검색 매수", "설정한 초 간격·정각 맞춤"],
+      "condition-scan": ["종목 조회·매수", "설정한 초 간격·정각 맞춤"],
       "bollinger-sell": ["보유종목 매도", "완성 봉마다"],
       "close-all": ["장 마감 전량 청산", "지정 시각"],
       "close-retry": ["청산 재확인", "30초 간격"],
@@ -1051,15 +1061,15 @@ function parseStrategyBlocks(source) {
       {
         id: "workflow:buy",
         name: "30초 주기",
-        title: "조건검색 매수",
+        title: "종목 조회·매수",
         vertical: true,
         actions: [
-          "조건검색 결과 조회",
+          "종목 데이터 조회",
           "잔고·미체결 확인",
           "보유·주문 종목 제외",
           "주문 가능 수량 계산",
           "종목당·총 운용 예산 확인",
-          "시장가 매수",
+          "선택한 방식으로 매수",
         ],
       },
       {
@@ -1070,9 +1080,9 @@ function parseStrategyBlocks(source) {
         actions: [
           "전략 보유종목 확인",
           "완성 봉 조회",
-          "볼린저·익절·손절 계산",
-          "매도 조건 분기",
-          "시장가 매도",
+          "가격·지표 값 계산",
+          "AND·OR 조건 비교",
+          "선택한 방식으로 매도",
         ],
       },
       {
@@ -1116,6 +1126,7 @@ function formatBlockFieldValue(field, value) {
 const BLOCK_PACKAGE_FIELD_TYPES = {
   bar_count: "number",
   max_new_buys_per_scan: "number",
+  ranking_limit: "number",
   bollinger_period: "number",
   buy_scan_seconds: "number",
   buy_budget_per_symbol: "decimal",
@@ -1126,6 +1137,7 @@ const BLOCK_PACKAGE_FIELD_TYPES = {
   use_bollinger_exit: "boolean",
   use_take_profit: "boolean",
   use_stop_loss: "boolean",
+  symbols: "symbols",
 };
 
 const BLOCK_PACKAGE_SOURCE_NAMES = {
@@ -1139,8 +1151,13 @@ function packageFieldSourceName(key) {
 function blockPackageFields() {
   const settings = state.blockPackage?.settings;
   if (!settings) return [];
+  const custom = new Set(["buy_conditions", "sell_conditions"]);
+  const legacy = new Set([
+    "use_bollinger_exit", "use_take_profit", "use_stop_loss",
+    "take_profit_multiplier", "stop_loss_multiplier",
+  ]);
   return Object.entries(settings)
-    .filter(([key]) => key !== "expected_condition_name")
+    .filter(([key]) => key !== "expected_condition_name" && !custom.has(key) && !legacy.has(key))
     .map(([settingKey, value]) => {
       const sourceName = packageFieldSourceName(settingKey);
       const [category, label] = genericConstantMeta(sourceName);
@@ -1178,9 +1195,10 @@ function blockFieldOptions(field) {
     return state.connections
       .filter(connection => {
         if (field.settingKey === "market_source") return true;
-        return Boolean(state.capabilities.find(item => (
-          item.connection_id === connection.id && item.conditions
-        )));
+        const capability = state.capabilities.find(item => item.connection_id === connection.id);
+        if (settings.target_source === "HTS_CONDITION") return Boolean(capability?.conditions);
+        if (settings.target_source === "RANKING") return Boolean(capability?.rankings);
+        return Boolean(capability?.quotes && capability?.bars);
       })
       .map(connection => ({
         value: connection.label,
@@ -1213,6 +1231,43 @@ function blockFieldOptions(field) {
       : ["KRX", "NXT", "SOR", "AUTO"];
     return routes.map(route => ({ value: route, label: route }));
   }
+  if (field.settingKey === "target_source") {
+    return [
+      { value: "HTS_CONDITION", label: "HTS 조건검색" },
+      { value: "RANKING", label: "시장 순위검색" },
+      { value: "SYMBOLS", label: "지정 종목" },
+    ];
+  }
+  if (field.settingKey === "ranking_kind") {
+    return [
+      { value: "HTS_VIEW", label: "조회 순위" },
+      { value: "VOLUME", label: "거래량 순위" },
+      { value: "TRADING_VALUE", label: "거래대금 순위" },
+      { value: "RISE", label: "상승률 순위" },
+    ];
+  }
+  if (field.settingKey === "ranking_venue") {
+    return ["KRX", "NXT", "INTEGRATED"].map(value => ({ value, label: value }));
+  }
+  if (field.settingKey === "ranking_market") {
+    return [
+      { value: "ALL", label: "전체" },
+      { value: "KOSPI", label: "코스피" },
+      { value: "KOSDAQ", label: "코스닥" },
+    ];
+  }
+  if (["buy_order_type", "sell_order_type"].includes(field.settingKey)) {
+    return [
+      { value: "MARKET", label: "시장가" },
+      { value: "LIMIT", label: "현재가 지정가" },
+    ];
+  }
+  if (["buy_condition_logic", "sell_condition_logic"].includes(field.settingKey)) {
+    return [
+      { value: "ALL", label: "모두 충족 (AND)" },
+      { value: "ANY", label: "하나 이상 (OR)" },
+    ];
+  }
   if (field.settingKey === "bar_interval") {
     return ["1m", "3m", "5m", "10m", "15m", "30m", "1h", "1d", "1w"]
       .map(value => ({ value, label: value }));
@@ -1231,6 +1286,9 @@ function normalizeBlockPackageValue(field, value) {
     const normalized = String(value).trim();
     if (!/^-?\d+(?:\.\d+)?$/.test(normalized)) throw new Error(`${field.label}에 숫자를 입력하세요.`);
     return normalized;
+  }
+  if (field.type === "symbols") {
+    return [...new Set(String(value).split(/[\s,]+/).map(item => item.trim().toUpperCase()).filter(Boolean))];
   }
   return String(value);
 }
@@ -1272,6 +1330,14 @@ function applyBlockFieldEdit(fieldId, value) {
     } else if (field.settingKey === "condition_id") {
       const selected = state.blockConditions.find(item => item.id === normalized);
       state.blockPackage.settings.expected_condition_name = selected?.name || "";
+    } else if (field.settingKey === "target_source") {
+      state.blockConditions = [];
+      state.blockConditionKey = null;
+      state.blockConditionError = null;
+      refreshBlockConditions().catch(error => {
+        state.blockConditionError = error.message;
+        renderStrategyBlocks();
+      });
     }
     setDirty(true);
     renderStrategyBlocks();
@@ -1317,6 +1383,11 @@ function createBlockFieldControl(field, disabled) {
       control.append(option);
     }
     control.value = String(field.value);
+  } else if (field.type === "symbols") {
+    control = document.createElement("textarea");
+    control.rows = 3;
+    control.placeholder = "005930, 000660";
+    control.value = Array.isArray(field.value) ? field.value.join(", ") : String(field.value || "");
   } else {
     control = document.createElement("input");
     control.type = field.type === "date" ? "date" : ["number", "decimal"].includes(field.type) ? "number" : "text";
@@ -1375,6 +1446,135 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [],
   return node;
 }
 
+const BLOCK_CONDITION_METRICS = [
+  ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
+  ["volume", "거래량"], ["bollinger_upper", "볼린저 상단"],
+  ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
+  ["average_price", "평균 매수가"], ["profit_rate", "수익률(%)"],
+];
+
+const BLOCK_CONDITION_OPERATORS = [
+  ["LT", "<"], ["LTE", "≤"], ["GT", ">"], ["GTE", "≥"], ["EQ", "="],
+  ["CROSS_UP", "상향돌파"], ["CROSS_DOWN", "하향돌파"],
+];
+
+function conditionSelect(items, value, disabled, onChange) {
+  const select = document.createElement("select");
+  select.className = "block-condition-control";
+  for (const [key, label] of items) {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = label;
+    select.append(option);
+  }
+  select.value = value;
+  select.disabled = disabled;
+  select.addEventListener("change", event => onChange(event.currentTarget.value));
+  return select;
+}
+
+function updateBlockCondition(kind, index, key, value) {
+  const rows = state.blockPackage?.settings?.[`${kind}_conditions`];
+  if (!Array.isArray(rows) || !rows[index]) return;
+  rows[index][key] = ["left_offset", "right_offset"].includes(key)
+    ? Math.max(0, Number.parseInt(value, 10) || 0)
+    : key === "value" ? String(value || "0") : value;
+  setDirty(true);
+  renderStrategyBlocks();
+}
+
+function createConditionEditor(kind, disabled) {
+  const wrap = document.createElement("div");
+  wrap.className = "block-condition-editor";
+  const rows = state.blockPackage?.settings?.[`${kind}_conditions`] || [];
+  const rightMetrics = [...BLOCK_CONDITION_METRICS, ["value", "직접 값"]];
+  rows.forEach((condition, index) => {
+    const row = document.createElement("div");
+    row.className = "block-condition-row";
+    const top = document.createElement("div");
+    top.className = "block-condition-expression";
+    top.append(
+      conditionSelect(BLOCK_CONDITION_METRICS, condition.left, disabled, value => updateBlockCondition(kind, index, "left", value)),
+      conditionSelect(BLOCK_CONDITION_OPERATORS, condition.operator, disabled, value => updateBlockCondition(kind, index, "operator", value)),
+      conditionSelect(rightMetrics, condition.right, disabled, value => updateBlockCondition(kind, index, "right", value)),
+    );
+    const detail = document.createElement("div");
+    detail.className = "block-condition-detail";
+    const leftOffset = document.createElement("input");
+    leftOffset.type = "number";
+    leftOffset.min = "0";
+    leftOffset.max = "200";
+    leftOffset.value = condition.left_offset ?? 0;
+    leftOffset.title = "왼쪽 값의 N봉 전";
+    leftOffset.disabled = disabled;
+    leftOffset.addEventListener("change", event => updateBlockCondition(kind, index, "left_offset", event.currentTarget.value));
+    const leftLabel = document.createElement("span");
+    leftLabel.textContent = "봉 전";
+    detail.append(leftOffset, leftLabel);
+    if (condition.right === "value") {
+      const value = document.createElement("input");
+      value.type = "number";
+      value.step = "any";
+      value.value = condition.value ?? "0";
+      value.title = "비교할 값";
+      value.disabled = disabled;
+      value.addEventListener("change", event => updateBlockCondition(kind, index, "value", event.currentTarget.value));
+      const valueLabel = document.createElement("span");
+      valueLabel.textContent = "비교값";
+      detail.append(value, valueLabel);
+    } else {
+      const rightOffset = document.createElement("input");
+      rightOffset.type = "number";
+      rightOffset.min = "0";
+      rightOffset.max = "200";
+      rightOffset.value = condition.right_offset ?? 0;
+      rightOffset.title = "오른쪽 값의 N봉 전";
+      rightOffset.disabled = disabled;
+      rightOffset.addEventListener("change", event => updateBlockCondition(kind, index, "right_offset", event.currentTarget.value));
+      const rightLabel = document.createElement("span");
+      rightLabel.textContent = "봉 전";
+      detail.append(rightOffset, rightLabel);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "block-condition-remove";
+    remove.textContent = "삭제";
+    remove.disabled = disabled || (kind === "sell" && rows.length <= 1);
+    remove.addEventListener("click", () => {
+      rows.splice(index, 1);
+      setDirty(true);
+      renderStrategyBlocks();
+    });
+    detail.append(remove);
+    row.append(top, detail);
+    wrap.append(row);
+    if (index < rows.length - 1) wrap.append(conditionJoin(
+      state.blockPackage.settings[`${kind}_condition_logic`] === "ALL" ? "그리고 (AND)" : "또는 (OR)"
+    ));
+  });
+  if (!rows.length) {
+    const empty = document.createElement("p");
+    empty.className = "block-condition-empty";
+    empty.textContent = "추가 조건 없음 · 종목 데이터에 들어온 종목을 바로 주문 후보로 사용합니다.";
+    wrap.append(empty);
+  }
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "button quiet compact block-condition-add";
+  add.textContent = "+ 조건 추가";
+  add.disabled = disabled || rows.length >= 20;
+  add.addEventListener("click", () => {
+    rows.push({
+      left: "close", operator: kind === "buy" ? "GT" : "LT",
+      right: "bollinger_upper", value: "0", left_offset: 0, right_offset: 0,
+    });
+    setDirty(true);
+    renderStrategyBlocks();
+  });
+  wrap.append(add);
+  return wrap;
+}
+
 function createBlockLane(title, description, count, className = "") {
   const lane = document.createElement("section");
   lane.className = `block-lane ${className}`.trim();
@@ -1396,6 +1596,13 @@ function createBlockLane(title, description, count, className = "") {
 async function refreshBlockConditions() {
   if (state.blockPackage?.template !== "condition-bollinger-v1") return;
   const settings = state.blockPackage.settings;
+  if ((settings.target_source || "HTS_CONDITION") !== "HTS_CONDITION") {
+    state.blockConditions = [];
+    state.blockConditionKey = null;
+    state.blockConditionError = null;
+    renderStrategyBlocks();
+    return;
+  }
   const connection = state.connections.find(item => (
     item.id === settings.condition_source || item.label === settings.condition_source
   ));
@@ -1421,6 +1628,45 @@ async function refreshBlockConditions() {
   renderStrategyBlocks();
 }
 
+function normalizeManagedBlockSettings(settings) {
+  if (!settings) return settings;
+  settings.target_source ||= "HTS_CONDITION";
+  settings.ranking_kind ||= "RISE";
+  settings.ranking_venue ||= "KRX";
+  settings.ranking_market ||= "ALL";
+  settings.ranking_limit ??= 20;
+  settings.symbols = Array.isArray(settings.symbols) ? settings.symbols : [];
+  settings.buy_condition_logic ||= "ALL";
+  settings.buy_conditions = Array.isArray(settings.buy_conditions) ? settings.buy_conditions : [];
+  settings.sell_condition_logic ||= "ANY";
+  if (!Array.isArray(settings.sell_conditions) || !settings.sell_conditions.length) {
+    settings.sell_conditions = [];
+    if (settings.use_take_profit !== false) {
+      settings.sell_conditions.push({
+        left: "profit_rate", operator: "GTE", right: "value",
+        value: String((Number(settings.take_profit_multiplier || 1.03) - 1) * 100),
+        left_offset: 0, right_offset: 0,
+      });
+    }
+    if (settings.use_stop_loss !== false) {
+      settings.sell_conditions.push({
+        left: "profit_rate", operator: "LTE", right: "value",
+        value: String((Number(settings.stop_loss_multiplier || .97) - 1) * 100),
+        left_offset: 0, right_offset: 0,
+      });
+    }
+    if (settings.use_bollinger_exit !== false) {
+      settings.sell_conditions.push({
+        left: "close", operator: "LT", right: "bollinger_upper",
+        value: "0", left_offset: 0, right_offset: 0,
+      });
+    }
+  }
+  settings.buy_order_type ||= "MARKET";
+  settings.sell_order_type ||= "MARKET";
+  return settings;
+}
+
 async function loadBlockEditorData(name) {
   const [blockPackage, providers, connections, accounts, capabilities] = await Promise.all([
     api(`/api/strategies/${encodeURIComponent(name)}/block-package`),
@@ -1430,6 +1676,7 @@ async function loadBlockEditorData(name) {
     api("/api/system/capabilities"),
   ]);
   state.blockPackage = blockPackage;
+  normalizeManagedBlockSettings(state.blockPackage.settings);
   state.providers = providers;
   state.connections = connections;
   state.accounts = accounts;
@@ -1454,26 +1701,24 @@ function conditionJoin(text = "또는 (OR)") {
 const CONDITION_GRAPH_DEFAULTS = {
   connection: { x: 70, y: 80 },
   target: { x: 470, y: 80 },
-  buyRules: { x: 470, y: 320 },
-  buyOrder: { x: 880, y: 350 },
-  takeProfit: { x: 70, y: 650 },
-  stopLoss: { x: 420, y: 650 },
-  bollinger: { x: 770, y: 650 },
-  sellOrder: { x: 1190, y: 690 },
-  buySchedule: { x: 70, y: 1010 },
-  sellSchedule: { x: 450, y: 1010 },
-  closeSchedule: { x: 830, y: 1010 },
+  buyConditions: { x: 850, y: 80 },
+  buyRules: { x: 470, y: 470 },
+  buyOrder: { x: 900, y: 500 },
+  sellConditions: { x: 70, y: 760 },
+  sellOrder: { x: 650, y: 800 },
+  buySchedule: { x: 70, y: 1150 },
+  sellSchedule: { x: 450, y: 1150 },
+  closeSchedule: { x: 830, y: 1150 },
 };
 
 const CONDITION_GRAPH_EDGES = [
-  ["connection", "target", "대상 연결"],
-  ["target", "buyRules", "후보"],
+  ["connection", "target", "데이터 연결"],
+  ["target", "buyConditions", "종목 목록"],
+  ["buyConditions", "buyRules", "조건 통과"],
   ["buyRules", "buyOrder", "AND"],
-  ["takeProfit", "sellOrder", "OR"],
-  ["stopLoss", "sellOrder", "OR"],
-  ["bollinger", "sellOrder", "OR"],
+  ["sellConditions", "sellOrder", "조건 통과"],
   ["buySchedule", "target", "주기"],
-  ["sellSchedule", "bollinger", "봉 마감"],
+  ["sellSchedule", "sellConditions", "봉 마감"],
   ["closeSchedule", "sellOrder", "장 마감"],
 ];
 
@@ -1511,7 +1756,7 @@ function drawBlockGraphEdges(world, edgeLayer) {
   [...edgeLayer.children].forEach(child => {
     if (child.tagName.toLowerCase() !== "defs") child.remove();
   });
-  edgeLayer.setAttribute("viewBox", "0 0 1580 1290");
+  edgeLayer.setAttribute("viewBox", "0 0 1580 1450");
   for (const [fromId, toId, label] of CONDITION_GRAPH_EDGES) {
     const from = world.querySelector(`[data-block-node="${fromId}"]`);
     const to = world.querySelector(`[data-block-node="${toId}"]`);
@@ -1707,34 +1952,45 @@ function createGraphSectionLabel(world, text, x, y) {
 function renderConditionBollingerBlocks(parsed, running) {
   const fields = new Map(parsed.fields.map(field => [field.settingKey, field]));
   const take = (...keys) => keys.map(key => fields.get(key)).filter(Boolean);
+  const settings = state.blockPackage.settings;
+  const targetFields = settings.target_source === "RANKING"
+    ? take("target_source", "ranking_kind", "ranking_venue", "ranking_market", "ranking_limit")
+    : settings.target_source === "SYMBOLS"
+      ? take("target_source", "symbols")
+      : take("target_source", "hts_user_id", "condition_id");
+  const targetLabels = {
+    HTS_CONDITION: "HTS 조건검색",
+    RANKING: "시장 순위검색",
+    SYMBOLS: "지정 종목",
+  };
   const world = document.createElement("div");
   world.className = "block-canvas-world";
   const edgeLayer = createBlockEdgeLayer();
   world.append(edgeLayer);
-  createGraphSectionLabel(world, "연결 · 대상", 70, 38);
-  createGraphSectionLabel(world, "조건검색 매수", 470, 278);
-  createGraphSectionLabel(world, "매도 조건 · OR", 70, 608);
-  createGraphSectionLabel(world, "실행 일정", 70, 968);
+  createGraphSectionLabel(world, "연결 · 종목 데이터", 70, 38);
+  createGraphSectionLabel(world, "매수 판단 · 주문", 470, 428);
+  createGraphSectionLabel(world, "보유종목 매도 판단", 70, 718);
+  createGraphSectionLabel(world, "실행 일정", 70, 1108);
 
   const nodes = [
     { id: "connection", title: "전략 연결", meta: "계좌 · API", tone: "connection", width: 330,
-      fields: take("strategy_id", "trading_account", "condition_source", "hts_user_id", "route") },
-    { id: "target", title: "HTS 조건검색", meta: state.blockConditionError ? "조회 실패" : `${state.blockConditions.length}개`, tone: "target", width: 320,
-      fields: take("condition_id"), actions: ["검색 결과를 신규 매수 후보로 전달"] },
+      fields: take("strategy_id", "trading_account", "condition_source", "route") },
+    { id: "target", title: targetLabels[settings.target_source] || "종목 데이터", meta: settings.target_source === "HTS_CONDITION"
+      ? (state.blockConditionError ? "조회 실패" : `${state.blockConditions.length}개 조건식`) : "재사용 가능", tone: "target", width: 330,
+      fields: targetFields, actions: ["조회 결과를 종목 목록으로 전달"] },
+    { id: "buyConditions", title: "매수 추가 조건", meta: settings.buy_conditions.length
+      ? `${settings.buy_conditions.length}개 · ${settings.buy_condition_logic}` : "조건 없이 통과", tone: "risk", width: 430,
+      fields: take("buy_condition_logic", "bar_interval", "bollinger_period", "bollinger_stddev"), conditionKind: "buy" },
     { id: "buyRules", title: "매수 조건", meta: "AND", tone: "risk", width: 340,
       fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
       actions: ["미보유", "미체결 없음", "가능 수량 ≥ 1", "운용 예산 이내"] },
     { id: "buyOrder", title: "매수 주문", meta: "중앙 주문 처리", tone: "event", width: 300,
-      actions: ["멱등성 예약", "위험 검사", "시장가 매수", "상태 조정"], vertical: true },
-    { id: "takeProfit", title: "익절", meta: "평균 매수가", tone: "risk", width: 290,
-      fields: take("use_take_profit", "take_profit_multiplier") },
-    { id: "stopLoss", title: "손절", meta: "평균 매수가", tone: "risk", width: 290,
-      fields: take("use_stop_loss", "stop_loss_multiplier") },
-    { id: "bollinger", title: "볼린저 상단선 미만", meta: "완성 봉", tone: "risk", width: 340,
-      fields: take("use_bollinger_exit", "bar_interval", "bollinger_period", "bollinger_stddev") },
-    { id: "sellOrder", title: "매도 주문", meta: "OR 충족", tone: "event", width: 300,
-      actions: ["전략 소유 수량", "시장가 매도", "상태 조정"], vertical: true },
-    { id: "buySchedule", title: "조건검색 일정", meta: "정각 반복", tone: "schedule", width: 320,
+      fields: take("buy_order_type"), actions: ["멱등성 예약", "위험 검사", "주문 제출", "상태 조정"], vertical: true },
+    { id: "sellConditions", title: "매도 조건", meta: `${settings.sell_conditions.length}개 · ${settings.sell_condition_logic}`, tone: "risk", width: 500,
+      fields: take("sell_condition_logic"), conditionKind: "sell" },
+    { id: "sellOrder", title: "매도 주문", meta: "조건 충족", tone: "event", width: 300,
+      fields: take("sell_order_type"), actions: ["전략 소유 수량", "주문 제출", "상태 조정"], vertical: true },
+    { id: "buySchedule", title: "종목 조회 일정", meta: "정각 반복", tone: "schedule", width: 320,
       fields: take("buy_scan_seconds", "buy_start_time", "buy_end_time") },
     { id: "sellSchedule", title: "매도 판단 일정", meta: "봉 마감", tone: "schedule", width: 320,
       fields: take("sell_start_time", "sell_end_time") },
@@ -1744,6 +2000,7 @@ function renderConditionBollingerBlocks(parsed, running) {
 
   for (const definition of nodes) {
     const node = createStrategyBlockNode(definition, running);
+    if (definition.conditionKind) node.append(createConditionEditor(definition.conditionKind, running));
     const point = blockNodePosition(definition.id);
     node.classList.add("graph-node");
     node.dataset.blockNode = definition.id;
