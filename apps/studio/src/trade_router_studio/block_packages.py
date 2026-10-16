@@ -477,7 +477,7 @@ from datetime import datetime, time
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from trade_router import OrderStatus, RankingKind, RiskLimits, RouterError, Strategy, StrategyConfig, Venue
+from trade_router import OrderStatus, RankingKind, RiskLimits, RouterError, ScheduleKind, Strategy, StrategyConfig, Venue
 
 BLOCK_TEMPLATE = __BLOCK_TEMPLATE__
 BLOCK_LAYOUT_JSON = __BLOCK_LAYOUT_JSON__
@@ -578,7 +578,10 @@ class ManagedBlockStrategy(Strategy):
             codes = list(SYMBOLS)
             label = "지정 종목"
         unique = list(dict.fromkeys(code.strip().upper() for code in codes if code.strip()))
-        ctx.log.info(f"{label} {len(unique)}종목 · 신규 매수 후보를 확인합니다.")
+        code_text = ", ".join(unique) if unique else "없음"
+        ctx.log.info(
+            f"{label} {len(unique)}종목 [{code_text}] · 신규 매수 후보를 확인합니다."
+        )
         return unique
 
     @staticmethod
@@ -1055,13 +1058,21 @@ class ManagedBlockStrategy(Strategy):
         tracked, _, pending_codes = await self._refresh_live_positions(ctx, balance, open_orders)
         submitted = 0
         for code in candidate_codes:
-            if code in held_codes or code in pending_codes or code in tracked:
+            if code in pending_codes:
+                ctx.log.info(f"{code} 매수 제외: 계좌에 미체결 주문이 있습니다.")
+                continue
+            if code in held_codes:
+                ctx.log.info(f"{code} 매수 제외: 현재 계좌에 보유 중입니다.")
+                continue
+            if code in tracked:
+                ctx.log.info(f"{code} 매수 제외: 전략 소유 종목으로 추적 중입니다.")
                 continue
             if BUY_CONDITION_GROUPS:
                 passed, _ = await self._condition_groups_result(
                     ctx, code, BUY_CONDITION_GROUPS, side="매수"
                 )
                 if not passed:
+                    ctx.log.info(f"{code} 매수 제외: 매수 조건 블록을 통과하지 못했습니다.")
                     continue
             limit_price = None
             try:

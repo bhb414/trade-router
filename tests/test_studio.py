@@ -19,6 +19,7 @@ from trade_router import (
     InstrumentId,
     OrderStatus,
     Position,
+    ScheduleKind,
     TokenScopeKey,
 )
 from trade_router_studio.app import _strategy_performance, create_app
@@ -715,6 +716,7 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
     source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
     namespace: dict[str, object] = {}
     exec(compile(source, "<managed-block>", "exec"), namespace)
+    assert namespace["ScheduleKind"] is ScheduleKind
     strategy = namespace["ManagedBlockStrategy"]()
 
     values: dict[str, object] = {
