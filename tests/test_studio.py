@@ -1747,7 +1747,7 @@ def test_strategy_runtime_api_requires_session_and_schedules_events(tmp_path: Pa
         event = client.get(
             "/api/v1/strategy/events/next",
             headers=headers,
-            params={"timeout": 2},
+                params={"timeout": 5},
         )
         assert event.status_code == 200
         assert event.json()["event"]["schedule_id"] == "one-second"

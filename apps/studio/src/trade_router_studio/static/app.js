@@ -897,7 +897,7 @@ function renderAccountBalanceModal() {
   if (state.accountBalanceTab === "trades") {
     const performance = account.trade_performance || {};
     const metrics = document.createElement("div");
-    metrics.className = "strategy-performance-grid account-modal-metrics";
+    metrics.className = "strategy-performance-grid account-modal-metrics account-trade-metrics";
     metrics.append(
       metricCard("실현 손익", performance.realized_profit, { signed: true }),
       metricCard("평가 손익", performance.unrealized_profit, { signed: true }),
