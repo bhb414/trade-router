@@ -12,6 +12,7 @@ from pathlib import Path
 import time
 from typing import Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -50,6 +51,9 @@ from .settings import SettingsError, SettingsStore
 from .sessions import StrategyManifest, StrategySession, StrategySessionRegistry
 from .strategies import StrategyManager, StrategyNameError
 from .updates import check_for_update, prepare_update
+
+
+SEOUL = ZoneInfo("Asia/Seoul")
 
 
 class StrategySource(BaseModel):
@@ -660,7 +664,7 @@ def _unfilled_buy_reservations(rows: list[dict[str, object]]) -> Decimal:
 def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     workspace = paths or WorkspacePaths.discover()
     instance_id = uuid4().hex
-    instance_started_at = datetime.now().astimezone()
+    instance_started_at = datetime.now(SEOUL)
     sessions = StrategySessionRegistry()
     scheduler = RuntimeScheduler()
     strategy_events = StrategyEventBus()
@@ -853,7 +857,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 for item in order_engine().permission_snapshot()
             }
             request_state = await connection_runtime.request_status()
-            business_date = datetime.now().astimezone().date().isoformat()
+            business_date = datetime.now(SEOUL).date().isoformat()
 
             # Multiple aliases may refer to the same real broker account. Fetch
             # and total that account once while keeping every alias visible.
@@ -1176,7 +1180,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             account_result["events"] = [
                 {
                     "id": f"account-{index}",
-                    "occurred_at": item.get("as_of") or datetime.now().astimezone().isoformat(),
+                    "occurred_at": item.get("as_of") or datetime.now(SEOUL).isoformat(),
                     "source": item.get("alias"),
                     "operation": "balance",
                     "outcome": "error" if item["state"] == "error" else "success",
@@ -1296,7 +1300,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 }
             )
 
-            generated_at = datetime.now().astimezone().isoformat()
+            generated_at = datetime.now(SEOUL).isoformat()
             dashboard_cache = {
                 "generated_at": generated_at,
                 "summary": {
@@ -1359,7 +1363,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             "instance_id": instance_id,
             "instance_started_at": instance_started_at.isoformat(),
             "workspace": str(workspace.root),
-            "server_time": datetime.now().astimezone().isoformat(),
+            "server_time": datetime.now(SEOUL).isoformat(),
             "running": sum(1 for item in strategies if item["running"]),
             "strategy_count": len(strategies),
             "broker_connections": connection_runtime.connected_count(),
@@ -3223,7 +3227,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         risk_limits = dict(
             manifest.risk_limits if manifest is not None else parsed["risk_limits"]
         )
-        business_date = datetime.now().astimezone().date().isoformat()
+        business_date = datetime.now(SEOUL).date().isoformat()
         orders = (
             journal().orders(strategy_id=str(strategy_id), limit=1_000)
             if strategy_id
@@ -3366,7 +3370,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             ]
         return {
             "name": name,
-            "generated_at": datetime.now().astimezone().isoformat(),
+            "generated_at": datetime.now(SEOUL).isoformat(),
             "running": bool(process["running"]),
             "started_at": process.get("started_at"),
             "runtime_managed": bool(process.get("runtime_managed")),
