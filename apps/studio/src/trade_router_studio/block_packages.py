@@ -475,6 +475,7 @@ _CONDITION_BOLLINGER_SOURCE = '''"""Trade Router가 관리하는 종목 데이�
 import json
 from datetime import datetime, time
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from trade_router import OrderStatus, RankingKind, RiskLimits, RouterError, Strategy, StrategyConfig, Venue
 
@@ -523,6 +524,7 @@ CLOSE_RETRY_START = __CLOSE_RETRY_START__
 CLOSE_RETRY_END = __CLOSE_RETRY_END__
 CLOSE_CONFIRM_TIME = __CLOSE_CONFIRM_TIME__
 ORDER_ROUTE = __ORDER_ROUTE__
+SEOUL = ZoneInfo("Asia/Seoul")
 
 SYMBOLS = tuple(json.loads(SYMBOLS_JSON))
 BUY_CONDITIONS = tuple(json.loads(BUY_CONDITIONS_JSON))
@@ -843,7 +845,7 @@ class ManagedBlockStrategy(Strategy):
 
     @staticmethod
     def _sell_window_is_open(at):
-        local_time = at.astimezone().time().replace(tzinfo=None)
+        local_time = at.astimezone(SEOUL).time().replace(tzinfo=None)
         return time.fromisoformat(SELL_START_TIME) <= local_time < time.fromisoformat(SELL_END_TIME)
 
     async def on_start(self, ctx):
@@ -928,7 +930,7 @@ class ManagedBlockStrategy(Strategy):
                     f"실시간 익절·손절 초기화 보류 [{exc.code.value}]: {exc.message} · 다음 조회에서 재시도합니다."
                 )
 
-        now = datetime.now().astimezone()
+        now = datetime.now(SEOUL)
         local_time = now.time().replace(tzinfo=None)
         if time.fromisoformat(CLOSE_TIME) <= local_time < time.fromisoformat(CLOSE_RETRY_END):
             await self._liquidate_owned_positions(ctx, now, reason="장 마감 청산 시각 이후 시작 보완")
@@ -1170,7 +1172,15 @@ class ManagedBlockStrategy(Strategy):
             if order.status is not OrderStatus.REJECTED:
                 self._live_sell_pending.add(code)
             price_text = f" {limit_price}원" if limit_price is not None else ""
-            ctx.log.info(f"{code} {sell_reason} · {SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}")
+            decision_time = (
+                f"완성봉 마감 {event.scheduled_at:%H:%M:%S}"
+                if event.kind is ScheduleKind.BAR_CLOSE
+                else f"판단 시각 {event.scheduled_at:%H:%M:%S}"
+            )
+            ctx.log.info(
+                f"{code} {decision_time} · {sell_reason} · "
+                f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
+            )
             if order.status is OrderStatus.FILLED:
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
