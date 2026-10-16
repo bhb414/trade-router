@@ -238,6 +238,7 @@ class Position:
     average_price: Decimal
     market_price: Decimal | None = None
     strategy_quantity: Decimal | None = None
+    name: str | None = None
 
     def __post_init__(self) -> None:
         if min(self.quantity, self.available_quantity, self.average_price) < 0:

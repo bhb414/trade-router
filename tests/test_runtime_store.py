@@ -224,3 +224,29 @@ def test_runtime_store_aggregates_service_results_by_strategy(tmp_path: Path) ->
         assert events["market"][0]["details"]["code"] == "005930"
     finally:
         store.close()
+
+
+def test_runtime_store_remembers_latest_instrument_names(tmp_path: Path) -> None:
+    path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(path)
+    try:
+        store.remember_instrument_names(
+            {"005930": "삼성전자", "000660": "SK하이닉스"},
+            source="kis-live",
+        )
+        store.remember_instrument_names(
+            {"005930": "삼성전자"},
+            source="balance",
+        )
+        assert store.instrument_names() == {
+            "000660": "SK하이닉스",
+            "005930": "삼성전자",
+        }
+    finally:
+        store.close()
+
+    reopened = RuntimeStore(path)
+    try:
+        assert reopened.instrument_names()["005930"] == "삼성전자"
+    finally:
+        reopened.close()

@@ -177,6 +177,13 @@ class RuntimeStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(scope_type, scope_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS instrument_names (
+                    code TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source TEXT,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             # Existing user databases predate the diagnostic message column.
@@ -391,6 +398,44 @@ class RuntimeStore:
             }
             for row in rows
         ]
+
+    def remember_instrument_names(
+        self,
+        names: dict[str, str],
+        *,
+        source: str | None = None,
+    ) -> None:
+        """Persist safe display names learned from broker responses."""
+
+        normalized = {
+            str(code).strip().upper(): str(name).strip()
+            for code, name in names.items()
+            if str(code).strip() and str(name).strip()
+        }
+        if not normalized:
+            return
+        updated_at = datetime.now(SEOUL).isoformat()
+        with self._lock, self._connection:
+            self._connection.executemany(
+                """
+                INSERT INTO instrument_names(code, name, source, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name = excluded.name,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (code, name, source, updated_at)
+                    for code, name in normalized.items()
+                ],
+            )
+
+    def instrument_names(self) -> dict[str, str]:
+        rows = self._fetchall(
+            "SELECT code, name FROM instrument_names ORDER BY updated_at ASC"
+        )
+        return {str(row["code"]): str(row["name"]) for row in rows}
 
     def service_results(
         self,

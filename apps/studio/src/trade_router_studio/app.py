@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime
 from decimal import Decimal
+import json
 import os
 from pathlib import Path
 import time
@@ -320,12 +321,117 @@ def _service_result_rows(
     return rows
 
 
+def _workspace_instrument_names(
+    workspace: WorkspacePaths,
+    strategy_name: str | None = None,
+) -> dict[str, str]:
+    """Read display names persisted by managed strategies without executing code."""
+
+    state_root = workspace.data / "strategy-state"
+    if strategy_name:
+        safe_name = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in strategy_name
+        )
+        paths = [state_root / f"{safe_name}.json"]
+    else:
+        paths = list(state_root.glob("*.json")) if state_root.is_dir() else []
+    names: dict[str, str] = {}
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        values = payload.get("instrument_names", {}) if isinstance(payload, dict) else {}
+        if not isinstance(values, dict):
+            continue
+        names.update(
+            {
+                str(code).strip().upper(): str(name).strip()
+                for code, name in values.items()
+                if str(code).strip() and str(name).strip()
+            }
+        )
+    return names
+
+
+def _matched_sale_results(
+    orders: list[dict[str, object]],
+) -> dict[int, dict[str, object]]:
+    """Match filled sells to weighted strategy cost at each execution."""
+
+    positions: dict[str, dict[str, Decimal | bool]] = {}
+    results: dict[int, dict[str, object]] = {}
+    for row in sorted(orders, key=lambda item: str(item.get("created_at") or "")):
+        request = dict(row.get("request") or {})
+        code = str(request.get("code") or "")
+        side = str(request.get("side") or "")
+        quantity = Decimal(str(row.get("filled_quantity") or "0"))
+        price_value = row.get("average_fill_price")
+        if not code or quantity <= 0 or price_value in {None, ""}:
+            continue
+        price = Decimal(str(price_value))
+        commission = Decimal(str(row.get("commission") or "0"))
+        tax = Decimal(str(row.get("tax") or "0"))
+        position = positions.setdefault(
+            code,
+            {
+                "quantity": Decimal("0"),
+                "cost": Decimal("0"),
+                "costs_complete": True,
+            },
+        )
+        if side == "BUY":
+            position["quantity"] = Decimal(str(position["quantity"])) + quantity
+            position["cost"] = (
+                Decimal(str(position["cost"])) + quantity * price + commission
+            )
+            position["costs_complete"] = bool(position["costs_complete"]) and bool(
+                row.get("costs_complete", False)
+            )
+            continue
+        if side != "SELL":
+            continue
+        held_quantity = Decimal(str(position["quantity"]))
+        matched = min(quantity, held_quantity)
+        if matched <= 0:
+            continue
+        average_cost = Decimal(str(position["cost"])) / held_quantity
+        matched_ratio = matched / quantity
+        net_proceeds = (quantity * price - commission - tax) * matched_ratio
+        cost_basis = average_cost * matched
+        profit = net_proceeds - cost_basis
+        return_percent = (
+            profit / cost_basis * Decimal("100") if cost_basis > 0 else None
+        )
+        results[id(row)] = {
+            "matched_quantity": str(matched),
+            "cost_basis": str(cost_basis),
+            "net_proceeds": str(net_proceeds),
+            "realized_profit": str(profit),
+            "return_percent": (
+                str(return_percent.quantize(Decimal("0.01")))
+                if return_percent is not None
+                else None
+            ),
+            "costs_complete": bool(position["costs_complete"])
+            and bool(row.get("costs_complete", False)),
+        }
+        position["quantity"] = held_quantity - matched
+        position["cost"] = Decimal(str(position["cost"])) - cost_basis
+        if Decimal(str(position["quantity"])) <= 0:
+            position["costs_complete"] = True
+    return results
+
+
 def _strategy_performance(
     orders: list[dict[str, object]],
     account: dict[str, object] | None,
+    instrument_names: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Calculate strategy P/L from router-owned fills and normalized costs."""
 
+    names = instrument_names or {}
     positions: dict[str, dict[str, Decimal]] = {}
     realized = Decimal("0")
     bought = Decimal("0")
@@ -443,6 +549,7 @@ def _strategy_performance(
         position_rows.append(
             {
                 "code": code,
+                "name": names.get(code),
                 "quantity": str(quantity),
                 "available_quantity": str(available),
                 "average_price": str(average_cost),
@@ -496,18 +603,24 @@ def _strategy_trade_history(
     orders: list[dict[str, object]],
     *,
     limit: int = 200,
+    instrument_names: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     """Return presentation-safe strategy order history without provider secrets."""
 
+    names = instrument_names or {}
+    sale_results = _matched_sale_results(orders)
     rows: list[dict[str, object]] = []
     for row in orders[:limit]:
         request = dict(row.get("request") or {})
+        code = str(request.get("code") or "")
+        sale = sale_results.get(id(row), {})
         rows.append(
             {
                 "id": row.get("id"),
                 "created_at": row.get("created_at"),
                 "updated_at": row.get("updated_at"),
-                "code": request.get("code"),
+                "code": code,
+                "name": names.get(code),
                 "side": request.get("side"),
                 "order_type": request.get("order_type"),
                 "quantity": request.get("quantity"),
@@ -516,6 +629,12 @@ def _strategy_trade_history(
                 "status": row.get("status"),
                 "commission": row.get("commission"),
                 "tax": row.get("tax"),
+                "matched_quantity": sale.get("matched_quantity"),
+                "cost_basis": sale.get("cost_basis"),
+                "net_proceeds": sale.get("net_proceeds"),
+                "realized_profit": sale.get("realized_profit"),
+                "return_percent": sale.get("return_percent"),
+                "profit_costs_complete": sale.get("costs_complete"),
                 "message": row.get("message"),
             }
         )
@@ -779,6 +898,8 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             }
 
             unresolved_rows = journal().unresolved_orders()
+            known_names = journal().instrument_names()
+            known_names.update(_workspace_instrument_names(workspace))
             account_rows: list[dict[str, object]] = []
             total_assets = Decimal("0")
             total_cash = Decimal("0")
@@ -796,6 +917,17 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 market_value = Decimal("0")
                 cost_basis = Decimal("0")
                 if balance is not None:
+                    broker_names = {
+                        position.instrument.code: position.name
+                        for position in balance.positions
+                        if position.name
+                    }
+                    if broker_names:
+                        known_names.update(broker_names)
+                        journal().remember_instrument_names(
+                            broker_names,
+                            source=str(key[1]),
+                        )
                     for position in balance.positions:
                         price = position.market_price
                         if price is None or price <= 0:
@@ -839,6 +971,62 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                         message = (
                             error.message if isinstance(error, RouterError) else str(error)
                         ) or "잔고를 조회하지 못했습니다."
+                    position_rows = (
+                        [
+                            {
+                                "code": position.instrument.code,
+                                "name": position.name
+                                or known_names.get(position.instrument.code),
+                                "quantity": str(position.quantity),
+                                "available_quantity": str(position.available_quantity),
+                                "average_price": str(position.average_price),
+                                "market_price": (
+                                    str(position.market_price)
+                                    if position.market_price is not None
+                                    else None
+                                ),
+                                "cost_basis": str(
+                                    position.quantity * position.average_price
+                                ),
+                                "market_value": str(
+                                    position.quantity
+                                    * (position.market_price or position.average_price)
+                                ),
+                                "unrealized_profit": str(
+                                    position.quantity
+                                    * (
+                                        (position.market_price or position.average_price)
+                                        - position.average_price
+                                    )
+                                ),
+                                "return_percent": (
+                                    str(
+                                        (
+                                            (
+                                                (position.market_price or position.average_price)
+                                                - position.average_price
+                                            )
+                                            / position.average_price
+                                            * Decimal("100")
+                                        ).quantize(Decimal("0.01"))
+                                    )
+                                    if position.average_price > 0
+                                    else None
+                                ),
+                            }
+                            for position in balance.positions
+                        ]
+                        if balance is not None
+                        else []
+                    )
+                    account_orders = journal().orders(
+                        account_alias=alias,
+                        limit=1_000,
+                    )
+                    account_snapshot = {
+                        "state": state,
+                        "positions": position_rows,
+                    }
                     account_rows.append(
                         {
                             "alias": alias,
@@ -854,51 +1042,15 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                             "cost_basis": str(cost_basis) if balance is not None else None,
                             "unrealized_profit": str(profit) if balance is not None else None,
                             "position_count": len(balance.positions) if balance is not None else None,
-                            "positions": (
-                                [
-                                    {
-                                        "code": position.instrument.code,
-                                        "quantity": str(position.quantity),
-                                        "available_quantity": str(position.available_quantity),
-                                        "average_price": str(position.average_price),
-                                        "market_price": (
-                                            str(position.market_price)
-                                            if position.market_price is not None
-                                            else None
-                                        ),
-                                        "cost_basis": str(
-                                            position.quantity * position.average_price
-                                        ),
-                                        "market_value": str(
-                                            position.quantity
-                                            * (position.market_price or position.average_price)
-                                        ),
-                                        "unrealized_profit": str(
-                                            position.quantity
-                                            * (
-                                                (position.market_price or position.average_price)
-                                                - position.average_price
-                                            )
-                                        ),
-                                        "return_percent": (
-                                            str(
-                                                (
-                                                    (
-                                                        (position.market_price or position.average_price)
-                                                        - position.average_price
-                                                    )
-                                                    / position.average_price
-                                                    * Decimal("100")
-                                                ).quantize(Decimal("0.01"))
-                                            )
-                                            if position.average_price > 0
-                                            else None
-                                        ),
-                                    }
-                                    for position in balance.positions
-                                ]
-                                if balance is not None
-                                else []
+                            "positions": position_rows,
+                            "trade_performance": _strategy_performance(
+                                account_orders,
+                                account_snapshot,
+                                known_names,
+                            ),
+                            "trade_history": _strategy_trade_history(
+                                account_orders,
+                                instrument_names=known_names,
                             ),
                             "as_of": (
                                 balance.as_of.isoformat()
@@ -2356,6 +2508,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 ],
             },
         )
+        journal().remember_instrument_names(
+            {
+                item.instrument.code: item.name
+                for item in matches
+                if item.name
+            },
+            source=source_alias or source,
+        )
         return {
             "matches": [
                 {
@@ -2481,6 +2641,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 ],
             },
         )
+        journal().remember_instrument_names(
+            {
+                item.instrument.code: item.name
+                for item in entries
+                if item.name
+            },
+            source=source_alias or source,
+        )
         return {
             "entries": [
                 {
@@ -2562,6 +2730,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             if manifest is not None
             else {}
         )
+        journal().remember_instrument_names(
+            {
+                position.instrument.code: position.name
+                for position in balance.positions
+                if position.name
+            },
+            source=account,
+        )
         payload = {
             "cash": str(balance.cash),
             "withdrawable_cash": str(balance.withdrawable_cash),
@@ -2593,6 +2769,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                             )
                         )
                     ),
+                    "name": position.name,
                 }
                 for position in balance.positions
             ],
@@ -3098,6 +3275,16 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             ),
             None,
         )
+        instrument_names = journal().instrument_names()
+        instrument_names.update(_workspace_instrument_names(workspace, name))
+        if account is not None:
+            instrument_names.update(
+                {
+                    str(position.get("code") or ""): str(position.get("name") or "")
+                    for position in account.get("positions", []) or []
+                    if position.get("code") and position.get("name")
+                }
+            )
         strategy_exposure = None
         if account is not None and strategy_id:
             owned = journal().strategy_position_quantities(
@@ -3196,8 +3383,15 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 "rejected": rejected_count,
                 "unresolved": len(unresolved),
             },
-            "performance": _strategy_performance(orders, account),
-            "trade_history": _strategy_trade_history(orders),
+            "performance": _strategy_performance(
+                orders,
+                account,
+                instrument_names,
+            ),
+            "trade_history": _strategy_trade_history(
+                orders,
+                instrument_names=instrument_names,
+            ),
             "limits": {
                 "max_order_amount": _usage_value(
                     largest_order, risk_limits.get("max_order_amount")

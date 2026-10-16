@@ -900,6 +900,13 @@ class ConnectionRuntime:
                     market_price=_decimal(
                         row.get("prpr"), default=Decimal("0")
                     ),
+                    name=_first_text(
+                        row,
+                        "prdt_name",
+                        "hts_kor_isnm",
+                        "name",
+                    )
+                    or None,
                 )
             )
         cash = _decimal(summary.get("dnca_tot_amt"), default=Decimal("0"))
@@ -1962,6 +1969,14 @@ class ConnectionRuntime:
                     market_price=_decimal(
                         row.get("now_pr"), default=Decimal("0")
                     ),
+                    name=_first_text(
+                        row,
+                        "iem_nm",
+                        "prdt_name",
+                        "hts_kor_isnm",
+                        "name",
+                    )
+                    or None,
                 )
             )
         cash = _decimal(summary.get("dca"), default=Decimal("0"))

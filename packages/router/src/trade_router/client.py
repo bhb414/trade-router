@@ -903,6 +903,7 @@ class AccountClient:
                     if row.get("strategy_quantity") is not None
                     else None
                 ),
+                name=row.get("name"),
             )
             for row in payload.get("positions", [])
         )

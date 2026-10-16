@@ -22,7 +22,11 @@ from trade_router import (
     ScheduleKind,
     TokenScopeKey,
 )
-from trade_router_studio.app import _strategy_performance, create_app
+from trade_router_studio.app import (
+    _strategy_performance,
+    _strategy_trade_history,
+    create_app,
+)
 from trade_router_studio.block_packages import (
     BAR_OBSERVER_TEMPLATE,
     DEFAULT_CONDITION_BOLLINGER_SETTINGS,
@@ -905,6 +909,7 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
                     available_quantity=Decimal("10"),
                     average_price=Decimal("9000"),
                     market_price=Decimal("10000"),
+                    name="삼성전자",
                 ),
             ),
             as_of=datetime.now(ZoneInfo("Asia/Seoul")),
@@ -935,6 +940,46 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
                 "max_open_orders": 3,
             },
         )
+        buy, _ = app.state.runtime_store.reserve_order(
+            strategy_id="dashboard-strategy",
+            account_alias="dashboard-account",
+            client_order_id="dashboard-buy",
+            request={
+                "code": "005930",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "quantity": "1",
+            },
+        )
+        app.state.runtime_store.update_order(
+            buy["id"], status=OrderStatus.ACKNOWLEDGED
+        )
+        app.state.runtime_store.update_order(
+            buy["id"],
+            status=OrderStatus.FILLED,
+            filled_quantity="1",
+            average_fill_price="9000",
+        )
+        sell, _ = app.state.runtime_store.reserve_order(
+            strategy_id="dashboard-strategy",
+            account_alias="dashboard-account",
+            client_order_id="dashboard-sell",
+            request={
+                "code": "005930",
+                "side": "SELL",
+                "order_type": "MARKET",
+                "quantity": "1",
+            },
+        )
+        app.state.runtime_store.update_order(
+            sell["id"], status=OrderStatus.ACKNOWLEDGED
+        )
+        app.state.runtime_store.update_order(
+            sell["id"],
+            status=OrderStatus.FILLED,
+            filled_quantity="1",
+            average_fill_price="10000",
+        )
 
         payload = client.get("/api/dashboard?refresh=true").json()
 
@@ -951,10 +996,14 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
     assert account["state"] == "ok"
     assert account["position_count"] == 1
     assert account["positions"][0]["available_quantity"] == "10"
+    assert account["positions"][0]["name"] == "삼성전자"
     assert account["positions"][0]["market_value"] == "100000"
     assert account["positions"][0]["unrealized_profit"] == "10000"
     assert account["positions"][0]["return_percent"] == "11.11"
-    assert account["limits"]["max_daily_buy_count"]["used"] == "0"
+    assert account["trade_history"][0]["name"] == "삼성전자"
+    assert account["trade_history"][0]["realized_profit"] == "1000"
+    assert account["trade_performance"]["realized_profit"] == "1000"
+    assert account["limits"]["max_daily_buy_count"]["used"] == "1"
     assert account["limits"]["max_daily_buy_count"]["limit"] == "4"
     assert account["limits"]["max_exposure"]["used"] == "100000"
     assert account["limits"]["max_exposure"]["percent"] == 50.0
@@ -999,6 +1048,7 @@ def test_strategy_performance_uses_router_owned_fills_and_current_price() -> Non
     assert result["positions"] == [
         {
             "code": "005930",
+            "name": None,
             "quantity": "1",
             "available_quantity": "1",
             "average_price": "100",
@@ -1010,6 +1060,56 @@ def test_strategy_performance_uses_router_owned_fills_and_current_price() -> Non
         }
     ]
     assert result["includes_fees"] is False
+
+
+def test_strategy_trade_history_includes_names_and_matched_sale_profit() -> None:
+    rows = [
+        {
+            "id": "sell",
+            "created_at": "2026-10-15T10:00:00+09:00",
+            "updated_at": "2026-10-15T10:00:01+09:00",
+            "request": {
+                "code": "005930",
+                "side": "SELL",
+                "order_type": "MARKET",
+                "quantity": "1",
+            },
+            "filled_quantity": "1",
+            "average_fill_price": "120",
+            "commission": "1",
+            "tax": "2",
+            "costs_complete": True,
+            "status": "FILLED",
+        },
+        {
+            "id": "buy",
+            "created_at": "2026-10-15T09:00:00+09:00",
+            "updated_at": "2026-10-15T09:00:01+09:00",
+            "request": {
+                "code": "005930",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "quantity": "1",
+            },
+            "filled_quantity": "1",
+            "average_fill_price": "100",
+            "commission": "1",
+            "tax": "0",
+            "costs_complete": True,
+            "status": "FILLED",
+        },
+    ]
+
+    history = _strategy_trade_history(
+        rows,
+        instrument_names={"005930": "삼성전자"},
+    )
+
+    assert history[0]["name"] == "삼성전자"
+    assert history[0]["realized_profit"] == "16"
+    assert history[0]["return_percent"] == "15.84"
+    assert history[0]["profit_costs_complete"] is True
+    assert history[1]["realized_profit"] is None
 
 
 def test_strategy_performance_subtracts_commission_and_tax() -> None:
@@ -1638,6 +1738,7 @@ def test_strategy_runtime_api_requires_session_and_schedules_events(tmp_path: Pa
                         "kind": "INTERVAL",
                         "interval_seconds": 1,
                         "aligned": True,
+                        "trading_days_only": False,
                     }
                 ]
             },

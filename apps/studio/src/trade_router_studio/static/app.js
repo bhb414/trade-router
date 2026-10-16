@@ -45,6 +45,8 @@ const state = {
   dashboardServiceTab: "market",
   strategyServiceTab: "market",
   strategyBalanceTab: "balance",
+  accountBalanceTab: "balance",
+  activeAccount: null,
 };
 
 const elements = {
@@ -660,7 +662,7 @@ function dataTable(columns, rows, emptyMessage) {
 
 function positionTable(positions, emptyMessage = "이 전략이 보유한 종목이 없습니다.") {
   return dataTable([
-    { label: "종목", render: row => row.code || "—" },
+    { label: "종목", render: row => instrumentLabel(row) },
     { label: "보유 / 주문가능", render: row => `${formatNumber(row.quantity)} / ${formatNumber(row.available_quantity)}주` },
     { label: "평균 매입가", render: row => `${formatNumber(row.average_price)}원` },
     { label: "현재가", render: row => row.market_price == null ? "—" : `${formatNumber(row.market_price)}원` },
@@ -668,6 +670,44 @@ function positionTable(positions, emptyMessage = "이 전략이 보유한 종목
     { label: "평가손익", render: row => ({ text: row.unrealized_profit == null ? "—" : `${formatNumber(row.unrealized_profit, { signed: true })}원`, className: profitClass(row.unrealized_profit) }) },
     { label: "수익률", render: row => ({ text: row.return_percent == null ? "—" : `${Number(row.return_percent).toLocaleString("ko-KR", { maximumFractionDigits: 2 })}%`, className: profitClass(row.return_percent) }) },
   ], positions || [], emptyMessage);
+}
+
+function instrumentLabel(row) {
+  const code = String(row?.code || "").trim();
+  const name = String(row?.name || "").trim();
+  if (name && name !== code) return code ? `${name} · ${code}` : name;
+  return code || name || "—";
+}
+
+function tradeHistoryTable(rows, emptyMessage) {
+  return dataTable([
+    { label: "종목", render: row => instrumentLabel(row) },
+    { label: "구분", render: row => row.side === "SELL" ? "매도" : "매수" },
+    { label: "시각", render: row => formatTimestamp(row.updated_at || row.created_at) },
+    { label: "주문", render: row => `${row.order_type === "LIMIT" ? "지정가" : "시장가"} ${formatNumber(row.quantity)}주` },
+    { label: "체결", render: row => row.filled_quantity && Number(row.filled_quantity) > 0 ? `${formatNumber(row.filled_quantity)}주 · ${formatNumber(row.average_fill_price)}원` : "—" },
+    {
+      label: "매매손익",
+      render: row => {
+        if (row.realized_profit == null) return "—";
+        const estimate = row.profit_costs_complete ? "" : " (추정)";
+        return {
+          text: `${formatNumber(row.realized_profit, { signed: true })}원${estimate}`,
+          className: profitClass(row.realized_profit),
+        };
+      },
+    },
+    {
+      label: "수익률",
+      render: row => row.return_percent == null
+        ? "—"
+        : {
+            text: `${Number(row.return_percent).toLocaleString("ko-KR", { maximumFractionDigits: 2 })}%`,
+            className: profitClass(row.return_percent),
+          },
+    },
+    { label: "상태", render: row => ({ text: orderStatusPresentation(row.status)[0], className: orderStatusPresentation(row.status)[1] }) },
+  ], rows || [], emptyMessage);
 }
 
 function renderStrategyBalanceContent() {
@@ -682,15 +722,19 @@ function renderStrategyBalanceContent() {
   const summary = state.strategySummary || {};
   const performance = summary.performance || {};
   if (state.strategyBalanceTab === "trades") {
-    container.append(dataTable([
-      { label: "시각", render: row => formatTimestamp(row.updated_at || row.created_at) },
-      { label: "종목", render: row => row.code || "—" },
-      { label: "구분", render: row => row.side === "SELL" ? "매도" : "매수" },
-      { label: "주문", render: row => `${row.order_type === "LIMIT" ? "지정가" : "시장가"} ${formatNumber(row.quantity)}주` },
-      { label: "체결", render: row => row.filled_quantity && Number(row.filled_quantity) > 0 ? `${formatNumber(row.filled_quantity)}주 · ${formatNumber(row.average_fill_price)}원` : "—" },
-      { label: "상태", render: row => ({ text: orderStatusPresentation(row.status)[0], className: orderStatusPresentation(row.status)[1] }) },
-      { label: "비용", render: row => `${formatNumber(Number(row.commission || 0) + Number(row.tax || 0))}원` },
-    ], summary.trade_history || [], "이 전략의 매매기록이 없습니다."));
+    const metrics = document.createElement("div");
+    metrics.className = "strategy-performance-grid compact trade-performance-grid";
+    metrics.append(
+      metricCard("실현 손익", performance.realized_profit, { signed: true }),
+      metricCard("누적 매수", performance.filled_buy_amount),
+      metricCard("누적 매도", performance.filled_sell_amount),
+      metricCard("매도 승률", performance.win_rate, { unit: "%", percent: true }),
+      metricCard("수수료·세금", Number(performance.commission || 0) + Number(performance.tax || 0)),
+    );
+    container.append(
+      metrics,
+      tradeHistoryTable(summary.trade_history || [], "이 전략의 매매기록이 없습니다."),
+    );
     return;
   }
   const metrics = document.createElement("div");
@@ -814,13 +858,64 @@ function renderDashboardAccount(account) {
 }
 
 function openAccountBalance(account) {
+  state.activeAccount = account;
+  state.accountBalanceTab = "balance";
   document.querySelector("#account-balance-title").textContent = account.alias;
+  renderAccountBalanceModal();
+  elements.accountBalanceModal.hidden = false;
+}
+
+function renderAccountBalanceModal() {
+  const account = state.activeAccount;
+  if (!account) return;
   const body = elements.accountBalanceBody;
   body.replaceChildren();
   const target = account.target === "LIVE" ? "실전" : account.target === "PAPER" ? "모의" : account.target;
   const meta = document.createElement("div");
   meta.className = "account-modal-meta";
   meta.textContent = `${account.connection_label || account.provider || "API"} · ${target || ""} · ${account.masked_account || ""} · ${account.message || ""}`;
+  const tabs = document.createElement("div");
+  tabs.className = "balance-tabs account-balance-tabs";
+  tabs.setAttribute("role", "tablist");
+  tabs.setAttribute("aria-label", "계좌 상세 내용");
+  for (const [id, label] of [["balance", "잔고"], ["trades", "매매기록"]]) {
+    const button = document.createElement("button");
+    const active = state.accountBalanceTab === id;
+    button.className = `balance-tab${active ? " active" : ""}`;
+    button.type = "button";
+    button.textContent = label;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", String(active));
+    button.addEventListener("click", () => {
+      state.accountBalanceTab = id;
+      renderAccountBalanceModal();
+    });
+    tabs.append(button);
+  }
+
+  body.append(meta, tabs);
+  if (state.accountBalanceTab === "trades") {
+    const performance = account.trade_performance || {};
+    const metrics = document.createElement("div");
+    metrics.className = "strategy-performance-grid account-modal-metrics";
+    metrics.append(
+      metricCard("실현 손익", performance.realized_profit, { signed: true }),
+      metricCard("평가 손익", performance.unrealized_profit, { signed: true }),
+      metricCard("누적 매수", performance.filled_buy_amount),
+      metricCard("누적 매도", performance.filled_sell_amount),
+      metricCard("수수료·세금", Number(performance.commission || 0) + Number(performance.tax || 0)),
+    );
+    const note = document.createElement("p");
+    note.className = "account-trade-note";
+    note.textContent = "이 계좌에서 Trade Router가 제출한 체결을 기준으로 계산합니다.";
+    body.append(
+      metrics,
+      note,
+      tradeHistoryTable(account.trade_history || [], "이 계좌의 매매기록이 없습니다."),
+    );
+    return;
+  }
+
   const metrics = document.createElement("div");
   metrics.className = "strategy-performance-grid account-modal-metrics";
   metrics.append(
@@ -842,12 +937,13 @@ function openAccountBalance(account) {
   appendLimitRow(limits, "일일 누적 매수횟수", account.limits?.max_daily_buy_count, "times");
   appendLimitRow(limits, "최대 보유 노출액", account.limits?.max_exposure);
   appendLimitRow(limits, "동시 미체결 주문", account.limits?.max_open_orders, "count");
-  body.append(meta, metrics, positionsHeading, positionTable(account.positions || [], "이 계좌에 보유 종목이 없습니다."), limitHeading, limits);
-  elements.accountBalanceModal.hidden = false;
+  body.append(metrics, positionsHeading, positionTable(account.positions || [], "이 계좌에 보유 종목이 없습니다."), limitHeading, limits);
 }
 
 function closeAccountBalance() {
   elements.accountBalanceModal.hidden = true;
+  state.activeAccount = null;
+  state.accountBalanceTab = "balance";
 }
 
 function renderDashboardService(service) {
