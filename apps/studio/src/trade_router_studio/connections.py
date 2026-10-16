@@ -457,6 +457,51 @@ class ConnectionRuntime:
         account = self._settings.get_account(account_reference)
         return dict(account.get("cost_rates", {}))
 
+    async def instrument_name(
+        self,
+        connection_reference: str,
+        code: str,
+    ) -> str | None:
+        """Resolve a domestic instrument name through the provider adapter.
+
+        This is primarily a compatibility fallback for older order-ledger rows
+        that were recorded before discovery and balance results persisted names.
+        Normal strategy traffic should keep using the names already returned by
+        those services.
+        """
+
+        connection = self._settings.resolve_connection(connection_reference)
+        instrument = InstrumentId(code)
+        if connection["provider"] != "kis":
+            return None
+        payload, _ = await self._kis_get(
+            connection,
+            path="/uapi/domestic-stock/v1/quotations/search-stock-info",
+            tr_id="CTPF1002R",
+            params={
+                "PRDT_TYPE_CD": "300",
+                "PDNO": instrument.code,
+            },
+            operation="instruments.name",
+            priority=RequestPriority.INTERACTIVE,
+            group="market",
+            dedupe_key=f"{connection['id']}:instrument-name:{instrument.code}",
+            cache_ttl=86_400,
+        )
+        output = payload.get("output")
+        if isinstance(output, list):
+            output = next((row for row in output if isinstance(row, dict)), None)
+        if not isinstance(output, dict):
+            return None
+        return _first_text(
+            output,
+            "prdt_name",
+            "prdt_abrv_name",
+            "prdt_name120",
+            "hts_kor_isnm",
+            "name",
+        ) or None
+
     async def quote(
         self,
         connection_reference: str,

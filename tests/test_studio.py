@@ -896,6 +896,7 @@ def test_block_editor_condition_options_use_connection_runtime(tmp_path: Path) -
 
 def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> None:
     app = create_app(workspace(tmp_path / "workspace"))
+    name_lookups: list[tuple[str, str]] = []
 
     async def balance(_account: str) -> Balance:
         return Balance(
@@ -909,13 +910,18 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
                     available_quantity=Decimal("10"),
                     average_price=Decimal("9000"),
                     market_price=Decimal("10000"),
-                    name="삼성전자",
                 ),
             ),
             as_of=datetime.now(ZoneInfo("Asia/Seoul")),
         )
 
     app.state.connections.balance = balance
+
+    async def instrument_name(connection: str, code: str) -> str | None:
+        name_lookups.append((connection, code))
+        return "삼성전자" if code == "005930" else None
+
+    app.state.connections.instrument_name = instrument_name
     with TestClient(app) as client:
         connection = client.post(
             "/api/settings/connections",
@@ -1003,6 +1009,8 @@ def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> No
     assert account["trade_history"][0]["name"] == "삼성전자"
     assert account["trade_history"][0]["realized_profit"] == "1000"
     assert account["trade_performance"]["realized_profit"] == "1000"
+    assert name_lookups == [(connection["id"], "005930")]
+    assert app.state.runtime_store.instrument_names()["005930"] == "삼성전자"
     assert account["limits"]["max_daily_buy_count"]["used"] == "1"
     assert account["limits"]["max_daily_buy_count"]["limit"] == "4"
     assert account["limits"]["max_exposure"]["used"] == "100000"

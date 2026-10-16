@@ -297,6 +297,62 @@ def test_kis_connection_token_quote_and_balance_share_runtime(tmp_path: Path) ->
     asyncio.run(run())
 
 
+def test_kis_instrument_name_uses_stock_info_and_shared_cache(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "workspace"))
+        connection = settings.add_connection(
+            provider="kis",
+            target="LIVE",
+            label="live-name-source",
+            app_key="live-name-key",
+            app_secret="live-name-secret",
+        )
+        calls = {"token": 0, "name": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/tokenP":
+                calls["token"] += 1
+                expiry = (datetime.now().astimezone() + timedelta(hours=24)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "name-token",
+                        "token_type": "Bearer",
+                        "access_token_token_expired": expiry,
+                    },
+                )
+            assert request.url.path.endswith("/search-stock-info")
+            assert request.headers["tr_id"] == "CTPF1002R"
+            assert request.url.params["PRDT_TYPE_CD"] == "300"
+            assert request.url.params["PDNO"] == "005930"
+            calls["name"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "rt_cd": "0",
+                    "output": {
+                        "pdno": "005930",
+                        "prdt_name": "삼성전자",
+                    },
+                },
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConnectionRuntime(settings, http_client=client)
+        try:
+            first = await runtime.instrument_name(connection["id"], "005930")
+            second = await runtime.instrument_name(connection["id"], "005930")
+            assert first == second == "삼성전자"
+            assert calls == {"token": 1, "name": 1}
+        finally:
+            await runtime.close()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_kis_live_condition_search_is_normalized_and_paper_is_blocked(
     tmp_path: Path,
 ) -> None:

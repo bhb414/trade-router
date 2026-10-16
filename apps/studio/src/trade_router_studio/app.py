@@ -904,6 +904,66 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             unresolved_rows = journal().unresolved_orders()
             known_names = journal().instrument_names()
             known_names.update(_workspace_instrument_names(workspace))
+            orders_by_account = {
+                str(account["alias"]): journal().orders(
+                    account_alias=str(account["alias"]),
+                    limit=1_000,
+                )
+                for account in account_settings
+            }
+
+            # Older releases stored normalized order codes but not their names.
+            # Resolve only the rows that can be shown in the account/strategy
+            # history, then cache the result so subsequent snapshots are local.
+            lookup_connection = next(
+                (
+                    str(connection["id"])
+                    for connection in connections
+                    if connection.get("provider") == "kis"
+                    and connection.get("target") == "LIVE"
+                ),
+                next(
+                    (
+                        str(connection["id"])
+                        for connection in connections
+                        if connection.get("provider") == "kis"
+                    ),
+                    None,
+                ),
+            )
+            missing_name_codes = sorted(
+                {
+                    str(dict(order.get("request") or {}).get("code") or "")
+                    for rows in orders_by_account.values()
+                    for order in rows[:200]
+                    if str(dict(order.get("request") or {}).get("code") or "")
+                    not in known_names
+                }
+                - {""}
+            )
+            if lookup_connection and missing_name_codes:
+                resolved_values = await asyncio.gather(
+                    *(
+                        connection_runtime.instrument_name(lookup_connection, code)
+                        for code in missing_name_codes
+                    ),
+                    return_exceptions=True,
+                )
+                resolved_names = {
+                    code: value
+                    for code, value in zip(
+                        missing_name_codes,
+                        resolved_values,
+                        strict=True,
+                    )
+                    if isinstance(value, str) and value.strip()
+                }
+                if resolved_names:
+                    known_names.update(resolved_names)
+                    journal().remember_instrument_names(
+                        resolved_names,
+                        source="kis:stock-info",
+                    )
             account_rows: list[dict[str, object]] = []
             total_assets = Decimal("0")
             total_cash = Decimal("0")
@@ -1023,10 +1083,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                         if balance is not None
                         else []
                     )
-                    account_orders = journal().orders(
-                        account_alias=alias,
-                        limit=1_000,
-                    )
+                    account_orders = orders_by_account.get(alias, [])
                     account_snapshot = {
                         "state": state,
                         "positions": position_rows,
