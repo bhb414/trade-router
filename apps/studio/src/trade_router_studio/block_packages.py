@@ -560,10 +560,15 @@ class ManagedBlockStrategy(Strategy):
         limits=RiskLimits(max_exposure=TOTAL_OPERATING_BUDGET),
     )
 
+    @staticmethod
+    def _instrument_label(ctx, code):
+        names = dict(ctx.state.get("instrument_names", {}))
+        return names.get(code) or code
+
     async def _candidate_codes(self, ctx):
         if TARGET_SOURCE == "HTS_CONDITION":
             rows = await ctx.discovery.matches(HTS_USER_ID, CONDITION_ID)
-            codes = [item.instrument.code for item in rows]
+            instruments = [(item.instrument.code, item.name) for item in rows]
             label = f"HTS 조건검색 {CONDITION_ID}"
         elif TARGET_SOURCE == "RANKING":
             rows = await ctx.discovery.ranking(
@@ -572,15 +577,23 @@ class ManagedBlockStrategy(Strategy):
                 market=RANKING_MARKET,
                 limit=RANKING_LIMIT,
             )
-            codes = [item.instrument.code for item in rows]
+            instruments = [(item.instrument.code, item.name) for item in rows]
             label = f"{RANKING_KIND} 순위"
         else:
-            codes = list(SYMBOLS)
+            instruments = [(code, None) for code in SYMBOLS]
             label = "지정 종목"
+        codes = [code for code, _ in instruments]
         unique = list(dict.fromkeys(code.strip().upper() for code in codes if code.strip()))
-        code_text = ", ".join(unique) if unique else "없음"
+        names = dict(ctx.state.get("instrument_names", {}))
+        for raw_code, name in instruments:
+            code = raw_code.strip().upper()
+            clean_name = str(name or "").strip()
+            if code and clean_name:
+                names[code] = clean_name
+        ctx.state.set("instrument_names", names)
+        name_text = ", ".join(names.get(code) or code for code in unique) if unique else "없음"
         ctx.log.info(
-            f"{label} {len(unique)}종목 [{code_text}] · 신규 매수 후보를 확인합니다."
+            f"{label} {len(unique)}종목 [{name_text}] · 신규 매수 후보를 확인합니다."
         )
         return unique
 
@@ -726,7 +739,7 @@ class ManagedBlockStrategy(Strategy):
                     except RouterError as exc:
                         bars_by_request[key] = ()
                         fetched_counts[key] = required
-                        ctx.log.warning(f"{code} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
+                        ctx.log.warning(f"{self._instrument_label(ctx, code)} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
                 if self._condition_matches(condition, bars_by_request, average_price):
                     matched.append(condition)
                     break
@@ -807,7 +820,7 @@ class ManagedBlockStrategy(Strategy):
             )
         except RouterError as exc:
             ctx.log.warning(
-                f"{code} 실시간 익절·손절 구독 보류 [{exc.code.value}]: {exc.message}"
+                f"{self._instrument_label(ctx, code)} 실시간 익절·손절 구독 보류 [{exc.code.value}]: {exc.message}"
             )
             return
         if subscriptions:
@@ -998,10 +1011,10 @@ class ManagedBlockStrategy(Strategy):
                 ctx.state.set("strategy_positions", tracked)
                 continue
             if code in pending_codes:
-                ctx.log.info(f"{code} 청산 대기: 계좌에 미체결 주문이 있습니다.")
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 청산 대기: 계좌에 미체결 주문이 있습니다.")
                 continue
             if not submit_orders:
-                ctx.log.warning(f"{code} 장 종료 후 잔여 확인: 전략 소유 {tracked[code]}주 · 실제 보유 {position.quantity}주")
+                ctx.log.warning(f"{self._instrument_label(ctx, code)} 장 종료 후 잔여 확인: 전략 소유 {tracked[code]}주 · 실제 보유 {position.quantity}주")
                 continue
             tracked_quantity = position.strategy_quantity if position.strategy_quantity is not None else Decimal(str(tracked[code]))
             quantity = min(tracked_quantity, position.available_quantity)
@@ -1015,9 +1028,9 @@ class ManagedBlockStrategy(Strategy):
                     client_order_id=f"close-{code}-{scheduled_at:%Y%m%d%H%M%S}-sell",
                 )
             except RouterError as exc:
-                ctx.log.error(f"{code} 청산 실패 [{exc.code.value}]: {exc.message}")
+                ctx.log.error(f"{self._instrument_label(ctx, code)} 청산 실패 [{exc.code.value}]: {exc.message}")
                 continue
-            ctx.log.info(f"{code} {reason} · 전략 소유 {quantity}주 시장가 매도 요청: {order.status.value}")
+            ctx.log.info(f"{self._instrument_label(ctx, code)} {reason} · 전략 소유 {quantity}주 시장가 매도 요청: {order.status.value}")
             if order.status is OrderStatus.FILLED:
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
@@ -1059,20 +1072,20 @@ class ManagedBlockStrategy(Strategy):
         submitted = 0
         for code in candidate_codes:
             if code in pending_codes:
-                ctx.log.info(f"{code} 매수 제외: 계좌에 미체결 주문이 있습니다.")
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 계좌에 미체결 주문이 있습니다.")
                 continue
             if code in held_codes:
-                ctx.log.info(f"{code} 매수 제외: 현재 계좌에 보유 중입니다.")
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 현재 계좌에 보유 중입니다.")
                 continue
             if code in tracked:
-                ctx.log.info(f"{code} 매수 제외: 전략 소유 종목으로 추적 중입니다.")
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 전략 소유 종목으로 추적 중입니다.")
                 continue
             if BUY_CONDITION_GROUPS:
                 passed, _ = await self._condition_groups_result(
                     ctx, code, BUY_CONDITION_GROUPS, side="매수"
                 )
                 if not passed:
-                    ctx.log.info(f"{code} 매수 제외: 매수 조건 블록을 통과하지 못했습니다.")
+                    ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 매수 조건 블록을 통과하지 못했습니다.")
                     continue
             limit_price = None
             try:
@@ -1088,19 +1101,19 @@ class ManagedBlockStrategy(Strategy):
                     route=ORDER_ROUTE,
                 )
             except RouterError as exc:
-                ctx.log.warning(f"{code} {MARKET_VENUE} 주문 전 조회 실패 [{exc.code.value}]: {exc.message}")
+                ctx.log.warning(f"{self._instrument_label(ctx, code)} {MARKET_VENUE} 주문 전 조회 실패 [{exc.code.value}]: {exc.message}")
                 continue
             except RuntimeError as exc:
-                ctx.log.warning(f"{code} {MARKET_VENUE} 주문 전 조회 실패: {exc}")
+                ctx.log.warning(f"{self._instrument_label(ctx, code)} {MARKET_VENUE} 주문 전 조회 실패: {exc}")
                 continue
             calculation_price = max(buying_power.calculation_price, market_price)
             if calculation_price <= 0:
-                ctx.log.warning(f"{code} 주문 전 조회 실패: 보수적 계산단가를 확인할 수 없습니다.")
+                ctx.log.warning(f"{self._instrument_label(ctx, code)} 주문 전 조회 실패: 보수적 계산단가를 확인할 수 없습니다.")
                 continue
             budget_quantity = int(BUY_BUDGET_PER_SYMBOL // calculation_price)
             quantity = min(int(buying_power.maximum_quantity), budget_quantity)
             if quantity < 1:
-                ctx.log.info(f"{code} 건너뜀: {MARKET_VENUE} 보수적 계산단가 {calculation_price}원 · 종목당 예산 {BUY_BUDGET_PER_SYMBOL}원")
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 건너뜀: {MARKET_VENUE} 보수적 계산단가 {calculation_price}원 · 종목당 예산 {BUY_BUDGET_PER_SYMBOL}원")
                 continue
             try:
                 order_id = f"target-{code}-{event.scheduled_at:%Y%m%d%H%M%S}-buy"
@@ -1114,7 +1127,7 @@ class ManagedBlockStrategy(Strategy):
                         code=code, quantity=quantity, route=ORDER_ROUTE, client_order_id=order_id,
                     )
             except RouterError as exc:
-                ctx.log.error(f"{code} 매수 요청 실패 [{exc.code.value}]: {exc.message}")
+                ctx.log.error(f"{self._instrument_label(ctx, code)} 매수 요청 실패 [{exc.code.value}]: {exc.message}")
                 continue
             if order.status is not OrderStatus.REJECTED:
                 tracked[code] = str(quantity)
@@ -1122,7 +1135,7 @@ class ManagedBlockStrategy(Strategy):
                 await self._subscribe_live_quote(ctx, code)
                 submitted += 1
                 price_text = f" {limit_price}원" if limit_price is not None else ""
-                ctx.log.info(f"{code} {BUY_ORDER_TYPE}{price_text} {quantity}주 매수 요청: {order.status.value}")
+                ctx.log.info(f"{self._instrument_label(ctx, code)} {BUY_ORDER_TYPE}{price_text} {quantity}주 매수 요청: {order.status.value}")
             if submitted >= MAX_NEW_BUYS_PER_SCAN:
                 break
 
@@ -1178,7 +1191,7 @@ class ManagedBlockStrategy(Strategy):
                         code=code, quantity=quantity, route=ORDER_ROUTE, client_order_id=order_id,
                     )
             except RouterError as exc:
-                ctx.log.error(f"{code} 매도 요청 실패 [{exc.code.value}]: {exc.message}")
+                ctx.log.error(f"{self._instrument_label(ctx, code)} 매도 요청 실패 [{exc.code.value}]: {exc.message}")
                 continue
             if order.status is not OrderStatus.REJECTED:
                 self._live_sell_pending.add(code)
@@ -1189,7 +1202,7 @@ class ManagedBlockStrategy(Strategy):
                 else f"판단 시각 {event.scheduled_at:%H:%M:%S}"
             )
             ctx.log.info(
-                f"{code} {decision_time} · {sell_reason} · "
+                f"{self._instrument_label(ctx, code)} {decision_time} · {sell_reason} · "
                 f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
             )
             if order.status is OrderStatus.FILLED:
@@ -1217,7 +1230,7 @@ class ManagedBlockStrategy(Strategy):
             )
         except RouterError as exc:
             ctx.log.warning(
-                f"{code} 실시간 익절·손절 확인 보류 [{exc.code.value}]: {exc.message}"
+                f"{self._instrument_label(ctx, code)} 실시간 익절·손절 확인 보류 [{exc.code.value}]: {exc.message}"
             )
             return
         position = positions.get(code)
@@ -1253,14 +1266,14 @@ class ManagedBlockStrategy(Strategy):
                 )
         except RouterError as exc:
             self._live_sell_pending.discard(code)
-            ctx.log.error(f"{code} 실시간 익절·손절 매도 실패 [{exc.code.value}]: {exc.message}")
+            ctx.log.error(f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 실패 [{exc.code.value}]: {exc.message}")
             return
         if order.status is OrderStatus.REJECTED:
             self._live_sell_pending.discard(code)
         reason = self._condition_summary(condition)
         price_text = f" {limit_price}원" if limit_price is not None else ""
         ctx.log.info(
-            f"{code} 실시간 현재가 {quote.price}원 ({reason}) · "
+            f"{self._instrument_label(ctx, code)} 실시간 현재가 {quote.price}원 ({reason}) · "
             f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
         )
 
@@ -1276,7 +1289,7 @@ class ManagedBlockStrategy(Strategy):
                 await self._refresh_live_positions(ctx, balance, open_orders)
             except RouterError as exc:
                 ctx.log.warning(
-                    f"{code} 체결 후 실시간 감시 연결 보류 [{exc.code.value}]: {exc.message}"
+                    f"{self._instrument_label(ctx, code)} 체결 후 실시간 감시 연결 보류 [{exc.code.value}]: {exc.message}"
                 )
             return
         if order.request.side.value != "SELL":

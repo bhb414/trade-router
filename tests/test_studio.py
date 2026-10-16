@@ -801,6 +801,46 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
     ]
 
 
+def test_managed_block_strategy_logs_condition_matches_by_name() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    values: dict[str, object] = {}
+    messages: list[str] = []
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    class Discovery:
+        async def matches(self, user_id: str, condition_id: str):
+            return (
+                SimpleNamespace(
+                    instrument=SimpleNamespace(code="048910"),
+                    name="대원미디어",
+                ),
+            )
+
+    ctx = SimpleNamespace(
+        state=State(),
+        discovery=Discovery(),
+        log=SimpleNamespace(info=messages.append),
+    )
+
+    codes = asyncio.run(strategy._candidate_codes(ctx))
+
+    assert codes == ["048910"]
+    assert values["instrument_names"] == {"048910": "대원미디어"}
+    assert messages == [
+        "HTS 조건검색 1 1종목 [대원미디어] · 신규 매수 후보를 확인합니다."
+    ]
+    assert strategy._instrument_label(ctx, "048910") == "대원미디어"
+
+
 def test_status_reports_automatic_runtime_database_recovery(tmp_path: Path) -> None:
     paths = workspace(tmp_path / "workspace")
     paths.data.mkdir(parents=True)

@@ -2347,6 +2347,13 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 "condition_id": condition_id,
                 "count": len(matches),
                 "source_alias": source_alias,
+                "matches": [
+                    {
+                        "name": item.name or item.instrument.code,
+                        "code": item.instrument.code,
+                    }
+                    for item in matches
+                ],
             },
         )
         return {
@@ -2464,6 +2471,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 "market": market,
                 "count": len(entries),
                 "source_alias": source_alias,
+                "entries": [
+                    {
+                        "rank": item.rank,
+                        "name": item.name or item.instrument.code,
+                        "code": item.instrument.code,
+                    }
+                    for item in entries
+                ],
             },
         )
         return {
