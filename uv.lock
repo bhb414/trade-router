@@ -516,7 +516,7 @@ wheels = [
 
 [[package]]
 name = "trade-router"
-version = "0.1.31"
+version = "0.1.32"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

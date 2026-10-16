@@ -678,6 +678,38 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert process_actions == ["restart", "shutdown"]
 
 
+def test_managed_block_strategy_recovers_a_late_filled_position() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    values: dict[str, object] = {
+        "ownership_initialized": True,
+        "strategy_positions": {},
+    }
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    position = SimpleNamespace(
+        instrument=SimpleNamespace(code="079650"),
+        quantity=Decimal("5"),
+        strategy_quantity=Decimal("5"),
+    )
+    tracked = strategy._sync_tracked_positions(
+        SimpleNamespace(state=State()),
+        SimpleNamespace(positions=(position,)),
+    )
+
+    assert tracked == {"079650": "5"}
+    assert values["strategy_positions"] == {"079650": "5"}
+
+
 def test_status_reports_automatic_runtime_database_recovery(tmp_path: Path) -> None:
     paths = workspace(tmp_path / "workspace")
     paths.data.mkdir(parents=True)

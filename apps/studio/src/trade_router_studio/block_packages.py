@@ -830,10 +830,10 @@ class ManagedBlockStrategy(Strategy):
     def _sync_tracked_positions(self, ctx, balance):
         positions = {item.instrument.code: item for item in balance.positions}
         tracked = dict(ctx.state.get("strategy_positions", {}))
+        for position in balance.positions:
+            if position.strategy_quantity is not None and position.strategy_quantity > 0:
+                tracked[position.instrument.code] = str(min(position.strategy_quantity, position.quantity))
         if not ctx.state.get("ownership_initialized", False):
-            for position in balance.positions:
-                if position.strategy_quantity is not None and position.strategy_quantity > 0:
-                    tracked[position.instrument.code] = str(min(position.strategy_quantity, position.quantity))
             ctx.state.set("ownership_initialized", True)
         for code in list(tracked):
             position = positions.get(code)
