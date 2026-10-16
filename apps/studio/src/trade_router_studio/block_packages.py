@@ -744,7 +744,110 @@ class ManagedBlockStrategy(Strategy):
         quote = await ctx.market.quote(code, venue=Venue(MARKET_VENUE))
         return quote.price
 
+    def _ensure_live_state(self):
+        if not hasattr(self, "_live_quote_subscriptions"):
+            self._live_quote_subscriptions = {}
+            self._live_positions = {}
+            self._live_sell_pending = set()
+
+    @staticmethod
+    def _is_live_profit_condition(condition):
+        metrics = {
+            condition.get("left"),
+            condition.get("right"),
+        }
+        return "profit_rate" in metrics and metrics <= {"profit_rate", "value"}
+
+    def _live_profit_match(self, condition, current_price, average_price):
+        if not average_price or average_price <= 0:
+            return False
+        profit_rate = (current_price / average_price - Decimal("1")) * Decimal("100")
+
+        def operand(side):
+            metric = condition.get(side)
+            if side == "right" and metric == "value":
+                return Decimal(str(condition.get("value", "0")))
+            if metric == "profit_rate":
+                return profit_rate
+            return None
+
+        left = operand("left")
+        right = operand("right")
+        if left is None or right is None:
+            return False
+        return {
+            "LT": left < right,
+            "LTE": left <= right,
+            "GT": left > right,
+            "GTE": left >= right,
+            "EQ": left == right,
+        }.get(condition["operator"], False)
+
+    def _matched_live_profit_condition(self, current_price, average_price):
+        for group in SELL_CONDITION_GROUPS:
+            for condition in group["conditions"]:
+                if self._is_live_profit_condition(condition) and self._live_profit_match(
+                    condition, current_price, average_price
+                ):
+                    return condition
+        return None
+
+    async def _subscribe_live_quote(self, ctx, code):
+        self._ensure_live_state()
+        if code in self._live_quote_subscriptions:
+            return
+        try:
+            subscriptions = await ctx.market.subscribe_quotes(
+                code, venue=Venue(MARKET_VENUE)
+            )
+        except RouterError as exc:
+            ctx.log.warning(
+                f"{code} 실시간 익절·손절 구독 보류 [{exc.code.value}]: {exc.message}"
+            )
+            return
+        if subscriptions:
+            self._live_quote_subscriptions[code] = subscriptions[0]["id"]
+
+    async def _unsubscribe_live_quote(self, ctx, code):
+        self._ensure_live_state()
+        subscription_id = self._live_quote_subscriptions.pop(code, None)
+        if subscription_id is None:
+            return
+        try:
+            await ctx.market.unsubscribe(subscription_id)
+        except RouterError:
+            pass
+
+    async def _refresh_live_positions(self, ctx, balance, open_orders):
+        self._ensure_live_state()
+        positions = {item.instrument.code: item for item in balance.positions}
+        tracked = self._sync_tracked_positions(ctx, balance)
+        desired = {
+            code
+            for code in tracked
+            if code in positions and positions[code].quantity > 0
+        }
+        self._live_positions = {code: positions[code] for code in desired}
+        pending_sells = {
+            item.instrument.code
+            for item in open_orders
+            if item.remaining_quantity > 0 and item.side.value == "SELL"
+        }
+        self._live_sell_pending.update(pending_sells)
+        for code in sorted(desired):
+            await self._subscribe_live_quote(ctx, code)
+        for code in tuple(self._live_quote_subscriptions):
+            if code not in desired:
+                await self._unsubscribe_live_quote(ctx, code)
+        return tracked, positions, {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
+
+    @staticmethod
+    def _sell_window_is_open(at):
+        local_time = at.astimezone().time().replace(tzinfo=None)
+        return time.fromisoformat(SELL_START_TIME) <= local_time < time.fromisoformat(SELL_END_TIME)
+
     async def on_start(self, ctx):
+        self._ensure_live_state()
         buy_sources = [
             self._condition_source(condition, side)
             for group in BUY_CONDITION_GROUPS
@@ -765,7 +868,8 @@ class ManagedBlockStrategy(Strategy):
         )) or "봉 계산 없음"
         sell_source_text = ", ".join(dict.fromkeys(
             f"{item['bar_interval']}·{'완성봉' if item['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
-            for item in sell_sources if self._source_uses_bars(item)
+            for item in sell_sources
+            if self._source_uses_bars(item) and item["metric"] != "profit_rate"
         )) or "봉 계산 없음"
         ctx.log.info(f"매수 조건 블록: {buy_source_text} · 블록 내부 OR / 블록 간 순차 AND")
         ctx.log.info(f"매도 조건 블록: {sell_source_text} · 블록 내부 OR / 블록 간 순차 AND")
@@ -775,7 +879,10 @@ class ManagedBlockStrategy(Strategy):
             between=(BUY_START_TIME, BUY_END_TIME),
             aligned=True,
         )
-        bar_sell_sources = [item for item in sell_sources if self._source_uses_bars(item)]
+        bar_sell_sources = [
+            item for item in sell_sources
+            if self._source_uses_bars(item) and item["metric"] != "profit_rate"
+        ]
         if not bar_sell_sources or any(item["bar_data_mode"] == "INCLUDE_CURRENT" for item in bar_sell_sources):
             ctx.scheduler.every(
                 seconds=BUY_SCAN_SECONDS,
@@ -805,6 +912,21 @@ class ManagedBlockStrategy(Strategy):
             aligned=True,
         )
         ctx.scheduler.daily_at(CLOSE_CONFIRM_TIME, schedule_id="close-confirm")
+
+        if any(
+            self._is_live_profit_condition(condition)
+            for group in SELL_CONDITION_GROUPS
+            for condition in group["conditions"]
+        ):
+            ctx.log.info("익절·손절: 실시간 현재가 WebSocket 기준으로 감시합니다.")
+            try:
+                balance = await ctx.account.balance()
+                open_orders = await ctx.account.open_orders()
+                await self._refresh_live_positions(ctx, balance, open_orders)
+            except RouterError as exc:
+                ctx.log.warning(
+                    f"실시간 익절·손절 초기화 보류 [{exc.code.value}]: {exc.message} · 다음 조회에서 재시도합니다."
+                )
 
         now = datetime.now().astimezone()
         local_time = now.time().replace(tzinfo=None)
@@ -928,8 +1050,7 @@ class ManagedBlockStrategy(Strategy):
             ctx.log.warning(f"매수 판단 보류 [{exc.code.value}]: {exc.message} · 다음 조회에서 재시도합니다.")
             return
         held_codes = {item.instrument.code for item in balance.positions if item.quantity > 0}
-        pending_codes = {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
-        tracked = self._sync_tracked_positions(ctx, balance)
+        tracked, _, pending_codes = await self._refresh_live_positions(ctx, balance, open_orders)
         submitted = 0
         for code in candidate_codes:
             if code in held_codes or code in pending_codes or code in tracked:
@@ -985,6 +1106,7 @@ class ManagedBlockStrategy(Strategy):
             if order.status is not OrderStatus.REJECTED:
                 tracked[code] = str(quantity)
                 ctx.state.set("strategy_positions", tracked)
+                await self._subscribe_live_quote(ctx, code)
                 submitted += 1
                 price_text = f" {limit_price}원" if limit_price is not None else ""
                 ctx.log.info(f"{code} {BUY_ORDER_TYPE}{price_text} {quantity}주 매수 요청: {order.status.value}")
@@ -998,9 +1120,7 @@ class ManagedBlockStrategy(Strategy):
         except RouterError as exc:
             ctx.log.warning(f"매도 판단 보류 [{exc.code.value}]: {exc.message} · 다음 완성 봉에서 재시도합니다.")
             return
-        positions = {item.instrument.code: item for item in balance.positions}
-        pending_codes = {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
-        tracked = self._sync_tracked_positions(ctx, balance)
+        tracked, positions, pending_codes = await self._refresh_live_positions(ctx, balance, open_orders)
         for code in list(tracked):
             position = positions.get(code)
             if position is None or position.quantity <= 0:
@@ -1047,11 +1167,109 @@ class ManagedBlockStrategy(Strategy):
             except RouterError as exc:
                 ctx.log.error(f"{code} 매도 요청 실패 [{exc.code.value}]: {exc.message}")
                 continue
+            if order.status is not OrderStatus.REJECTED:
+                self._live_sell_pending.add(code)
             price_text = f" {limit_price}원" if limit_price is not None else ""
             ctx.log.info(f"{code} {sell_reason} · {SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}")
             if order.status is OrderStatus.FILLED:
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
+
+    async def on_quote(self, ctx, quote):
+        self._ensure_live_state()
+        if quote.delayed or quote.stale or not self._sell_window_is_open(quote.received_at):
+            return
+        code = quote.instrument.code
+        position = self._live_positions.get(code)
+        if position is None or code in self._live_sell_pending:
+            return
+        condition = self._matched_live_profit_condition(
+            quote.price, position.average_price
+        )
+        if condition is None:
+            return
+        try:
+            balance = await ctx.account.balance()
+            open_orders = await ctx.account.open_orders()
+            tracked, positions, pending_codes = await self._refresh_live_positions(
+                ctx, balance, open_orders
+            )
+        except RouterError as exc:
+            ctx.log.warning(
+                f"{code} 실시간 익절·손절 확인 보류 [{exc.code.value}]: {exc.message}"
+            )
+            return
+        position = positions.get(code)
+        if position is None or code in pending_codes or code not in tracked:
+            return
+        condition = self._matched_live_profit_condition(
+            quote.price, position.average_price
+        )
+        if condition is None:
+            return
+        tracked_quantity = (
+            position.strategy_quantity
+            if position.strategy_quantity is not None
+            else Decimal(str(tracked[code]))
+        )
+        quantity = min(tracked_quantity, position.available_quantity)
+        if quantity <= 0:
+            return
+        self._live_sell_pending.add(code)
+        limit_price = None
+        try:
+            order_id = f"live-exit-{code}-{quote.received_at:%Y%m%d%H%M%S%f}-sell"
+            if SELL_ORDER_TYPE == "LIMIT":
+                limit_price = quote.price
+                order = await ctx.orders.limit_sell(
+                    code=code, quantity=quantity, price=limit_price,
+                    route=ORDER_ROUTE, client_order_id=order_id,
+                )
+            else:
+                order = await ctx.orders.market_sell(
+                    code=code, quantity=quantity, route=ORDER_ROUTE,
+                    client_order_id=order_id,
+                )
+        except RouterError as exc:
+            self._live_sell_pending.discard(code)
+            ctx.log.error(f"{code} 실시간 익절·손절 매도 실패 [{exc.code.value}]: {exc.message}")
+            return
+        if order.status is OrderStatus.REJECTED:
+            self._live_sell_pending.discard(code)
+        reason = self._condition_summary(condition)
+        price_text = f" {limit_price}원" if limit_price is not None else ""
+        ctx.log.info(
+            f"{code} 실시간 현재가 {quote.price}원 ({reason}) · "
+            f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
+        )
+
+    async def on_order(self, ctx, order):
+        self._ensure_live_state()
+        code = order.request.instrument.code
+        if order.request.side.value == "BUY":
+            if order.status is not OrderStatus.FILLED:
+                return
+            try:
+                balance = await ctx.account.balance()
+                open_orders = await ctx.account.open_orders()
+                await self._refresh_live_positions(ctx, balance, open_orders)
+            except RouterError as exc:
+                ctx.log.warning(
+                    f"{code} 체결 후 실시간 감시 연결 보류 [{exc.code.value}]: {exc.message}"
+                )
+            return
+        if order.request.side.value != "SELL":
+            return
+        if order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED}:
+            self._live_sell_pending.discard(code)
+            return
+        if order.status is OrderStatus.FILLED:
+            self._live_sell_pending.discard(code)
+            tracked = dict(ctx.state.get("strategy_positions", {}))
+            tracked.pop(code, None)
+            ctx.state.set("strategy_positions", tracked)
+            self._live_positions.pop(code, None)
+            await self._unsubscribe_live_quote(ctx, code)
 
     async def on_stop(self, ctx):
         ctx.log.info("관리형 조건 블록 전략을 종료합니다.")

@@ -581,6 +581,12 @@ class MarketClient:
             raise RouterError(RouterErrorCode.INVALID_REQUEST, "등록된 시세 연결이 없습니다.")
         return await self.source(source).subscribe_orderbooks(codes, venue=venue)
 
+    async def unsubscribe(self, subscription_id: str) -> None:
+        await self._router._delete(
+            f"/api/v1/market/subscriptions/{subscription_id}"
+        )
+        self._router._stream_subscription_ids.discard(subscription_id)
+
 
 class MarketSourceClient:
     def __init__(

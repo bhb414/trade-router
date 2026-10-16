@@ -17,6 +17,7 @@ from trade_router import (
     ConnectionTarget,
     ConditionDefinition,
     InstrumentId,
+    OrderStatus,
     Position,
     TokenScopeKey,
 )
@@ -708,6 +709,94 @@ def test_managed_block_strategy_recovers_a_late_filled_position() -> None:
 
     assert tracked == {"079650": "5"}
     assert values["strategy_positions"] == {"079650": "5"}
+
+
+def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    values: dict[str, object] = {
+        "ownership_initialized": True,
+        "strategy_positions": {"079650": "5"},
+    }
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    position = SimpleNamespace(
+        instrument=SimpleNamespace(code="079650"),
+        quantity=Decimal("5"),
+        available_quantity=Decimal("5"),
+        average_price=Decimal("7590"),
+        strategy_quantity=Decimal("5"),
+    )
+    balance = SimpleNamespace(positions=(position,))
+
+    class Account:
+        async def balance(self):
+            return balance
+
+        async def open_orders(self):
+            return ()
+
+    class Market:
+        async def subscribe_quotes(self, code, *, venue):
+            return ({"id": f"quote-{code}"},)
+
+        async def unsubscribe(self, subscription_id):
+            return None
+
+    submitted: list[dict[str, object]] = []
+
+    class Orders:
+        async def market_sell(self, **kwargs):
+            submitted.append(kwargs)
+            return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED)
+
+    logger = SimpleNamespace(
+        info=lambda message: None,
+        warning=lambda message: None,
+        error=lambda message: None,
+    )
+    ctx = SimpleNamespace(
+        state=State(),
+        account=Account(),
+        market=Market(),
+        orders=Orders(),
+        log=logger,
+    )
+
+    async def exercise() -> None:
+        await strategy._refresh_live_positions(ctx, balance, ())
+        await strategy.on_quote(
+            ctx,
+            SimpleNamespace(
+                instrument=SimpleNamespace(code="079650"),
+                price=Decimal("8000"),
+                delayed=False,
+                stale=False,
+                received_at=datetime(
+                    2026, 10, 16, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")
+                ),
+            ),
+        )
+
+    asyncio.run(exercise())
+
+    assert submitted == [
+        {
+            "code": "079650",
+            "quantity": Decimal("5"),
+            "route": "KRX",
+            "client_order_id": "live-exit-079650-20261016100000000000-sell",
+        }
+    ]
 
 
 def test_status_reports_automatic_runtime_database_recovery(tmp_path: Path) -> None:

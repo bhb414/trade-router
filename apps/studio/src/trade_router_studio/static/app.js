@@ -1657,7 +1657,7 @@ const BLOCK_CONDITION_METRICS = [
   ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
   ["volume", "거래량"], ["bollinger_upper", "볼린저 상단"],
   ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
-  ["average_price", "평균 매수가"], ["profit_rate", "평균가 대비 수익률(%)"],
+  ["average_price", "평균 매수가"], ["profit_rate", "실시간 수익률(평균가 대비 %)"],
 ];
 
 const BLOCK_CONDITION_OPERATORS = [
