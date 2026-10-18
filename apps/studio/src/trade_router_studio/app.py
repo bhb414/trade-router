@@ -699,6 +699,22 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         on_exit=handle_strategy_exit,
     )
 
+    async def refresh_block_runtime(name: str) -> None:
+        """Compile saved block settings with the current server-owned runtime."""
+
+        if manager.strategy_type(name) != "block":
+            return
+        source = manager.read(name)
+        display_name = name[:-3] if name.lower().endswith(".py") else name
+        package = block_package_from_source(display_name, source)
+        compiled = compile_block_strategy(
+            package.settings,
+            template=package.template,
+            layout=package.layout,
+        )
+        if compiled != source:
+            await manager.save(name, compiled)
+
     async def publish_order_event(
         strategy_id: str,
         event: dict[str, object],
@@ -743,6 +759,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 failed: dict[str, str] = {}
                 for name in restore_names:
                     try:
+                        await refresh_block_runtime(name)
                         await manager.start(name)
                         restored.append(name)
                     except Exception as exc:
@@ -3560,6 +3577,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     @app.post("/api/strategies/{name}/start")
     async def start_strategy(name: str) -> dict[str, object]:
         try:
+            await refresh_block_runtime(name)
             result = await manager.start(name)
             journal().record(
                 source=name,
@@ -3572,6 +3590,8 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Strategy not found.") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/strategies/{name}/stop")
     async def stop_strategy(name: str) -> dict[str, object]:

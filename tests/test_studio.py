@@ -164,7 +164,7 @@ def test_managed_block_compiles_generic_comparisons() -> None:
         left="profit_rate", operator="GTE", right="value", value=Decimal("3")
     ).model_dump(mode="json")
     assert strategy._condition_matches(
-        profit_condition, bars_by_request, Decimal("150"),
+        profit_condition, bars_by_request, Decimal("150"), current_price=Decimal("160"),
     )
     cross_condition = BlockTradeCondition(
         left="close", operator="CROSS_UP", right="bollinger_upper"
@@ -316,7 +316,7 @@ def test_managed_block_keeps_or_conditions_inside_and_groups_across_timeframes()
     first = package.settings.buy_condition_groups[0].conditions[0]
     assert (first.left_bar_interval, first.right_bar_interval) == ("1m", "3m")
     assert len(package.settings.buy_condition_groups[0].conditions) == 2
-    assert "if self._condition_matches(condition, bars_by_request, average_price):" in source
+    assert "condition, bars_by_request, average_price, current_price," in source
     assert "for group in groups:" in source
 
 
@@ -436,6 +436,85 @@ def test_managed_block_does_not_require_bars_for_account_only_conditions() -> No
     assert "bars" not in namespace["ManagedBlockStrategy"].config.required_capabilities["primary"]
 
 
+def test_managed_block_treats_profit_rate_as_live_account_data() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = []
+    payload["sell_condition_groups"] = [{
+        "id": "profit-only",
+        "conditions": [BlockTradeCondition(
+            left="profit_rate", operator="GTE", right="value", value=Decimal("3")
+        ).model_dump(mode="json")],
+    }]
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    assert namespace["NEEDS_BARS"] is False
+    assert "bars" not in strategy.config.required_capabilities["primary"]
+    condition = settings.sell_condition_groups[0].conditions[0].model_dump(mode="json")
+    assert strategy._condition_requests(condition) == {}
+    assert strategy._condition_matches(
+        condition, {}, Decimal("100"), current_price=Decimal("103"),
+    )
+
+
+def test_live_profit_exit_still_honors_other_and_condition_groups() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["sell_condition_groups"] = [
+        {
+            "id": "profit",
+            "conditions": [BlockTradeCondition(
+                left="profit_rate", operator="GTE", right="value", value=Decimal("3")
+            ).model_dump(mode="json")],
+        },
+        {
+            "id": "bar-confirmation",
+            "conditions": [BlockTradeCondition(
+                left="close", operator="LT", right="value", value=Decimal("100")
+            ).model_dump(mode="json")],
+        },
+    ]
+    source = render_block_strategy(ConditionBollingerBlockSettings.model_validate(payload))
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    class Market:
+        def __init__(self):
+            self.close = Decimal("101")
+
+        async def bars(self, code, interval, **kwargs):
+            return [SimpleNamespace(
+                open=self.close, high=self.close, low=self.close,
+                close=self.close, volume=Decimal("1000"),
+            )]
+
+    market = Market()
+    context = SimpleNamespace(
+        market=market,
+        log=SimpleNamespace(warning=lambda message: None),
+    )
+
+    async def evaluate():
+        return await strategy._condition_groups_result(
+            context,
+            "005930",
+            namespace["SELL_CONDITION_GROUPS"],
+            average_price=Decimal("100"),
+            current_price=Decimal("104"),
+            side="실시간 매도",
+        )
+
+    passed, _ = asyncio.run(evaluate())
+    assert passed is False
+    market.close = Decimal("99")
+    passed, matched = asyncio.run(evaluate())
+    assert passed is True
+    assert len(matched) == 2
+
+
 def test_legacy_bar_block_package_still_round_trips() -> None:
     settings = BlockStrategySettings(
         strategy_id="legacy-observer",
@@ -546,6 +625,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "left_bar_interval" in static_script.text
         assert "왼쪽 값 설정" in static_script.text
         assert "오른쪽 값 설정" in static_script.text
+        assert "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다." in static_script.text
+        assert "선택한 봉의 종가와 평균 매수가로 계산" not in static_script.text
         page = client.get("/")
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text

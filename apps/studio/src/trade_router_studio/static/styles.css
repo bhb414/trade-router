@@ -699,6 +699,18 @@ button:disabled { cursor: default; opacity: .45; }
 .block-condition-evaluation-hint { margin: 0; color: #697586; font-size: 9px; line-height: 1.45; }
 .block-condition-row { overflow: hidden; border: 1px solid #c8ced8; border-radius: 6px; background: white; }
 .block-condition-expression { display: grid; grid-template-columns: minmax(0, 1fr) 84px minmax(0, 1fr); gap: 5px; padding: 7px; }
+.block-condition-timing {
+  justify-self: start;
+  margin: 0 7px 7px;
+  padding: 3px 6px;
+  border: 1px solid #d5dae2;
+  border-radius: 999px;
+  background: #f3f5f7;
+  color: #667085;
+  font-size: 8px;
+  line-height: 1.2;
+}
+.block-condition-timing.live { border-color: #b8d6ca; background: #edf7f2; color: #316b55; }
 .block-condition-control,
 .block-condition-operand input,
 .block-condition-operand select {

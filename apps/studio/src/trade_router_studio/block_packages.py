@@ -302,7 +302,7 @@ class ConditionBollingerBlockSettings(BaseModel):
             for condition in group.conditions:
                 for side in ("left", "right"):
                     metric = getattr(condition, side)
-                    if metric in {"value", "average_price"}:
+                    if metric in {"value", "average_price", "profit_rate"}:
                         continue
                     offset = getattr(condition, f"{side}_offset")
                     if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
@@ -532,7 +532,7 @@ SELL_CONDITIONS = tuple(json.loads(SELL_CONDITIONS_JSON))
 BUY_CONDITION_GROUPS = tuple(json.loads(BUY_CONDITION_GROUPS_JSON))
 SELL_CONDITION_GROUPS = tuple(json.loads(SELL_CONDITION_GROUPS_JSON))
 BAR_METRICS = {
-    "open", "high", "low", "close", "volume", "profit_rate",
+    "open", "high", "low", "close", "volume",
     "bollinger_upper", "bollinger_middle", "bollinger_lower",
 }
 NEEDS_BARS = any(
@@ -610,7 +610,7 @@ class ManagedBlockStrategy(Strategy):
 
     @staticmethod
     def _source_uses_bars(source):
-        return source["metric"] not in {"value", "average_price"}
+        return source["metric"] not in {"value", "average_price", "profit_rate"}
 
     @staticmethod
     def _source_key(source):
@@ -652,9 +652,13 @@ class ManagedBlockStrategy(Strategy):
         deviation = stddev * variance.sqrt()
         return mean + deviation, mean, mean - deviation
 
-    def _indicator_value(self, metric, bars, offset, average_price, source):
+    def _indicator_value(self, metric, bars, offset, average_price, source, current_price=None):
         if metric == "average_price":
             return average_price if average_price and average_price > 0 else None
+        if metric == "profit_rate":
+            if not average_price or average_price <= 0 or current_price is None:
+                return None
+            return (current_price / average_price - Decimal("1")) * Decimal("100")
         index = len(bars) - 1 - offset
         if index < 0:
             return None
@@ -666,13 +670,12 @@ class ManagedBlockStrategy(Strategy):
             if values is None:
                 return None
             return values[{"bollinger_upper": 0, "bollinger_middle": 1, "bollinger_lower": 2}[metric]]
-        if metric == "profit_rate":
-            if not average_price or average_price <= 0:
-                return None
-            return (bar.close / average_price - Decimal("1")) * Decimal("100")
         return None
 
-    def _condition_operand_value(self, condition, side, bars_by_request, average_price, extra_offset=0):
+    def _condition_operand_value(
+        self, condition, side, bars_by_request, average_price, extra_offset=0,
+        current_price=None,
+    ):
         if side == "right" and condition["right"] == "value":
             return Decimal(str(condition.get("value", "0")))
         source = self._condition_source(condition, side)
@@ -685,16 +688,26 @@ class ManagedBlockStrategy(Strategy):
             source["offset"] + extra_offset,
             average_price,
             source,
+            current_price,
         )
 
-    def _condition_values(self, condition, bars_by_request, average_price, extra_offset=0):
+    def _condition_values(
+        self, condition, bars_by_request, average_price, extra_offset=0,
+        current_price=None,
+    ):
         return (
-            self._condition_operand_value(condition, "left", bars_by_request, average_price, extra_offset),
-            self._condition_operand_value(condition, "right", bars_by_request, average_price, extra_offset),
+            self._condition_operand_value(
+                condition, "left", bars_by_request, average_price, extra_offset, current_price,
+            ),
+            self._condition_operand_value(
+                condition, "right", bars_by_request, average_price, extra_offset, current_price,
+            ),
         )
 
-    def _condition_matches(self, condition, bars_by_request, average_price):
-        left, right = self._condition_values(condition, bars_by_request, average_price)
+    def _condition_matches(self, condition, bars_by_request, average_price, current_price=None):
+        left, right = self._condition_values(
+            condition, bars_by_request, average_price, current_price=current_price,
+        )
         if left is None or right is None:
             return False
         operator = condition["operator"]
@@ -708,7 +721,9 @@ class ManagedBlockStrategy(Strategy):
             return left >= right
         if operator == "EQ":
             return left == right
-        previous_left, previous_right = self._condition_values(condition, bars_by_request, average_price, 1)
+        previous_left, previous_right = self._condition_values(
+            condition, bars_by_request, average_price, 1, current_price,
+        )
         if previous_left is None or previous_right is None:
             return False
         if operator == "CROSS_UP":
@@ -717,13 +732,33 @@ class ManagedBlockStrategy(Strategy):
             return previous_left >= previous_right and left < right
         return False
 
-    async def _condition_groups_result(self, ctx, code, groups, *, average_price=None, side):
+    async def _condition_groups_result(
+        self, ctx, code, groups, *, average_price=None, current_price=None, side,
+    ):
         bars_by_request = {}
         fetched_counts = {}
         matched_groups = []
+        needs_current_price = any(
+            condition.get(source_side) == "profit_rate"
+            for group in groups
+            for condition in group["conditions"]
+            for source_side in ("left", "right")
+        )
+        if needs_current_price and current_price is None:
+            try:
+                current_price = await self._current_price(ctx, code)
+            except RouterError as exc:
+                ctx.log.warning(
+                    f"{self._instrument_label(ctx, code)} {side} 실시간 수익률 조회 실패 "
+                    f"[{exc.code.value}]: {exc.message}"
+                )
         for group in groups:
             matched = []
-            for condition in group["conditions"]:
+            ordered_conditions = sorted(
+                group["conditions"],
+                key=lambda item: not self._is_live_profit_condition(item),
+            )
+            for condition in ordered_conditions:
                 for key, required in self._condition_requests(condition).items():
                     if fetched_counts.get(key, 0) >= required:
                         continue
@@ -740,7 +775,9 @@ class ManagedBlockStrategy(Strategy):
                         bars_by_request[key] = ()
                         fetched_counts[key] = required
                         ctx.log.warning(f"{self._instrument_label(ctx, code)} {side} 조건 자료 조회 실패 [{exc.code.value}]: {exc.message}")
-                if self._condition_matches(condition, bars_by_request, average_price):
+                if self._condition_matches(
+                    condition, bars_by_request, average_price, current_price,
+                ):
                     matched.append(condition)
                     break
             if not matched:
@@ -887,7 +924,7 @@ class ManagedBlockStrategy(Strategy):
         sell_source_text = ", ".join(dict.fromkeys(
             f"{item['bar_interval']}·{'완성봉' if item['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"
             for item in sell_sources
-            if self._source_uses_bars(item) and item["metric"] != "profit_rate"
+            if self._source_uses_bars(item)
         )) or "봉 계산 없음"
         ctx.log.info(f"매수 조건 블록: {buy_source_text} · 블록 내부 OR / 블록 간 순차 AND")
         ctx.log.info(f"매도 조건 블록: {sell_source_text} · 블록 내부 OR / 블록 간 순차 AND")
@@ -899,7 +936,7 @@ class ManagedBlockStrategy(Strategy):
         )
         bar_sell_sources = [
             item for item in sell_sources
-            if self._source_uses_bars(item) and item["metric"] != "profit_rate"
+            if self._source_uses_bars(item)
         ]
         if not bar_sell_sources or any(item["bar_data_mode"] == "INCLUDE_CURRENT" for item in bar_sell_sources):
             ctx.scheduler.every(
@@ -1241,6 +1278,16 @@ class ManagedBlockStrategy(Strategy):
         )
         if condition is None:
             return
+        should_sell, matched_groups = await self._condition_groups_result(
+            ctx,
+            code,
+            SELL_CONDITION_GROUPS,
+            average_price=position.average_price,
+            current_price=quote.price,
+            side="실시간 매도",
+        )
+        if not should_sell:
+            return
         tracked_quantity = (
             position.strategy_quantity
             if position.strategy_quantity is not None
@@ -1270,7 +1317,10 @@ class ManagedBlockStrategy(Strategy):
             return
         if order.status is OrderStatus.REJECTED:
             self._live_sell_pending.discard(code)
-        reason = self._condition_summary(condition)
+        reason = " 그리고 ".join(
+            "(" + " 또는 ".join(self._condition_summary(item) for item in matched) + ")"
+            for matched in matched_groups
+        )
         price_text = f" {limit_price}원" if limit_price is not None else ""
         ctx.log.info(
             f"{self._instrument_label(ctx, code)} 실시간 현재가 {quote.price}원 ({reason}) · "

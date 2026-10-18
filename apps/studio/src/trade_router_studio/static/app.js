@@ -1761,6 +1761,27 @@ const BLOCK_CONDITION_OPERATORS = [
   ["CROSS_UP", "상향돌파"], ["CROSS_DOWN", "하향돌파"],
 ];
 
+function isLiveProfitCondition(condition) {
+  const metrics = new Set([condition?.left, condition?.right]);
+  return metrics.has("profit_rate") && [...metrics].every(metric => ["profit_rate", "value"].includes(metric));
+}
+
+function blockConditionTiming(condition) {
+  if (isLiveProfitCondition(condition)) return "실시간 현재가";
+  const labels = [];
+  for (const side of ["left", "right"]) {
+    const metric = condition?.[side];
+    if (!metric || metric === "value" || metric === "average_price" || metric === "profit_rate") continue;
+    const interval = condition[`${side}_bar_interval`] || "3m";
+    const intervalLabel = interval === "1d" ? "일봉" : `${interval.replace("m", "")}분봉`;
+    const modeLabel = (condition[`${side}_bar_data_mode`] || "COMPLETE_ONLY") === "COMPLETE_ONLY"
+      ? "완성봉"
+      : "진행봉 포함";
+    labels.push(`${intervalLabel} ${modeLabel}`);
+  }
+  return [...new Set(labels)].join(" · ") || "계좌 값";
+}
+
 function conditionSelect(items, value, disabled, onChange) {
   const select = document.createElement("select");
   select.className = "block-condition-control";
@@ -1838,10 +1859,16 @@ const BLOCK_BAR_INTERVALS = ["1m", "3m", "5m", "10m", "15m", "30m", "60m", "120m
 function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, condition, disabled) {
   const panel = document.createElement("div");
   panel.className = "block-condition-operand";
-  const title = document.createElement("strong");
-  title.textContent = side === "left" ? "왼쪽 값 설정" : "오른쪽 값 설정";
-  panel.append(title);
   const metric = condition[side];
+  const title = document.createElement("strong");
+  title.textContent = metric === "profit_rate"
+    ? "실시간 계산"
+    : metric === "average_price"
+      ? "계좌 값"
+      : side === "right" && metric === "value"
+        ? "비교 기준"
+        : side === "left" ? "왼쪽 값 설정" : "오른쪽 값 설정";
+  panel.append(title);
   if (side === "right" && metric === "value") {
     const row = document.createElement("label");
     row.textContent = "비교값";
@@ -1859,6 +1886,13 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     const hint = document.createElement("span");
     hint.className = "block-condition-operand-hint";
     hint.textContent = "계좌의 평균 매수가를 사용합니다.";
+    panel.append(hint);
+    return panel;
+  }
+  if (metric === "profit_rate") {
+    const hint = document.createElement("span");
+    hint.className = "block-condition-operand-hint";
+    hint.textContent = "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다. 수수료·세금은 포함하지 않습니다.";
     panel.append(hint);
     return panel;
   }
@@ -1922,12 +1956,6 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     deviationRow.append(deviation);
     panel.append(periodRow, deviationRow);
   }
-  if (metric === "profit_rate") {
-    const hint = document.createElement("span");
-    hint.className = "block-condition-operand-hint";
-    hint.textContent = "선택한 봉의 종가와 평균 매수가로 계산하며 수수료·세금은 포함하지 않습니다.";
-    panel.append(hint);
-  }
   return panel;
 }
 
@@ -1960,6 +1988,9 @@ function createConditionEditor(kind, groupIndex, disabled) {
       createConditionOperandEditor(kind, groupIndex, index, "left", condition, disabled),
       createConditionOperandEditor(kind, groupIndex, index, "right", condition, disabled),
     );
+    const timing = document.createElement("span");
+    timing.className = `block-condition-timing${isLiveProfitCondition(condition) ? " live" : ""}`;
+    timing.textContent = `판단 기준 · ${blockConditionTiming(condition)}`;
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "block-condition-remove";
@@ -1973,7 +2004,7 @@ function createConditionEditor(kind, groupIndex, disabled) {
     const footer = document.createElement("div");
     footer.className = "block-condition-row-footer";
     footer.append(remove);
-    row.append(top, detail, footer);
+    row.append(top, timing, detail, footer);
     wrap.append(row);
     if (index < rows.length - 1) wrap.append(conditionJoin("또는 (OR)"));
   });
@@ -2621,6 +2652,22 @@ function renderConditionBollingerBlocks(parsed, running) {
   };
   const buyGroups = blockConditionGroups("buy");
   const sellGroups = blockConditionGroups("sell");
+  const sellConditions = sellGroups.flatMap(group => group.conditions || []);
+  const hasLiveSellConditions = sellConditions.some(isLiveProfitCondition);
+  const hasBarSellConditions = sellConditions.some(condition =>
+    [condition.left, condition.right].some(metric =>
+      metric && !["value", "average_price", "profit_rate"].includes(metric)
+    )
+  );
+  const sellScheduleMeta = hasLiveSellConditions && hasBarSellConditions
+    ? "실시간 · 봉 시점"
+    : hasLiveSellConditions
+      ? "실시간"
+      : "봉 시점";
+  const sellScheduleActions = [
+    ...(hasLiveSellConditions ? ["수익률 · 실시간 현재가"] : []),
+    ...(hasBarSellConditions ? ["차트 값 · 각 조건의 봉 설정"] : []),
+  ];
   const plan = managedConditionGraphPlan(settings);
   state.blockGraphPlan = plan;
   const world = document.createElement("div");
@@ -2648,8 +2695,8 @@ function renderConditionBollingerBlocks(parsed, running) {
       fields: take("sell_order_type"), actions: ["전략 소유 수량", "주문 제출", "상태 조정"], vertical: true },
     { id: "buySchedule", title: "종목 조회 일정", meta: "정각 반복", tone: "schedule", width: 320,
       fields: take("buy_scan_seconds", "buy_start_time", "buy_end_time") },
-    { id: "sellSchedule", title: "매도 판단 일정", meta: "봉 마감", tone: "schedule", width: 320,
-      fields: take("sell_start_time", "sell_end_time") },
+    { id: "sellSchedule", title: "매도 판단 일정", meta: sellScheduleMeta, tone: "schedule", width: 320,
+      fields: take("sell_start_time", "sell_end_time"), actions: sellScheduleActions, vertical: true },
     { id: "closeSchedule", title: "장 마감 청산", meta: "정시 · 재확인", tone: "schedule", width: 360,
       fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time") },
   ];
