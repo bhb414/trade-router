@@ -661,6 +661,9 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         chart_script = client.get("/static/chart.js")
         assert chart_script.status_code == 200
         assert "HEIKIN_ASHI" in chart_script.text
+        assert "/api/chart/bars" in chart_script.text
+        assert 'addEventListener("wheel"' in chart_script.text
+        assert 'addEventListener("pointerdown"' in chart_script.text
         assert 'id="dashboard-chart"' in page.text
         assert 'id="chart-modal"' in page.text
         assert 'id="chart-indicator-modal"' in page.text
@@ -1034,6 +1037,7 @@ def test_chart_api_uses_an_eligible_connection_and_normalizes_market_data(
             assert code == "005930"
             assert interval == "3m"
             assert kwargs["venue"] is Venue.KRX
+            bar_end_requests.append(kwargs.get("end"))
             return (
                 Bar(
                     instrument=InstrumentId(code), interval=interval,
@@ -1059,6 +1063,7 @@ def test_chart_api_uses_an_eligible_connection_and_normalizes_market_data(
             assert source == connection["id"]
             return "삼성전자" if code == "005930" else None
 
+        bar_end_requests: list[datetime | None] = []
         app.state.connections.bars = bars
         app.state.connections.quote = quote
         app.state.connections.instrument_name = instrument_name
@@ -1093,6 +1098,19 @@ def test_chart_api_uses_an_eligible_connection_and_normalizes_market_data(
         assert payload["instrument"] == {"code": "005930", "name": "삼성전자"}
         assert payload["bars"][0]["close"] == "70400"
         assert payload["quote"]["price"] == "70400"
+
+        history = client.get(
+            "/api/chart/bars",
+            params={
+                "code": "005930", "interval": "3m", "venue": "KRX",
+                "source": "AUTO", "count": 20,
+                "end": (now - timedelta(days=1)).isoformat(),
+            },
+        )
+        assert history.status_code == 200
+        assert history.json()["source"]["id"] == connection["id"]
+        assert history.json()["bars"][0]["close"] == "70400"
+        assert bar_end_requests[-1] is not None
 
         search = client.get("/api/chart/instruments", params={"q": "삼성"}).json()
         assert search["instruments"][0] == {"code": "005930", "name": "삼성전자"}

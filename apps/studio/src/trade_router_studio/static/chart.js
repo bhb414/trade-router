@@ -17,6 +17,14 @@
     searchIndex: -1,
     resizeObserver: null,
     manualClose: true,
+    viewCount: null,
+    viewEnd: null,
+    geometry: null,
+    crosshair: null,
+    drag: null,
+    historyLoading: false,
+    noMoreHistory: false,
+    historyRetryAt: 0,
     indicators: [
       { id: crypto.randomUUID(), type: "BOLLINGER", placement: "SERIES", period: 20, deviation: 2, color: "#2f67d8" },
       { id: crypto.randomUUID(), type: "VOLUME", placement: "PANEL", period: 20, color: "#7c8798" },
@@ -230,6 +238,60 @@
     ctx.fillText(label, panel.x + 5, panel.y + 12);
   }
 
+  function formatBarTime(value, detailed = false) {
+    const time = new Date(value);
+    if (el.interval.value.endsWith("m")) {
+      return time.toLocaleString("ko-KR", {
+        timeZone: "Asia/Seoul",
+        month: detailed ? "2-digit" : undefined,
+        day: detailed ? "2-digit" : undefined,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      });
+    }
+    return time.toLocaleDateString("ko-KR", {
+      timeZone: "Asia/Seoul",
+      year: detailed ? "2-digit" : undefined,
+      month: "2-digit",
+      day: "2-digit",
+    });
+  }
+
+  function drawCrosshair(ctx, rows, geometry) {
+    if (!state.crosshair || state.drag) return;
+    const { pricePanel, start, end, xAt, yAt, minimum, maximum, bounds } = geometry;
+    const index = Math.max(start, Math.min(end - 1, state.crosshair.index));
+    const row = rows[index];
+    if (!row) return;
+    const x = xAt(index);
+    const y = Math.max(pricePanel.y, Math.min(pricePanel.y + pricePanel.h, state.crosshair.y));
+    ctx.save();
+    ctx.strokeStyle = "#7c8798";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(x, pricePanel.y); ctx.lineTo(x, bounds.height - 22); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pricePanel.x, y); ctx.lineTo(pricePanel.x + pricePanel.w, y); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const timeLabel = formatBarTime(row.open_time, true);
+    ctx.font = "10px system-ui";
+    const timeWidth = ctx.measureText(timeLabel).width + 12;
+    const timeX = Math.max(pricePanel.x, Math.min(pricePanel.x + pricePanel.w - timeWidth, x - timeWidth / 2));
+    ctx.fillStyle = "#475467";
+    ctx.fillRect(timeX, bounds.height - 21, timeWidth, 18);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(timeLabel, timeX + 6, bounds.height - 8);
+
+    const price = maximum - (y - pricePanel.y) / pricePanel.h * (maximum - minimum);
+    const priceLabel = formatPrice(price);
+    ctx.fillStyle = "#475467";
+    ctx.fillRect(pricePanel.x + pricePanel.w, y - 9, bounds.width - pricePanel.x - pricePanel.w, 18);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(priceLabel, pricePanel.x + pricePanel.w + 5, y + 3);
+    ctx.restore();
+  }
+
   function drawChart() {
     const canvas = el.canvas;
     const panelCount = state.indicators.filter(item => item.placement === "PANEL").length;
@@ -239,10 +301,12 @@
     const bounds = canvas.getBoundingClientRect();
     if (!bounds.width || !bounds.height) return;
     const ratio = Math.max(1, window.devicePixelRatio || 1);
-    canvas.width = Math.round(bounds.width * ratio);
-    canvas.height = Math.round(bounds.height * ratio);
+    const pixelWidth = Math.round(bounds.width * ratio);
+    const pixelHeight = Math.round(bounds.height * ratio);
+    if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+    if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
     const ctx = canvas.getContext("2d");
-    ctx.scale(ratio, ratio);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, bounds.width, bounds.height);
     if (!state.bars.length) return;
 
@@ -255,9 +319,16 @@
     const panelHeight = panelIndicators.length ? Math.max(72, Math.min(110, availableHeight * .18)) : 0;
     const priceHeight = Math.max(150, availableHeight - panelHeight * panelIndicators.length);
     const pricePanel = { x: left, y: top, w: bounds.width - left - right, h: priceHeight };
-    const visibleCount = Math.max(20, Math.min(rows.length, Math.floor(pricePanel.w / 8)));
-    const start = Math.max(0, rows.length - visibleCount), end = rows.length;
-    const step = pricePanel.w / visibleCount;
+    if (state.viewCount == null) {
+      state.viewCount = Math.max(36, Math.min(140, Math.floor(pricePanel.w / 9)));
+    }
+    const visibleCount = Math.max(12, Math.min(300, Math.round(state.viewCount)));
+    if (state.viewEnd == null) state.viewEnd = rows.length;
+    const actualCount = Math.min(rows.length, visibleCount);
+    const end = Math.max(actualCount, Math.min(rows.length, Math.round(state.viewEnd)));
+    const start = Math.max(0, end - actualCount);
+    state.viewEnd = end;
+    const step = pricePanel.w / Math.max(1, actualCount);
     const xAt = index => pricePanel.x + (index - start + .5) * step;
     const overlays = seriesIndicators.flatMap(item => indicatorSeries(item, rows));
     const priceValues = rows.slice(start, end).flatMap(row => [row.low, row.high]);
@@ -325,12 +396,11 @@
     ctx.fillStyle = "#7a8493";
     for (let index = 0; index <= labelCount; index += 1) {
       const rowIndex = Math.min(end - 1, start + Math.floor((visibleCount - 1) * index / labelCount));
-      const time = new Date(rows[rowIndex].open_time);
-      const label = el.interval.value.endsWith("m")
-        ? time.toLocaleTimeString("ko-KR", { timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
-        : time.toLocaleDateString("ko-KR", { timeZone: "Asia/Seoul", month: "2-digit", day: "2-digit" });
+      const label = formatBarTime(rows[rowIndex].open_time);
       ctx.fillText(label, xAt(rowIndex) - 18, bounds.height - 7);
     }
+    state.geometry = { bounds, pricePanel, start, end, step, xAt, yAt, minimum, maximum };
+    drawCrosshair(ctx, rows, state.geometry);
     canvas.dataset.start = String(start);
     canvas.dataset.end = String(end);
     canvas.dataset.step = String(step);
@@ -476,6 +546,60 @@
     await loadChart();
   }
 
+  function mergeOlderBars(rows) {
+    const existing = new Set(state.bars.map(row => row.open_time));
+    const added = rows.filter(row => !existing.has(row.open_time));
+    if (!added.length) return 0;
+    state.bars = [...added, ...state.bars]
+      .sort((a, b) => new Date(a.open_time) - new Date(b.open_time));
+    state.viewEnd = (state.viewEnd ?? state.bars.length - added.length) + added.length;
+    if (state.crosshair) state.crosshair.index += added.length;
+    if (state.drag) state.drag.startEnd += added.length;
+    return added.length;
+  }
+
+  function restoreStreamState() {
+    if (state.socket?.readyState === WebSocket.OPEN) setLiveState("실시간", "live");
+    else if (state.fallbackTimer) setLiveState("REST 보완 · 10초", "fallback");
+    else setLiveState("조회됨", "idle");
+  }
+
+  async function loadOlderBars() {
+    if (state.historyLoading || state.noMoreHistory || !state.bars.length || !state.source) return;
+    if (Date.now() < state.historyRetryAt) return;
+    state.historyLoading = true;
+    setLiveState("이전 봉 조회 중", "connecting");
+    try {
+      const earliest = new Date(state.bars[0].open_time).getTime() - 1;
+      const query = new URLSearchParams({
+        code: state.code,
+        interval: el.interval.value,
+        venue: el.venue.value,
+        source: state.source.id,
+        count: "180",
+        end: new Date(earliest).toISOString(),
+      });
+      const payload = await request(`/api/chart/bars?${query}`);
+      const received = (payload.bars || []).map(barNumbers);
+      const added = mergeOlderBars(received);
+      if (!added) state.noMoreHistory = true;
+      drawChart();
+      restoreStreamState();
+    } catch (_) {
+      state.historyRetryAt = Date.now() + 5000;
+      setLiveState("이전 봉 조회 실패", "error");
+      setTimeout(restoreStreamState, 1500);
+    } finally {
+      state.historyLoading = false;
+    }
+  }
+
+  function maybeLoadOlder() {
+    const geometry = state.geometry;
+    if (!geometry || geometry.start > Math.max(6, state.viewCount * .08)) return;
+    loadOlderBars();
+  }
+
   function renderQuote() {
     if (!state.quote || !state.code) return;
     const bar = state.bars[state.bars.length - 1];
@@ -512,9 +636,11 @@
     const start = bucketStart(quote.market_time || quote.received_at, el.interval.value);
     const last = state.bars[state.bars.length - 1];
     const lastStart = bucketStart(last.open_time, el.interval.value);
+    const followingLatest = state.viewEnd == null || state.viewEnd >= state.bars.length;
     if (start > lastStart) {
       state.bars.push({ ...last, open_time: new Date(start).toISOString(), close_time: new Date(start).toISOString(), open: price, high: price, low: price, close: price, volume: 0, complete: false });
       if (state.bars.length > 400) state.bars.shift();
+      if (followingLatest) state.viewEnd = state.bars.length;
     } else if (start === lastStart) {
       last.high = Math.max(last.high, price);
       last.low = Math.min(last.low, price);
@@ -568,6 +694,9 @@
   }
 
   async function loadChart() {
+    state.searchRequest += 1;
+    clearTimeout(state.searchTimer);
+    showSearchResults([]);
     const typedCode = el.search.value.match(/(?:^|·\s*)([A-Z0-9]{6,24})\s*$/i)?.[1];
     if (!state.code && typedCode) state.code = typedCode.toUpperCase();
     if (!state.code) { await searchInstruments(); return; }
@@ -580,7 +709,13 @@
       const payload = await request(`/api/chart/data?${query}`);
       state.source = payload.source;
       state.name = payload.instrument?.name || state.name;
+      if (state.name) el.search.value = `${state.name} · ${state.code}`;
       state.bars = (payload.bars || []).map(barNumbers).sort((a, b) => new Date(a.open_time) - new Date(b.open_time));
+      state.viewCount = null;
+      state.viewEnd = state.bars.length;
+      state.crosshair = null;
+      state.noMoreHistory = false;
+      state.historyRetryAt = 0;
       state.quote = payload.quote;
       el.empty.hidden = Boolean(state.bars.length);
       if (!state.bars.length) { el.empty.hidden = false; el.empty.textContent = "표시할 봉이 없습니다."; }
@@ -606,6 +741,7 @@
       await loadChart();
     } else {
       state.code = ""; state.name = ""; state.bars = []; state.quote = null;
+      state.viewCount = null; state.viewEnd = null; state.crosshair = null; state.noMoreHistory = false;
       el.search.value = ""; el.title.textContent = "종목 차트";
       el.empty.hidden = false; el.empty.textContent = "종목을 선택하면 차트를 표시합니다.";
       setLiveState("조회 전", "idle"); drawChart(); el.search.focus();
@@ -670,21 +806,74 @@
     });
     [el.source, el.venue, el.interval].forEach(control => control.addEventListener("change", () => { saveSettings(); if (state.code) loadChart(); }));
     el.type.addEventListener("change", () => { saveSettings(); drawChart(); });
-    el.canvas.addEventListener("mousemove", event => {
-      if (!state.bars.length) return;
+    el.canvas.addEventListener("pointerdown", event => {
+      if (!state.geometry || event.button !== 0) return;
+      state.drag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startEnd: state.viewEnd,
+        step: state.geometry.step,
+      };
+      el.canvas.setPointerCapture(event.pointerId);
+      el.canvas.classList.add("dragging");
+      state.crosshair = null;
+      el.tooltip.hidden = true;
+    });
+    el.canvas.addEventListener("pointermove", event => {
+      if (!state.bars.length || !state.geometry) return;
+      if (state.drag) {
+        const shift = Math.round((event.clientX - state.drag.startX) / Math.max(1, state.drag.step));
+        const count = Math.min(state.bars.length, Math.round(state.viewCount));
+        state.viewEnd = Math.max(count, Math.min(state.bars.length, state.drag.startEnd - shift));
+        drawChart();
+        maybeLoadOlder();
+        return;
+      }
       const rect = el.canvas.getBoundingClientRect();
-      const start = Number(el.canvas.dataset.start || 0), end = Number(el.canvas.dataset.end || state.bars.length), step = Number(el.canvas.dataset.step || 1);
-      const index = Math.max(start, Math.min(end - 1, start + Math.floor((event.clientX - rect.left - 12) / step)));
+      const { pricePanel, start, end, step } = state.geometry;
+      const relativeX = event.clientX - rect.left;
+      const index = Math.max(start, Math.min(end - 1, start + Math.round((relativeX - pricePanel.x) / step - .5)));
+      state.crosshair = { index, y: event.clientY - rect.top };
       const rows = el.type.value === "HEIKIN_ASHI" ? heikinAshi(state.bars) : state.bars;
       const row = rows[index];
       if (!row) return;
-      const time = new Date(row.open_time).toLocaleString("ko-KR", { timeZone: "Asia/Seoul", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+      const time = formatBarTime(row.open_time, true);
       el.tooltip.textContent = `${time}\n시 ${formatPrice(row.open)}  고 ${formatPrice(row.high)}\n저 ${formatPrice(row.low)}  종 ${formatPrice(row.close)}\n거래량 ${formatPrice(row.volume)}`;
       el.tooltip.style.left = `${Math.min(rect.width - 180, Math.max(8, event.clientX - rect.left + 12))}px`;
       el.tooltip.style.top = `${Math.max(8, event.clientY - rect.top - 68)}px`;
       el.tooltip.hidden = false;
+      drawChart();
     });
-    el.canvas.addEventListener("mouseleave", () => { el.tooltip.hidden = true; });
+    const finishDrag = event => {
+      if (!state.drag || (event.pointerId != null && event.pointerId !== state.drag.pointerId)) return;
+      state.drag = null;
+      el.canvas.classList.remove("dragging");
+      maybeLoadOlder();
+      drawChart();
+    };
+    el.canvas.addEventListener("pointerup", finishDrag);
+    el.canvas.addEventListener("pointercancel", finishDrag);
+    el.canvas.addEventListener("wheel", event => {
+      if (!state.geometry || !state.bars.length) return;
+      event.preventDefault();
+      const rect = el.canvas.getBoundingClientRect();
+      const { pricePanel, start, end } = state.geometry;
+      const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left - pricePanel.x) / pricePanel.w));
+      const anchor = start + fraction * Math.max(1, end - start);
+      const oldCount = Math.max(12, Math.round(state.viewCount));
+      const factor = event.deltaY > 0 ? 1.16 : .86;
+      const nextCount = Math.max(12, Math.min(300, Math.round(oldCount * factor)));
+      if (nextCount === oldCount) return;
+      const nextStart = anchor - fraction * nextCount;
+      state.viewCount = nextCount;
+      state.viewEnd = Math.round(nextStart + nextCount);
+      state.viewEnd = Math.max(Math.min(nextCount, state.bars.length), Math.min(state.bars.length, state.viewEnd));
+      drawChart();
+      maybeLoadOlder();
+    }, { passive: false });
+    el.canvas.addEventListener("mouseleave", () => {
+      if (!state.drag) { state.crosshair = null; el.tooltip.hidden = true; drawChart(); }
+    });
     state.resizeObserver = new ResizeObserver(drawChart);
     state.resizeObserver.observe($("#chart-stage"));
     loadSources(restoredSource).catch(() => {});

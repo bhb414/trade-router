@@ -1735,6 +1735,38 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         except (ValueError, SettingsError, RouterError) as exc:
             raise chart_http_error(exc) from exc
 
+    @app.get("/api/chart/bars")
+    async def chart_bars(
+        code: str = Query(min_length=1, max_length=24),
+        interval: str = Query(default="3m", max_length=16),
+        venue: str = Query(default="INTEGRATED", max_length=16),
+        source: str = Query(default="AUTO", max_length=160),
+        count: int = Query(default=180, ge=20, le=400),
+        end: datetime | None = None,
+    ) -> dict[str, object]:
+        try:
+            instrument = InstrumentId(code)
+            market_venue = Venue(venue.upper())
+            selected = await chart_connection(source, market_venue)
+            bars = await connection_runtime.bars(
+                str(selected["id"]),
+                instrument.code,
+                interval,
+                count=count,
+                venue=market_venue,
+                source_alias=str(selected["label"]),
+                end=end,
+            )
+            return {
+                "source": selected,
+                "instrument": {"code": instrument.code},
+                "interval": interval,
+                "venue": market_venue.value,
+                "bars": [bar_payload(bar) for bar in bars[-count:]],
+            }
+        except (ValueError, SettingsError, RouterError) as exc:
+            raise chart_http_error(exc) from exc
+
     @app.get("/api/chart/quote")
     async def chart_quote(
         code: str = Query(min_length=1, max_length=24),
