@@ -624,7 +624,7 @@ function metricCard(label, raw, { unit = "원", signed = false, percent = false 
   return article;
 }
 
-function dataTable(columns, rows, emptyMessage) {
+function dataTable(columns, rows, emptyMessage, { onRowClick = null, rowClass = "" } = {}) {
   if (!rows.length) {
     const empty = document.createElement("div");
     empty.className = "balance-empty";
@@ -646,6 +646,18 @@ function dataTable(columns, rows, emptyMessage) {
   const body = document.createElement("tbody");
   rows.forEach(row => {
     const line = document.createElement("tr");
+    if (rowClass) line.className = rowClass;
+    if (onRowClick) {
+      line.tabIndex = 0;
+      line.title = "차트 열기";
+      line.addEventListener("click", () => onRowClick(row));
+      line.addEventListener("keydown", event => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onRowClick(row);
+        }
+      });
+    }
     columns.forEach(column => {
       const cell = document.createElement("td");
       const output = column.render(row);
@@ -660,7 +672,7 @@ function dataTable(columns, rows, emptyMessage) {
   return wrap;
 }
 
-function positionTable(positions, emptyMessage = "이 전략이 보유한 종목이 없습니다.") {
+function positionTable(positions, emptyMessage = "이 전략이 보유한 종목이 없습니다.", chartOptions = {}) {
   return dataTable([
     { label: "종목", render: row => instrumentLabel(row) },
     { label: "보유 / 주문가능", render: row => `${formatNumber(row.quantity)} / ${formatNumber(row.available_quantity)}주` },
@@ -669,7 +681,14 @@ function positionTable(positions, emptyMessage = "이 전략이 보유한 종목
     { label: "평가금액", render: row => row.market_value == null ? "—" : `${formatNumber(row.market_value)}원` },
     { label: "평가손익", render: row => ({ text: row.unrealized_profit == null ? "—" : `${formatNumber(row.unrealized_profit, { signed: true })}원`, className: profitClass(row.unrealized_profit) }) },
     { label: "수익률", render: row => ({ text: row.return_percent == null ? "—" : `${Number(row.return_percent).toLocaleString("ko-KR", { maximumFractionDigits: 2 })}%`, className: profitClass(row.return_percent) }) },
-  ], positions || [], emptyMessage);
+  ], positions || [], emptyMessage, {
+    rowClass: "chart-open-row",
+    onRowClick: row => window.tradeRouterChart?.open({
+      code: row.code,
+      name: row.name,
+      source: chartOptions.source || "AUTO",
+    }),
+  });
 }
 
 function instrumentLabel(row) {
@@ -937,7 +956,17 @@ function renderAccountBalanceModal() {
   appendLimitRow(limits, "일일 누적 매수횟수", account.limits?.max_daily_buy_count, "times");
   appendLimitRow(limits, "최대 보유 노출액", account.limits?.max_exposure);
   appendLimitRow(limits, "동시 미체결 주문", account.limits?.max_open_orders, "count");
-  body.append(metrics, positionsHeading, positionTable(account.positions || [], "이 계좌에 보유 종목이 없습니다."), limitHeading, limits);
+  body.append(
+    metrics,
+    positionsHeading,
+    positionTable(
+      account.positions || [],
+      "이 계좌에 보유 종목이 없습니다.",
+      { source: account.connection_id || "AUTO" },
+    ),
+    limitHeading,
+    limits,
+  );
 }
 
 function closeAccountBalance() {
@@ -1751,6 +1780,8 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [],
 
 const BLOCK_CONDITION_METRICS = [
   ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
+  ["heikin_open", "하이킨아시 시가"], ["heikin_high", "하이킨아시 고가"],
+  ["heikin_low", "하이킨아시 저가"], ["heikin_close", "하이킨아시 종가"],
   ["volume", "거래량"], ["bollinger_upper", "볼린저 상단"],
   ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
   ["average_price", "평균 매수가"], ["profit_rate", "실시간 수익률(평균가 대비 %)"],
@@ -4073,6 +4104,9 @@ elements.dashboardButton.addEventListener("click", () => {
 });
 elements.dashboardRefresh.addEventListener("click", () => {
   refreshDashboard(true).catch(error => notify(error.message, true));
+});
+document.querySelector("#dashboard-chart").addEventListener("click", () => {
+  window.tradeRouterChart?.open();
 });
 document.querySelector("#strategy-search-button").addEventListener("click", () => {
   elements.strategySearch.hidden = false;

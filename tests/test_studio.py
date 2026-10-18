@@ -13,14 +13,17 @@ from fastapi.testclient import TestClient
 
 from trade_router import (
     AccessToken,
+    Bar,
     Balance,
     ConnectionTarget,
     ConditionDefinition,
     InstrumentId,
     OrderStatus,
     Position,
+    Quote,
     ScheduleKind,
     TokenScopeKey,
+    Venue,
 )
 from trade_router_studio.app import (
     _strategy_performance,
@@ -171,6 +174,32 @@ def test_managed_block_compiles_generic_comparisons() -> None:
     ).model_dump(mode="json")
     requests = strategy._condition_requests(cross_condition)
     assert requests[("3m", True)] == 56
+
+
+def test_managed_block_compares_heikin_ashi_prices_with_a_stable_warmup() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    bars = [
+        SimpleNamespace(
+            open=Decimal(str(100 + index)),
+            high=Decimal(str(104 + index)),
+            low=Decimal(str(98 + index)),
+            close=Decimal(str(102 + index)),
+            volume=Decimal("1000"),
+        )
+        for index in range(24)
+    ]
+    condition = BlockTradeCondition(
+        left="heikin_close", operator="GT", right="value", value=Decimal("120")
+    ).model_dump(mode="json")
+
+    assert strategy._condition_requests(condition)[("3m", True)] == 24
+    assert strategy._condition_matches(condition, {("3m", True): bars}, None) is True
+    values = strategy._heikin_ashi_values(bars)
+    assert values[0][0] == Decimal("101")
+    assert values[-1][3] == Decimal("124")
 
 
 def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> None:
@@ -623,11 +652,17 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "매수 주문 조건" in static_script.text
         assert "createCalculationEditor" not in static_script.text
         assert "left_bar_interval" in static_script.text
+        assert "하이킨아시 종가" in static_script.text
         assert "왼쪽 값 설정" in static_script.text
         assert "오른쪽 값 설정" in static_script.text
         assert "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다." in static_script.text
         assert "선택한 봉의 종가와 평균 매수가로 계산" not in static_script.text
         page = client.get("/")
+        chart_script = client.get("/static/chart.js")
+        assert chart_script.status_code == 200
+        assert "HEIKIN_ASHI" in chart_script.text
+        assert 'id="dashboard-chart"' in page.text
+        assert 'id="chart-modal"' in page.text
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text
         assert 'name="strategy-type" value="script"' in page.text
@@ -973,6 +1008,79 @@ def test_block_editor_condition_options_use_connection_runtime(tmp_path: Path) -
         }
     ]
     assert calls == [("kis-live", "tester")]
+
+
+def test_chart_api_uses_an_eligible_connection_and_normalizes_market_data(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+    now = datetime.now(ZoneInfo("Asia/Seoul")).replace(microsecond=0)
+    with TestClient(app) as client:
+        connection = client.post(
+            "/api/settings/connections",
+            json={
+                "provider": "kis",
+                "target": "PAPER",
+                "label": "chart-source",
+                "app_key": "chart-key",
+                "app_secret": "chart-secret",
+            },
+        ).json()
+
+        async def bars(source, code, interval, **kwargs):
+            assert source == connection["id"]
+            assert code == "005930"
+            assert interval == "3m"
+            assert kwargs["venue"] is Venue.KRX
+            return (
+                Bar(
+                    instrument=InstrumentId(code), interval=interval,
+                    open_time=now - timedelta(minutes=3), close_time=now,
+                    open=Decimal("70000"), high=Decimal("70500"),
+                    low=Decimal("69800"), close=Decimal("70400"),
+                    volume=Decimal("12345"), venue=Venue.KRX,
+                    provider="kis", correlation_id="bar-1",
+                    source_alias=kwargs.get("source_alias"), received_at=now,
+                ),
+            )
+
+        async def quote(source, code, venue, **kwargs):
+            assert source == connection["id"]
+            return Quote(
+                instrument=InstrumentId(code), price=Decimal("70400"),
+                venue=venue, provider="kis", market_time=now,
+                received_at=now, correlation_id="quote-1",
+                source_alias=kwargs.get("source_alias"),
+            )
+
+        async def instrument_name(source, code):
+            assert source == connection["id"]
+            return "삼성전자" if code == "005930" else None
+
+        app.state.connections.bars = bars
+        app.state.connections.quote = quote
+        app.state.connections.instrument_name = instrument_name
+
+        sources = client.get("/api/chart/sources").json()
+        assert sources["automatic"] == connection["id"]
+        assert sources["sources"][0]["realtime"] is True
+
+        response = client.get(
+            "/api/chart/data",
+            params={
+                "code": "005930", "interval": "3m", "venue": "KRX",
+                "source": "AUTO", "count": 20,
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["source"]["id"] == connection["id"]
+        assert payload["instrument"] == {"code": "005930", "name": "삼성전자"}
+        assert payload["bars"][0]["close"] == "70400"
+        assert payload["quote"]["price"] == "70400"
+
+        search = client.get("/api/chart/instruments", params={"q": "삼성"}).json()
+        assert search["instruments"][0] == {"code": "005930", "name": "삼성전자"}
 
 
 def test_dashboard_reports_balances_profit_and_limit_usage(tmp_path: Path) -> None:

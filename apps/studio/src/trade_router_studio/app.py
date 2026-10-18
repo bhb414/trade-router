@@ -14,7 +14,16 @@ from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -1108,6 +1117,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                     account_rows.append(
                         {
                             "alias": alias,
+                            "connection_id": account.get("connection_id"),
                             "provider": account.get("provider"),
                             "target": account.get("target"),
                             "connection_label": account.get("connection_label"),
@@ -1399,6 +1409,147 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             dashboard_cache_until = time.monotonic() + 15.0
             return dashboard_cache
 
+    async def chart_connection_rows() -> list[dict[str, object]]:
+        """Return chart-capable connections ordered by live capacity.
+
+        Chart reads stay inside the central request router.  The ordering only
+        chooses a connection; token reuse, request pacing and WebSocket quotas
+        are still enforced by ConnectionRuntime and RealtimeHub.
+        """
+
+        request_state = await connection_runtime.request_status()
+        buckets = {str(item["key"]): item for item in request_state.get("limits", [])}
+        rows: list[dict[str, object]] = []
+        for connection in settings.list_connections():
+            connection_id = str(connection["id"])
+            capabilities = connection_runtime.capabilities(connection_id)
+            if not capabilities.quotes or not capabilities.bars:
+                continue
+            try:
+                scope = settings.rate_limit_identity(connection_id)
+            except SettingsError:
+                scope = ""
+            bucket = buckets.get(f"{scope}:rest-global") if scope else None
+            capacity = float(bucket.get("capacity") or 1) if bucket else 1.0
+            available = float(bucket.get("available") or capacity) if bucket else capacity
+            connection_status = connection_runtime.status(connection_id)
+            rows.append(
+                {
+                    "id": connection_id,
+                    "label": connection.get("label") or connection_id,
+                    "provider": connection.get("provider"),
+                    "target": connection.get("target"),
+                    "state": connection_status.get("state"),
+                    "message": connection_status.get("message"),
+                    "realtime": capabilities.realtime,
+                    "venues": [venue.value for venue in capabilities.venues],
+                    "available": available,
+                    "capacity": capacity,
+                    "load_ratio": max(0.0, min(1.0, available / capacity)),
+                }
+            )
+        rows.sort(
+            key=lambda item: (
+                str(item["state"]) == "connected",
+                bool(item["realtime"]),
+                float(item["load_ratio"]),
+                str(item["target"]) == "LIVE",
+            ),
+            reverse=True,
+        )
+        return rows
+
+    async def chart_connection(
+        reference: str | None,
+        venue: Venue | None = None,
+    ) -> dict[str, object]:
+        rows = await chart_connection_rows()
+        if venue is not None:
+            rows = [item for item in rows if venue.value in item["venues"]]
+        if not rows:
+            raise RouterError(
+                RouterErrorCode.UNSUPPORTED_CAPABILITY,
+                "현재가와 봉 조회를 모두 지원하는 API 연결이 없습니다.",
+            )
+        normalized = (reference or "AUTO").strip()
+        if normalized.upper() == "AUTO":
+            return rows[0]
+        selected = next(
+            (
+                item
+                for item in rows
+                if normalized in {str(item["id"]), str(item["label"])}
+            ),
+            None,
+        )
+        if selected is None:
+            raise RouterError(
+                RouterErrorCode.UNSUPPORTED_CAPABILITY,
+                "선택한 API 연결에서는 차트 조회를 지원하지 않습니다.",
+            )
+        return selected
+
+    def chart_http_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, ValueError):
+            return HTTPException(status_code=400, detail=str(exc))
+        if isinstance(exc, SettingsError):
+            return HTTPException(status_code=404, detail=str(exc))
+        if isinstance(exc, RouterError):
+            status_code = (
+                422
+                if exc.code in {
+                    RouterErrorCode.INVALID_REQUEST,
+                    RouterErrorCode.UNSUPPORTED_CAPABILITY,
+                }
+                else 429 if exc.code is RouterErrorCode.RATE_LIMITED else 502
+            )
+            return HTTPException(status_code=status_code, detail=exc.as_dict())
+        return HTTPException(status_code=502, detail=str(exc))
+
+    def quote_payload(quote: object) -> dict[str, object]:
+        return {
+            "instrument": {
+                "code": quote.instrument.code,
+                "country": quote.instrument.country,
+                "asset": quote.instrument.asset.value,
+            },
+            "price": str(quote.price),
+            "venue": quote.venue.value,
+            "provider": quote.provider,
+            "source_alias": quote.source_alias,
+            "market_time": quote.market_time.isoformat(),
+            "received_at": quote.received_at.isoformat(),
+            "correlation_id": quote.correlation_id,
+            "delayed": quote.delayed,
+            "stale": quote.stale,
+            "connection_generation": quote.connection_generation,
+        }
+
+    def bar_payload(bar: object) -> dict[str, object]:
+        return {
+            "instrument": {
+                "code": bar.instrument.code,
+                "country": bar.instrument.country,
+                "asset": bar.instrument.asset.value,
+            },
+            "interval": bar.interval,
+            "open_time": bar.open_time.isoformat(),
+            "close_time": bar.close_time.isoformat(),
+            "open": str(bar.open),
+            "high": str(bar.high),
+            "low": str(bar.low),
+            "close": str(bar.close),
+            "volume": str(bar.volume),
+            "venue": bar.venue.value,
+            "provider": bar.provider,
+            "source_alias": bar.source_alias,
+            "correlation_id": bar.correlation_id,
+            "complete": bar.complete,
+            "received_at": bar.received_at.isoformat() if bar.received_at else None,
+            "connection_generation": bar.connection_generation,
+            "stale": bar.stale,
+        }
+
     async def require_strategy_session(
         authorization: str | None = Header(default=None),
     ) -> StrategySession:
@@ -1452,6 +1603,185 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         refresh: bool = Query(default=False),
     ) -> dict[str, object]:
         return await dashboard_snapshot(force=refresh)
+
+    @app.get("/api/chart/sources")
+    async def chart_sources() -> dict[str, object]:
+        rows = await chart_connection_rows()
+        return {
+            "sources": rows,
+            "automatic": rows[0]["id"] if rows else None,
+        }
+
+    @app.get("/api/chart/instruments")
+    async def chart_instruments(
+        q: str = Query(default="", max_length=80),
+        source: str = Query(default="AUTO", max_length=160),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> dict[str, object]:
+        query = q.strip()
+        names = journal().instrument_names()
+        names.update(_workspace_instrument_names(workspace))
+        normalized = query.casefold()
+        rows = [
+            {"code": code, "name": name}
+            for code, name in names.items()
+            if not query
+            or normalized in code.casefold()
+            or normalized in str(name).casefold()
+        ]
+        rows.sort(
+            key=lambda item: (
+                0 if str(item["code"]).casefold().startswith(normalized) else 1,
+                0 if str(item["name"]).casefold().startswith(normalized) else 1,
+                str(item["name"]),
+            )
+        )
+        code_query = query.upper()
+        if (
+            code_query
+            and code_query.isascii()
+            and code_query.isalnum()
+            and len(code_query) <= 24
+            and code_query not in names
+        ):
+            try:
+                selected = await chart_connection(source)
+                resolved = await connection_runtime.instrument_name(
+                    str(selected["id"]), code_query
+                )
+                if resolved:
+                    journal().remember_instrument_names({code_query: resolved})
+                    rows.insert(0, {"code": code_query, "name": resolved})
+                elif code_query.isdigit() and len(code_query) == 6:
+                    rows.insert(0, {"code": code_query, "name": code_query})
+            except (SettingsError, RouterError):
+                if code_query.isdigit() and len(code_query) == 6:
+                    rows.insert(0, {"code": code_query, "name": code_query})
+        unique: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row in rows:
+            code = str(row["code"])
+            if code in seen:
+                continue
+            seen.add(code)
+            unique.append(row)
+        return {"instruments": unique[:limit]}
+
+    @app.get("/api/chart/data")
+    async def chart_data(
+        code: str = Query(min_length=1, max_length=24),
+        interval: str = Query(default="3m", max_length=16),
+        venue: str = Query(default="INTEGRATED", max_length=16),
+        source: str = Query(default="AUTO", max_length=160),
+        count: int = Query(default=180, ge=20, le=400),
+    ) -> dict[str, object]:
+        try:
+            instrument = InstrumentId(code)
+            market_venue = Venue(venue.upper())
+            selected = await chart_connection(source, market_venue)
+            selected_id = str(selected["id"])
+            bars, quote = await asyncio.gather(
+                connection_runtime.bars(
+                    selected_id,
+                    instrument.code,
+                    interval,
+                    count=count,
+                    venue=market_venue,
+                    source_alias=str(selected["label"]),
+                ),
+                connection_runtime.quote(
+                    selected_id,
+                    instrument.code,
+                    market_venue,
+                    source_alias=str(selected["label"]),
+                ),
+            )
+            known_name = journal().instrument_names().get(instrument.code)
+            if not known_name:
+                known_name = await connection_runtime.instrument_name(
+                    selected_id, instrument.code
+                )
+                if known_name:
+                    journal().remember_instrument_names({instrument.code: known_name})
+            return {
+                "source": selected,
+                "instrument": {"code": instrument.code, "name": known_name},
+                "interval": interval,
+                "venue": market_venue.value,
+                "quote": quote_payload(quote),
+                "bars": [bar_payload(bar) for bar in bars[-count:]],
+            }
+        except (ValueError, SettingsError, RouterError) as exc:
+            raise chart_http_error(exc) from exc
+
+    @app.get("/api/chart/quote")
+    async def chart_quote(
+        code: str = Query(min_length=1, max_length=24),
+        venue: str = Query(default="INTEGRATED", max_length=16),
+        source: str = Query(default="AUTO", max_length=160),
+    ) -> dict[str, object]:
+        try:
+            instrument = InstrumentId(code)
+            market_venue = Venue(venue.upper())
+            selected = await chart_connection(source, market_venue)
+            quote = await connection_runtime.quote(
+                str(selected["id"]),
+                instrument.code,
+                market_venue,
+                source_alias=str(selected["label"]),
+            )
+            return {"source": selected, "quote": quote_payload(quote)}
+        except (ValueError, SettingsError, RouterError) as exc:
+            raise chart_http_error(exc) from exc
+
+    @app.websocket("/api/chart/stream")
+    async def chart_stream(websocket: WebSocket) -> None:
+        await websocket.accept()
+        consumer = f"__chart__:{uuid4().hex}"
+        subscription_id: str | None = None
+        try:
+            code = InstrumentId(websocket.query_params.get("code") or "").code
+            venue = Venue(
+                str(websocket.query_params.get("venue") or "INTEGRATED").upper()
+            )
+            selected = await chart_connection(
+                websocket.query_params.get("source"), venue
+            )
+            if not selected.get("realtime"):
+                raise RouterError(
+                    RouterErrorCode.UNSUPPORTED_CAPABILITY,
+                    "선택한 API 연결은 실시간 시세를 지원하지 않습니다.",
+                )
+            subscription = await realtime.subscribe(
+                strategy_name=consumer,
+                source=str(selected["id"]),
+                source_alias=str(selected["label"]),
+                kind="QUOTE",
+                code=code,
+                venue=venue,
+            )
+            subscription_id = str(subscription["id"])
+            await websocket.send_json(
+                {
+                    "event_type": "subscribed",
+                    "source": selected,
+                    "subscription": subscription,
+                }
+            )
+            while True:
+                event = await strategy_events.next_event(consumer, timeout=20)
+                await websocket.send_json(event or {"event_type": "keepalive"})
+        except WebSocketDisconnect:
+            pass
+        except (ValueError, SettingsError, RouterError) as exc:
+            detail = exc.as_dict() if isinstance(exc, RouterError) else str(exc)
+            with suppress(Exception):
+                await websocket.send_json({"event_type": "error", "detail": detail})
+        finally:
+            if subscription_id is not None:
+                await realtime.unsubscribe(subscription_id, strategy_name=consumer)
+            await realtime.unsubscribe_strategy(consumer)
+            await strategy_events.unregister(consumer)
 
     @app.get("/api/settings/providers")
     async def provider_schemas() -> list[dict[str, object]]:

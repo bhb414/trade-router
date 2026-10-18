@@ -64,6 +64,7 @@
           <div class="dashboard-header-actions">
             <span id="dashboard-updated">계좌 상태 확인 중</span>
             <button class="button quiet compact" id="dashboard-refresh" type="button">새로고침</button>
+            <button class="button quiet compact" id="dashboard-chart" type="button">차트</button>
           </div>
         </header>
         <div class="dashboard-content">
@@ -469,7 +470,51 @@
     </section>
   </div>
 
+  <div class="modal-backdrop chart-modal-backdrop" id="chart-modal" hidden>
+    <section class="modal chart-modal" role="dialog" aria-modal="true" aria-labelledby="chart-title">
+      <header class="modal-header chart-modal-header">
+        <div>
+          <span class="eyebrow">MARKET CHART</span>
+          <h2 id="chart-title">종목 차트</h2>
+        </div>
+        <div class="chart-header-status">
+          <span class="chart-live-state idle" id="chart-live-state">조회 전</span>
+          <button class="modal-close" id="chart-close" type="button" aria-label="차트 닫기">×</button>
+        </div>
+      </header>
+      <div class="chart-toolbar">
+        <label class="chart-search-field">
+          <span>종목</span>
+          <input id="chart-search" autocomplete="off" placeholder="종목명 또는 종목코드">
+          <div class="chart-search-results" id="chart-search-results" hidden></div>
+        </label>
+        <label><span>API</span><select id="chart-source"><option value="AUTO">자동 선택</option></select></label>
+        <label><span>시장</span><select id="chart-venue"><option value="INTEGRATED">통합</option><option value="KRX">KRX</option><option value="NXT">NXT</option></select></label>
+        <label><span>봉 주기</span><select id="chart-interval"><option value="1m">1분</option><option value="3m" selected>3분</option><option value="5m">5분</option><option value="10m">10분</option><option value="15m">15분</option><option value="30m">30분</option><option value="60m">60분</option><option value="120m">120분</option><option value="1d">일봉</option><option value="1w">주봉</option></select></label>
+        <label><span>차트 유형</span><select id="chart-type"><option value="CANDLE">캔들</option><option value="HEIKIN_ASHI">하이킨아시</option></select></label>
+        <button class="button primary compact" id="chart-load" type="button">조회</button>
+      </div>
+      <div class="chart-quote-strip" id="chart-quote-strip">
+        <strong>종목을 검색해 선택하세요.</strong>
+        <span>등록한 API의 중앙 요청 큐와 실시간 구독을 사용합니다.</span>
+      </div>
+      <div class="chart-stage" id="chart-stage">
+        <canvas id="chart-canvas" aria-label="종목 가격 차트"></canvas>
+        <div class="chart-empty" id="chart-empty">종목을 선택하면 차트를 표시합니다.</div>
+        <div class="chart-tooltip" id="chart-tooltip" hidden></div>
+      </div>
+      <section class="chart-indicator-section">
+        <div class="chart-indicator-heading">
+          <div><strong>보조지표</strong><span>가격 차트의 시리즈 또는 별도 패널로 표시합니다.</span></div>
+          <button class="button quiet compact" id="chart-add-indicator" type="button">+ 지표 추가</button>
+        </div>
+        <div class="chart-indicator-list" id="chart-indicator-list"></div>
+      </section>
+    </section>
+  </div>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/chart.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

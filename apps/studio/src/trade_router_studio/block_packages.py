@@ -63,12 +63,14 @@ class BlockTradeCondition(BaseModel):
     model_config = ConfigDict(extra="forbid")
     left: Literal[
         "open", "high", "low", "close", "volume",
+        "heikin_open", "heikin_high", "heikin_low", "heikin_close",
         "bollinger_upper", "bollinger_middle", "bollinger_lower",
         "average_price", "profit_rate",
     ] = "close"
     operator: Literal["LT", "LTE", "GT", "GTE", "EQ", "CROSS_UP", "CROSS_DOWN"] = "LT"
     right: Literal[
         "open", "high", "low", "close", "volume",
+        "heikin_open", "heikin_high", "heikin_low", "heikin_close",
         "bollinger_upper", "bollinger_middle", "bollinger_lower",
         "average_price", "profit_rate", "value",
     ] = "bollinger_upper"
@@ -533,6 +535,7 @@ BUY_CONDITION_GROUPS = tuple(json.loads(BUY_CONDITION_GROUPS_JSON))
 SELL_CONDITION_GROUPS = tuple(json.loads(SELL_CONDITION_GROUPS_JSON))
 BAR_METRICS = {
     "open", "high", "low", "close", "volume",
+    "heikin_open", "heikin_high", "heikin_low", "heikin_close",
     "bollinger_upper", "bollinger_middle", "bollinger_lower",
 }
 NEEDS_BARS = any(
@@ -621,7 +624,14 @@ class ManagedBlockStrategy(Strategy):
         if not cls._source_uses_bars(source):
             return 0
         offset = source["offset"] + (1 if crossing else 0)
-        period = source["bollinger_period"] if source["metric"].startswith("bollinger_") else 1
+        if source["metric"].startswith("bollinger_"):
+            period = source["bollinger_period"]
+        elif source["metric"].startswith("heikin_"):
+            # The recursive Heikin-Ashi open converges quickly.  A fixed warm-up
+            # keeps comparisons stable without forcing a full-session download.
+            period = 24
+        else:
+            period = 1
         return offset + period
 
     @classmethod
@@ -652,6 +662,24 @@ class ManagedBlockStrategy(Strategy):
         deviation = stddev * variance.sqrt()
         return mean + deviation, mean, mean - deviation
 
+    @staticmethod
+    def _heikin_ashi_values(bars):
+        values = []
+        previous_open = None
+        previous_close = None
+        for bar in bars:
+            close = (bar.open + bar.high + bar.low + bar.close) / Decimal("4")
+            open_value = (
+                (bar.open + bar.close) / Decimal("2")
+                if previous_open is None or previous_close is None
+                else (previous_open + previous_close) / Decimal("2")
+            )
+            high = max(bar.high, open_value, close)
+            low = min(bar.low, open_value, close)
+            values.append((open_value, high, low, close))
+            previous_open, previous_close = open_value, close
+        return values
+
     def _indicator_value(self, metric, bars, offset, average_price, source, current_price=None):
         if metric == "average_price":
             return average_price if average_price and average_price > 0 else None
@@ -665,6 +693,16 @@ class ManagedBlockStrategy(Strategy):
         bar = bars[index]
         if metric in {"open", "high", "low", "close", "volume"}:
             return getattr(bar, metric)
+        if metric in {"heikin_open", "heikin_high", "heikin_low", "heikin_close"}:
+            values = self._heikin_ashi_values(bars)
+            if index >= len(values):
+                return None
+            return values[index][{
+                "heikin_open": 0,
+                "heikin_high": 1,
+                "heikin_low": 2,
+                "heikin_close": 3,
+            }[metric]]
         if metric in {"bollinger_upper", "bollinger_middle", "bollinger_lower"}:
             values = self._bollinger_values(bars, offset, source)
             if values is None:
