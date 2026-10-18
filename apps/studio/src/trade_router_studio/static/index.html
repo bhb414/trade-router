@@ -485,8 +485,8 @@
       <div class="chart-toolbar">
         <label class="chart-search-field">
           <span>종목</span>
-          <input id="chart-search" autocomplete="off" placeholder="종목명 또는 종목코드">
-          <div class="chart-search-results" id="chart-search-results" hidden></div>
+          <input id="chart-search" autocomplete="off" placeholder="종목명 또는 종목코드" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="chart-search-results">
+          <div class="chart-search-results" id="chart-search-results" role="listbox" hidden></div>
         </label>
         <label><span>API</span><select id="chart-source"><option value="AUTO">자동 선택</option></select></label>
         <label><span>시장</span><select id="chart-venue"><option value="INTEGRATED">통합</option><option value="KRX">KRX</option><option value="NXT">NXT</option></select></label>
@@ -503,13 +503,27 @@
         <div class="chart-empty" id="chart-empty">종목을 선택하면 차트를 표시합니다.</div>
         <div class="chart-tooltip" id="chart-tooltip" hidden></div>
       </div>
-      <section class="chart-indicator-section">
-        <div class="chart-indicator-heading">
-          <div><strong>보조지표</strong><span>가격 차트의 시리즈 또는 별도 패널로 표시합니다.</span></div>
-          <button class="button quiet compact" id="chart-add-indicator" type="button">+ 지표 추가</button>
-        </div>
-        <div class="chart-indicator-list" id="chart-indicator-list"></div>
+      <section class="chart-indicator-summary-bar">
+        <div><strong>보조지표</strong><span id="chart-indicator-summary">설정 없음</span></div>
+        <button class="button quiet compact" id="chart-indicator-settings" type="button">지표 설정</button>
       </section>
+    </section>
+  </div>
+
+  <div class="modal-backdrop compact-modal-backdrop chart-indicator-modal-backdrop" id="chart-indicator-modal" hidden>
+    <section class="modal chart-indicator-modal" role="dialog" aria-modal="true" aria-labelledby="chart-indicator-title">
+      <header class="modal-header">
+        <div><span class="eyebrow">CHART INDICATORS</span><h2 id="chart-indicator-title">보조지표 설정</h2></div>
+        <button class="modal-close" id="chart-indicator-close" type="button" aria-label="보조지표 설정 닫기">×</button>
+      </header>
+      <div class="chart-indicator-modal-body">
+        <p>각 지표를 가격 차트 위 시리즈 또는 별도 패널에 표시할 수 있습니다.</p>
+        <div class="chart-indicator-list" id="chart-indicator-list"></div>
+        <button class="button quiet compact" id="chart-add-indicator" type="button">+ 지표 추가</button>
+      </div>
+      <footer class="chart-indicator-modal-footer">
+        <button class="button primary compact" id="chart-indicator-done" type="button">적용</button>
+      </footer>
     </section>
   </div>
 

@@ -13,6 +13,8 @@
     socket: null,
     fallbackTimer: null,
     searchTimer: null,
+    searchRequest: 0,
+    searchIndex: -1,
     resizeObserver: null,
     manualClose: true,
     indicators: [
@@ -393,6 +395,13 @@
       row.append(type, placement, parameters, color, remove);
       el.indicators.append(row);
     });
+    const names = {
+      SMA: "이동평균", EMA: "지수이동평균", BOLLINGER: "볼린저밴드",
+      VOLUME: "거래량", RSI: "RSI", MACD: "MACD",
+    };
+    el.indicatorSummary.textContent = state.indicators.length
+      ? state.indicators.map(item => names[item.type] || item.type).join(" · ")
+      : "설정 없음";
   }
 
   async function loadSources(preferred = "AUTO") {
@@ -409,9 +418,10 @@
 
   function showSearchResults(rows) {
     el.searchResults.replaceChildren();
+    state.searchIndex = -1;
     rows.forEach(item => {
       const button = document.createElement("button");
-      button.type = "button"; button.className = "chart-search-result";
+      button.type = "button"; button.className = "chart-search-result"; button.setAttribute("role", "option");
       const strong = document.createElement("strong"); strong.textContent = item.name || item.code;
       const small = document.createElement("small"); small.textContent = item.code;
       button.append(strong, small);
@@ -419,17 +429,43 @@
       el.searchResults.append(button);
     });
     el.searchResults.hidden = !rows.length;
+    el.search.setAttribute("aria-expanded", String(Boolean(rows.length)));
+  }
+
+  function showSearchStatus(text) {
+    el.searchResults.replaceChildren();
+    state.searchIndex = -1;
+    const status = document.createElement("div");
+    status.className = "chart-search-status";
+    status.textContent = text;
+    el.searchResults.append(status);
+    el.searchResults.hidden = false;
+    el.search.setAttribute("aria-expanded", "true");
   }
 
   async function searchInstruments() {
     const query = el.search.value.trim();
     if (!query) { showSearchResults([]); return; }
+    const requestId = ++state.searchRequest;
+    showSearchStatus("종목을 찾고 있습니다…");
     try {
       const payload = await request(`/api/chart/instruments?q=${encodeURIComponent(query)}&source=${encodeURIComponent(el.source.value)}`);
-      showSearchResults(payload.instruments || []);
+      if (requestId !== state.searchRequest) return;
+      const rows = payload.instruments || [];
+      if (rows.length) showSearchResults(rows);
+      else showSearchStatus("일치하는 종목이 없습니다.");
     } catch (error) {
-      el.empty.hidden = false; el.empty.textContent = error.message;
+      if (requestId === state.searchRequest) showSearchStatus(error.message);
     }
+  }
+
+  function moveSearchSelection(direction) {
+    const buttons = [...el.searchResults.querySelectorAll("button")];
+    if (!buttons.length) return false;
+    state.searchIndex = (state.searchIndex + direction + buttons.length) % buttons.length;
+    buttons.forEach((button, index) => button.classList.toggle("active", index === state.searchIndex));
+    buttons[state.searchIndex].scrollIntoView({ block: "nearest" });
+    return true;
   }
 
   async function selectInstrument(item) {
@@ -579,6 +615,7 @@
   function close() {
     stopRealtime();
     showSearchResults([]);
+    el.indicatorModal.hidden = true;
     el.tooltip.hidden = true;
     el.modal.hidden = true;
   }
@@ -590,6 +627,7 @@
       source: $("#chart-source"), venue: $("#chart-venue"), interval: $("#chart-interval"), type: $("#chart-type"),
       canvas: $("#chart-canvas"), empty: $("#chart-empty"), tooltip: $("#chart-tooltip"),
       quote: $("#chart-quote-strip"), indicators: $("#chart-indicator-list"),
+      indicatorModal: $("#chart-indicator-modal"), indicatorSummary: $("#chart-indicator-summary"),
     });
     if (!el.modal) return;
     const restoredSource = restoreSettings();
@@ -597,6 +635,15 @@
     $("#chart-close").addEventListener("click", close);
     el.modal.addEventListener("click", event => { if (event.target === el.modal) close(); });
     $("#chart-load").addEventListener("click", () => loadChart());
+    const closeIndicatorSettings = () => { el.indicatorModal.hidden = true; };
+    $("#chart-indicator-settings").addEventListener("click", () => {
+      showSearchResults([]);
+      renderIndicators();
+      el.indicatorModal.hidden = false;
+    });
+    $("#chart-indicator-close").addEventListener("click", closeIndicatorSettings);
+    $("#chart-indicator-done").addEventListener("click", closeIndicatorSettings);
+    el.indicatorModal.addEventListener("click", event => { if (event.target === el.indicatorModal) closeIndicatorSettings(); });
     $("#chart-add-indicator").addEventListener("click", () => {
       if (state.indicators.length >= 8) return;
       state.indicators.push({ id: crypto.randomUUID(), type: "SMA", placement: "SERIES", period: 20, color: palette[state.indicators.length % palette.length] });
@@ -605,13 +652,20 @@
     el.search.addEventListener("input", () => {
       state.code = ""; state.name = "";
       clearTimeout(state.searchTimer);
-      state.searchTimer = setTimeout(searchInstruments, 250);
+      state.searchTimer = setTimeout(searchInstruments, 160);
     });
+    el.search.addEventListener("focus", () => { if (el.search.value.trim() && !state.code) searchInstruments(); });
     el.search.addEventListener("keydown", event => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        if (moveSearchSelection(event.key === "ArrowDown" ? 1 : -1)) event.preventDefault();
+        return;
+      }
+      if (event.key === "Escape") { showSearchResults([]); return; }
       if (event.key === "Enter") {
         event.preventDefault();
-        const first = el.searchResults.querySelector("button");
-        if (first) first.click(); else loadChart();
+        const buttons = [...el.searchResults.querySelectorAll("button")];
+        const selected = buttons[state.searchIndex] || buttons[0];
+        if (selected) selected.click(); else loadChart();
       }
     });
     [el.source, el.venue, el.interval].forEach(control => control.addEventListener("change", () => { saveSettings(); if (state.code) loadChart(); }));

@@ -50,6 +50,7 @@ from .block_packages import (
 )
 from .connections import ConnectionRuntime
 from .event_bus import StrategyEventBus
+from .instrument_catalog import InstrumentCatalog
 from .paths import WorkspacePaths
 from .runtime_scheduler import RuntimeScheduler, schedule_from_dict
 from .runtime_store import RuntimeStore, RuntimeStoreRestartRequired
@@ -688,6 +689,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     settings = SettingsStore(workspace)
     connection_runtime = ConnectionRuntime(settings)
     realtime = RealtimeHub(connection_runtime, strategy_events)
+    instrument_catalog = InstrumentCatalog(workspace.data / "instrument-catalog.json")
 
     async def handle_strategy_exit(strategy_name: str) -> None:
         await scheduler.unregister(strategy_name)
@@ -818,6 +820,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.strategy_events = strategy_events
     app.state.realtime = realtime
+    app.state.instrument_catalog = instrument_catalog
     app.state.runtime_store = None
     app.state.order_service = None
     app.state.order_reconciler = None
@@ -1636,6 +1639,22 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 str(item["name"]),
             )
         )
+        catalog = app.state.instrument_catalog
+        catalog_rows = await catalog.search(query, limit=limit)
+        if catalog_rows:
+            catalog_names = {
+                str(item["code"]): str(item["name"])
+                for item in catalog_rows
+            }
+            names.update(catalog_names)
+            journal().remember_instrument_names(
+                catalog_names,
+                source="instrument-master",
+            )
+            rows.extend(
+                {"code": item["code"], "name": item["name"]}
+                for item in catalog_rows
+            )
         code_query = query.upper()
         if (
             code_query
@@ -1697,6 +1716,8 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 ),
             )
             known_name = journal().instrument_names().get(instrument.code)
+            if not known_name:
+                known_name = await app.state.instrument_catalog.name(instrument.code)
             if not known_name:
                 known_name = await connection_runtime.instrument_name(
                     selected_id, instrument.code

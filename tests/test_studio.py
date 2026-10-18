@@ -663,6 +663,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "HEIKIN_ASHI" in chart_script.text
         assert 'id="dashboard-chart"' in page.text
         assert 'id="chart-modal"' in page.text
+        assert 'id="chart-indicator-modal"' in page.text
+        assert 'aria-autocomplete="list"' in page.text
         assert 'id="order-permission-button"' in page.text
         assert 'role="switch"' in page.text
         assert 'name="strategy-type" value="script"' in page.text
@@ -1060,6 +1062,19 @@ def test_chart_api_uses_an_eligible_connection_and_normalizes_market_data(
         app.state.connections.bars = bars
         app.state.connections.quote = quote
         app.state.connections.instrument_name = instrument_name
+
+        class ChartCatalog:
+            async def search(self, query, *, limit=20):
+                if "삼성" in query:
+                    return [
+                        {"code": "005930", "name": "삼성전자", "market": "KOSPI"}
+                    ][:limit]
+                return []
+
+            async def name(self, code):
+                return None
+
+        app.state.instrument_catalog = ChartCatalog()
 
         sources = client.get("/api/chart/sources").json()
         assert sources["automatic"] == connection["id"]
