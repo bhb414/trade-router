@@ -893,11 +893,12 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         page = client.get("/")
         static_styles = client.get("/static/styles.css")
         assert static_styles.status_code == 200
+        normalized_styles = static_styles.text.replace("\r\n", "\n")
         assert ".strategy-blocks.managed-composer" in static_styles.text
         assert ".composer-fixed-tree" in static_styles.text
         assert """.composer-inspector .schedule-fields-grid {
   grid-template-columns: minmax(0, 1fr);
-}""" in static_styles.text
+}""" in normalized_styles
         assert ".composer-tree-card" in static_styles.text
         assert ".composer-tree-branch" in static_styles.text
         assert ".composer-tree-children" in static_styles.text
