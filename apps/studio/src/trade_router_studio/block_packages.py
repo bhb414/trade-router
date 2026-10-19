@@ -377,8 +377,8 @@ class ConditionBollingerBlockSettings(BaseModel):
 
 class BlockNodePosition(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    x: float = Field(ge=-10_000, le=10_000)
-    y: float = Field(ge=-10_000, le=10_000)
+    x: float = Field(ge=-20_000, le=20_000)
+    y: float = Field(ge=-20_000, le=20_000)
 
 
 class BlockViewport(BaseModel):

@@ -1790,6 +1790,11 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border-color: #adb9c9;
   box-shadow: 0 5px 16px rgba(34, 45, 61, .12);
 }
+.strategy-block-node.graph-node.composer-node:focus-visible {
+  border-color: #3b73db;
+  box-shadow: 0 0 0 3px rgba(46, 105, 220, .18), 0 7px 20px rgba(34, 45, 61, .12);
+  outline: none;
+}
 .strategy-block-node.graph-node.composer-node.selected,
 .strategy-block-node.graph-node.composer-node[aria-selected="true"] {
   border-color: #3b73db;
@@ -1839,7 +1844,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .composer-node .composer-node-copy strong {
   overflow: hidden;
   color: #263244;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 750;
   line-height: 1.3;
   text-overflow: ellipsis;
@@ -1848,8 +1853,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .composer-node .composer-node-copy small,
 .composer-node .composer-node-meta {
   overflow: hidden;
-  color: #7b8799;
-  font-size: 9px;
+  color: #667386;
+  font-size: 10px;
   font-weight: 550;
   line-height: 1.35;
   text-overflow: ellipsis;
@@ -1863,7 +1868,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border-radius: 6px;
   background: #fbfcfd;
   color: #536177;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 750;
   cursor: pointer;
 }
@@ -1886,7 +1891,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border-radius: 999px;
   background: #eef2f7;
   color: #506078;
-  font-size: 8px !important;
+  font-size: 10px !important;
   font-weight: 850 !important;
   letter-spacing: .035em;
   line-height: 1;
@@ -1965,8 +1970,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border: 1px solid #e0e5eb;
   border-radius: 999px;
   background: white;
-  color: #5f6d81;
-  font-size: 8px;
+  color: #536176;
+  font-size: 10px;
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
   text-overflow: ellipsis;
@@ -2025,15 +2030,15 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .composer-inspector > header > div > strong {
   overflow: hidden;
   color: #263244;
-  font-size: 12px;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .composer-inspector-heading small,
 .composer-inspector > header > div > small {
   overflow: hidden;
-  color: #7a879a;
-  font-size: 9px;
+  color: #667386;
+  font-size: 10px;
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2073,8 +2078,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border: 1px solid #e1e6ed;
   border-radius: 7px;
   background: #f7f9fc;
-  color: #6b778a;
-  font-size: 9px;
+  color: #5f6d80;
+  font-size: 10px;
   line-height: 1.55;
 }
 .composer-inspector-section + .composer-inspector-section {
@@ -2084,8 +2089,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 }
 .composer-inspector-section-title {
   margin: 0 0 8px;
-  color: #58667a;
-  font-size: 9px;
+  color: #4c5b70;
+  font-size: 10px;
   font-weight: 800;
   letter-spacing: .06em;
   text-transform: uppercase;
@@ -2125,8 +2130,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border: 1px solid #dce3eb;
   border-radius: 6px;
   background: white;
-  color: #5c6a7e;
-  font-size: 9px;
+  color: #526176;
+  font-size: 10px;
 }
 .composer-remove-flow { margin-top: 12px; }
 .composer-inspector-actions .danger-text { margin-left: auto; color: #9a5060; }
@@ -2136,8 +2141,8 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   border: 1px solid #e0e5ec;
   border-radius: 7px;
   background: #f7f9fc;
-  color: #6d798c;
-  font-size: 9px;
+  color: #5f6d80;
+  font-size: 10px;
   line-height: 1.55;
 }
 
@@ -2178,7 +2183,7 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   .block-canvas.graph-mode.composer-mode { min-height: 500px; }
   .strategy-block-node.graph-node.composer-node { min-width: 270px; }
   .composer-inspector {
-    top: 8px;
+    top: 38%;
     right: 8px;
     bottom: 8px;
     width: calc(100% - 16px);

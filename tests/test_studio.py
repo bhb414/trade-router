@@ -841,6 +841,13 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'classList.add("graph-mode", "composer-mode")' in static_script.text
         assert 'event.target.closest(".strategy-block-node, .composer-inspector")' in static_script.text
         assert 'event.target.closest(".composer-inspector")' in static_script.text
+        assert "function bindBlockNodeDrag(node, world, edgeLayer)" in static_script.text
+        assert "() => persistBlockLayout(strategyName, layout)" in static_script.text
+        assert "const packageLayout = cloneBlockLayout(state.blockPackage.layout)" in static_script.text
+        assert "BLOCK_NODE_COORD_LIMIT = 20000" in static_script.text
+        assert 'node.addEventListener("keydown"' in static_script.text
+        assert "focusComposerInspector" in static_script.text
+        assert "closeComposerInspector" in static_script.text
         assert "createCalculationEditor" not in static_script.text
         assert "previousTable.scrollTop" in static_script.text
         assert "previousSignature !== JSON.stringify(state.strategyPermission)" in static_script.text
@@ -859,6 +866,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert ".composer-inspector" in static_styles.text
         assert "전략 블록 편집" in page.text
         assert "제목줄을 끌어 블록을 옮기고" in page.text
+        assert 'aria-describedby="block-editor-status"' in page.text
+        assert 'id="block-canvas" aria-live=' not in page.text
         chart_script = client.get("/static/chart.js")
         assert chart_script.status_code == 200
         assert "HEIKIN_ASHI" in chart_script.text
@@ -906,6 +915,14 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert len(package["settings"]["sell_condition_groups"]) == 1
         assert package["layout"]["viewport"]["zoom"] == 0.75
         package["layout"]["nodes"]["target"] = {"x": 412.5, "y": 93.0}
+        package["layout"]["nodes"]["flow-buy-flow-1-target"] = {
+            "x": 777.0,
+            "y": 333.0,
+        }
+        package["layout"]["nodes"]["closeSchedule"] = {
+            "x": 50.0,
+            "y": 14_426.0,
+        }
         package["layout"]["viewport"] = {"x": 18.0, "y": 27.0, "zoom": 0.2}
         package["settings"]["target_source"] = "RANKING"
         package["settings"]["ranking_kind"] = "TRADING_VALUE"
@@ -940,6 +957,14 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
             "/api/strategies/%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package"
         ).json()["layout"]
         assert saved_layout["nodes"]["target"] == {"x": 412.5, "y": 93.0}
+        assert saved_layout["nodes"]["flow-buy-flow-1-target"] == {
+            "x": 777.0,
+            "y": 333.0,
+        }
+        assert saved_layout["nodes"]["closeSchedule"] == {
+            "x": 50.0,
+            "y": 14_426.0,
+        }
         assert saved_layout["viewport"]["zoom"] == 0.2
         package["name"] = "가져온 블록 예제"
         imported = client.post("/api/strategies/import-block", json=package)
@@ -951,6 +976,14 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert imported_source.status_code == 200
         assert "ManagedBlockStrategy" in imported_source.json()["source"]
         assert 'STRATEGY_ID = "block-example-2"' in imported_source.json()["source"]
+        imported_layout = client.get(
+            "/api/strategies/%EA%B0%80%EC%A0%B8%EC%98%A8%20%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C.py/block-package"
+        ).json()["layout"]
+        assert imported_layout["nodes"]["flow-buy-flow-1-target"] == {
+            "x": 777.0,
+            "y": 333.0,
+        }
+        assert imported_layout["viewport"]["zoom"] == 0.2
         assert "ctx.discovery.matches" in imported_source.json()["source"]
         assert "ctx.orders.market_buy" in imported_source.json()["source"]
         assert "ctx.orders.market_sell" in imported_source.json()["source"]
@@ -2011,7 +2044,7 @@ def test_strategy_process_captures_output(tmp_path: Path) -> None:
         await manager.save("once.py", "print('hello from strategy', flush=True)\n")
         await manager.start("once.py")
         for _ in range(40):
-            if not manager.details("once.py")["running"]:
+            if manager.logs("once.py")["exit_code"] is not None:
                 break
             await asyncio.sleep(0.025)
         logs = manager.logs("once.py")

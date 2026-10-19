@@ -1,5 +1,9 @@
 const LOG_CLEAR_STORAGE_KEY = "trade-router.log-clear-cursors.v1";
 const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v4";
+const BLOCK_NODE_COORD_LIMIT = 20000;
+const BLOCK_VIEWPORT_COORD_LIMIT = 20000;
+const BLOCK_ZOOM_MIN = .2;
+const BLOCK_ZOOM_MAX = 2;
 
 const state = {
   view: "dashboard",
@@ -15,6 +19,7 @@ const state = {
   blockGraphRedraw: null,
   blockGraphPlan: null,
   blockSelectedNode: null,
+  blockRenderedRunning: null,
   conditionGroupSerial: 0,
   blockScheduleExpanded: new Map(),
   strategySearch: "",
@@ -209,20 +214,25 @@ function rememberLogClearCursor(name, cursor) {
   persistLogClearCursors();
 }
 
+function clampBlockNumber(value, minimum, maximum, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.min(maximum, Math.max(minimum, number)) : fallback;
+}
+
 function cloneBlockLayout(layout) {
   const nodes = {};
   Object.entries(layout?.nodes || {}).forEach(([id, point]) => {
-    const x = Number(point?.x);
-    const y = Number(point?.y);
-    if (Number.isFinite(x) && Number.isFinite(y)) nodes[id] = { x, y };
+    const x = clampBlockNumber(point?.x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
+    const y = clampBlockNumber(point?.y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
+    if (x != null && y != null) nodes[id] = { x, y };
   });
   const viewport = layout?.viewport || {};
   return {
     nodes,
     viewport: {
-      x: Number.isFinite(Number(viewport.x)) ? Number(viewport.x) : 24,
-      y: Number.isFinite(Number(viewport.y)) ? Number(viewport.y) : 24,
-      zoom: Math.min(2, Math.max(.2, Number(viewport.zoom) || .75)),
+      x: clampBlockNumber(viewport.x, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24),
+      y: clampBlockNumber(viewport.y, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24),
+      zoom: clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, .75),
     },
   };
 }
@@ -243,11 +253,11 @@ function storedBlockLayout(name) {
   }
 }
 
-function persistBlockLayout() {
-  if (!state.selected || !state.blockPackage?.layout) return;
+function persistBlockLayout(name = state.selected, layout = state.blockPackage?.layout) {
+  if (!name || !layout) return;
   try {
     const saved = JSON.parse(window.localStorage.getItem(BLOCK_LAYOUT_STORAGE_KEY) || "{}") || {};
-    saved[blockLayoutIdentity(state.selected)] = cloneBlockLayout(state.blockPackage.layout);
+    saved[blockLayoutIdentity(name)] = cloneBlockLayout(layout);
     window.localStorage.setItem(BLOCK_LAYOUT_STORAGE_KEY, JSON.stringify(saved));
   } catch (_) {}
 }
@@ -1800,12 +1810,26 @@ function flushBlockFieldEdits(strict = true) {
       control._commitBlockField(false);
     } catch (error) {
       control.setCustomValidity(error.message);
-      setDirty(true);
       if (strict) throw error;
       return false;
     }
   }
   return true;
+}
+
+function settleBlockFieldEditsForRerender() {
+  if (!state.blockPackage || !elements.blockCanvas) return;
+  for (const control of elements.blockCanvas.querySelectorAll("[data-block-field-id], [data-block-condition-input]")) {
+    if (control.disabled || control._blockPackageOwner !== state.blockPackage || control.value === control._blockCommittedValue) continue;
+    try {
+      control._commitBlockField(false);
+    } catch (_) {
+      // A half-entered numeric value must not trap the user in the inspector
+      // or leave controls editable after the strategy starts elsewhere.
+      control.value = control._blockCommittedValue;
+      control.setCustomValidity("");
+    }
+  }
 }
 
 function createBlockFieldControl(field, disabled) {
@@ -1877,7 +1901,6 @@ function createBlockFieldControl(field, disabled) {
       } catch (error) {
         // Keep an incomplete numeric edit visible; Save validates it before sending.
         control.setCustomValidity(error.message);
-        setDirty(true);
       }
     });
   }
@@ -1936,7 +1959,8 @@ function createComposerGraphNode(definition, disabled) {
   node.dataset.blockNode = definition.id;
   node.classList.toggle("selected", state.blockSelectedNode === definition.id);
   node.classList.toggle("has-summary", Boolean(definition.summary?.filter(Boolean).length));
-  node.setAttribute("aria-selected", String(state.blockSelectedNode === definition.id));
+  node.tabIndex = 0;
+  node.setAttribute("role", "group");
   const heading = document.createElement("div");
   heading.className = "strategy-block-title";
   const logic = document.createElement("span");
@@ -1960,6 +1984,7 @@ function createComposerGraphNode(definition, disabled) {
     if (node._blockDraggedUntil && performance.now() < node._blockDraggedUntil) return;
     state.blockSelectedNode = definition.id;
     renderStrategyBlocks();
+    focusComposerInspector();
   };
   edit.addEventListener("pointerdown", event => event.stopPropagation());
   edit.addEventListener("click", select);
@@ -1975,9 +2000,31 @@ function createComposerGraphNode(definition, disabled) {
   node.append(heading);
   if (summary.childElementCount) node.append(summary);
   node.addEventListener("click", select);
-  node.setAttribute("aria-label", `${definition.title}. ${definition.meta || ""}. 클릭해 편집`);
+  node.setAttribute("aria-label", `${definition.title}. ${definition.meta || ""}. Enter로 편집, 방향키로 이동`);
   node.classList.toggle("read-only", disabled);
   return node;
+}
+
+function focusComposerInspector() {
+  window.requestAnimationFrame(() => {
+    elements.blockCanvas.querySelector(".composer-inspector-close")?.focus({ preventScroll: true });
+  });
+}
+
+function focusComposerNode(id) {
+  if (!id) return;
+  window.requestAnimationFrame(() => {
+    const node = [...elements.blockCanvas.querySelectorAll("[data-block-node]")]
+      .find(candidate => candidate.dataset.blockNode === id);
+    node?.focus({ preventScroll: true });
+  });
+}
+
+function closeComposerInspector(returnToNode = state.blockSelectedNode) {
+  settleBlockFieldEditsForRerender();
+  state.blockSelectedNode = false;
+  renderStrategyBlocks();
+  focusComposerNode(returnToNode);
 }
 
 function createComposerInspector(definition, running, flowCount) {
@@ -1985,6 +2032,8 @@ function createComposerInspector(definition, running, flowCount) {
   const inspector = document.createElement("aside");
   inspector.className = "composer-inspector";
   inspector.dataset.blockInspector = definition.id;
+  inspector.setAttribute("role", "region");
+  inspector.setAttribute("aria-label", `${definition.title} 상세 설정`);
   const heading = document.createElement("header");
   heading.className = "composer-inspector-header";
   const copy = document.createElement("div");
@@ -2002,10 +2051,8 @@ function createComposerInspector(definition, running, flowCount) {
   close.className = "composer-inspector-close";
   close.textContent = "×";
   close.title = "상세 편집 닫기";
-  close.addEventListener("click", () => {
-    state.blockSelectedNode = false;
-    renderStrategyBlocks();
-  });
+  close.setAttribute("aria-label", "상세 편집 닫기");
+  close.addEventListener("click", () => closeComposerInspector(definition.id));
   heading.append(copy, close);
   inspector.append(heading);
 
@@ -2093,7 +2140,7 @@ function bindBlockConditionControl(control, onChange) {
   };
   if (control.tagName !== "SELECT") control.addEventListener("input", () => {
     try { control._commitBlockField(false); }
-    catch (error) { control.setCustomValidity(error.message); setDirty(true); }
+    catch (error) { control.setCustomValidity(error.message); }
   });
   control.addEventListener("change", () => {
     try { control._commitBlockField(true); }
@@ -2560,11 +2607,6 @@ async function loadBlockEditorData(name, openToken = null) {
   state.blockConditions = [];
   state.blockConditionKey = null;
   state.blockConditionError = null;
-  try {
-    await refreshBlockConditions(openToken);
-  } catch (error) {
-    state.blockConditionError = error.message;
-  }
   return openToken == null || openToken === state.strategyOpenToken;
 }
 
@@ -2669,6 +2711,11 @@ function prepareBlockVisualLayout(name) {
     state.blockPackage.layout = localLayout;
     return;
   }
+  const packageLayout = cloneBlockLayout(state.blockPackage.layout);
+  if (Object.keys(packageLayout.nodes).some(id => id.startsWith("flow-"))) {
+    state.blockPackage.layout = packageLayout;
+    return;
+  }
   state.blockPackage.layout = {
     nodes: Object.fromEntries(Object.entries(plan.defaults).map(([id, point]) => [id, { ...point }])),
     viewport: { x: 34, y: 34, zoom: .82 },
@@ -2680,10 +2727,16 @@ function ensureBlockLayout() {
   state.blockPackage.layout ||= {};
   state.blockPackage.layout.nodes ||= {};
   state.blockPackage.layout.viewport ||= { x: 24, y: 24, zoom: .75 };
+  Object.entries(state.blockPackage.layout.nodes).forEach(([id, point]) => {
+    const x = clampBlockNumber(point?.x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
+    const y = clampBlockNumber(point?.y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
+    if (x == null || y == null) delete state.blockPackage.layout.nodes[id];
+    else state.blockPackage.layout.nodes[id] = { x, y };
+  });
   const viewport = state.blockPackage.layout.viewport;
-  viewport.x = Number.isFinite(Number(viewport.x)) ? Number(viewport.x) : 24;
-  viewport.y = Number.isFinite(Number(viewport.y)) ? Number(viewport.y) : 24;
-  viewport.zoom = Math.min(2, Math.max(.2, Number(viewport.zoom) || .75));
+  viewport.x = clampBlockNumber(viewport.x, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
+  viewport.y = clampBlockNumber(viewport.y, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
+  viewport.zoom = clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, .75);
   return state.blockPackage.layout;
 }
 
@@ -2692,13 +2745,20 @@ function blockNodePosition(id) {
   const saved = layout?.nodes?.[id];
   const fallback = state.blockGraphPlan?.defaults?.[id] || { x: 40, y: 40 };
   return {
-    x: Number.isFinite(Number(saved?.x)) ? Number(saved.x) : fallback.x,
-    y: Number.isFinite(Number(saved?.y)) ? Number(saved.y) : fallback.y,
+    x: clampBlockNumber(saved?.x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, fallback.x),
+    y: clampBlockNumber(saved?.y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, fallback.y),
   };
 }
 
+function constrainBlockViewport(viewport) {
+  viewport.x = clampBlockNumber(viewport.x, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
+  viewport.y = clampBlockNumber(viewport.y, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
+  viewport.zoom = clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, .75);
+  return viewport;
+}
+
 function applyBlockViewport(world) {
-  const viewport = ensureBlockLayout()?.viewport || { x: 24, y: 24, zoom: .75 };
+  const viewport = constrainBlockViewport(ensureBlockLayout()?.viewport || { x: 24, y: 24, zoom: .75 });
   world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`;
   elements.blockCanvas.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`;
   elements.blockCanvas.style.backgroundSize = `${18 * viewport.zoom}px ${18 * viewport.zoom}px`;
@@ -2822,30 +2882,66 @@ function createBlockEdgeLayer() {
   return svg;
 }
 
-function bindBlockNodeDrag(node, world, edgeLayer, running) {
+function bindBlockNodeDrag(node, world, edgeLayer) {
   const handle = node.querySelector(".strategy-block-title");
-  if (!handle || running) return;
+  if (!handle) return;
+  const moveNode = (x, y) => {
+    const constrained = {
+      x: Math.round(clampBlockNumber(x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, 0) * 10) / 10,
+      y: Math.round(clampBlockNumber(y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, 0) * 10) / 10,
+    };
+    ensureBlockLayout().nodes[node.dataset.blockNode] = constrained;
+    node.style.left = `${constrained.x}px`;
+    node.style.top = `${constrained.y}px`;
+    drawBlockGraphEdges(world, edgeLayer);
+    return constrained;
+  };
+  node.addEventListener("keydown", event => {
+    if (event.target !== node) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      node.querySelector(".composer-node-edit")?.click();
+      return;
+    }
+    const directions = {
+      ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
+    };
+    const direction = directions[event.key];
+    if (!direction) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const step = event.shiftKey ? 40 : 10;
+    const start = blockNodePosition(node.dataset.blockNode);
+    moveNode(start.x + direction[0] * step, start.y + direction[1] * step);
+    persistBlockLayout();
+  });
   handle.addEventListener("pointerdown", event => {
     if (event.button !== 0 || event.target.closest("button, input, select, textarea, a")) return;
     event.preventDefault();
     event.stopPropagation();
     const viewport = ensureBlockLayout().viewport;
+    const strategyName = state.selected;
+    const layout = state.blockPackage?.layout;
     const start = blockNodePosition(node.dataset.blockNode);
     const origin = { x: event.clientX, y: event.clientY };
     let moved = false;
     handle.setPointerCapture(event.pointerId);
     node.classList.add("dragging");
     const move = moveEvent => {
-      const x = start.x + (moveEvent.clientX - origin.x) / viewport.zoom;
-      const y = start.y + (moveEvent.clientY - origin.y) / viewport.zoom;
+      const x = clampBlockNumber(
+        start.x + (moveEvent.clientX - origin.x) / viewport.zoom,
+        -BLOCK_NODE_COORD_LIMIT,
+        BLOCK_NODE_COORD_LIMIT,
+        start.x,
+      );
+      const y = clampBlockNumber(
+        start.y + (moveEvent.clientY - origin.y) / viewport.zoom,
+        -BLOCK_NODE_COORD_LIMIT,
+        BLOCK_NODE_COORD_LIMIT,
+        start.y,
+      );
       moved ||= Math.abs(x - start.x) >= .1 || Math.abs(y - start.y) >= .1;
-      state.blockPackage.layout.nodes[node.dataset.blockNode] = {
-        x: Math.round(x * 10) / 10,
-        y: Math.round(y * 10) / 10,
-      };
-      node.style.left = `${x}px`;
-      node.style.top = `${y}px`;
-      drawBlockGraphEdges(world, edgeLayer);
+      moveNode(x, y);
     };
     const end = endEvent => {
       if (handle.hasPointerCapture?.(endEvent.pointerId)) {
@@ -2857,7 +2953,7 @@ function bindBlockNodeDrag(node, world, edgeLayer, running) {
       handle.removeEventListener("pointercancel", end);
       if (moved) {
         node._blockDraggedUntil = performance.now() + 250;
-        persistBlockLayout();
+        persistBlockLayout(strategyName, layout);
       }
     };
     handle.addEventListener("pointermove", move);
@@ -2870,18 +2966,31 @@ function bindBlockCanvasPan(world) {
   const canvas = elements.blockCanvas;
   if (canvas._blockPanHandler) canvas.removeEventListener("pointerdown", canvas._blockPanHandler);
   if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
+  if (canvas._blockKeyHandler) canvas.removeEventListener("keydown", canvas._blockKeyHandler);
   const panHandler = event => {
     if (event.button !== 0 || event.target.closest(".strategy-block-node, .composer-inspector")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
+    const strategyName = state.selected;
+    const layout = state.blockPackage?.layout;
     const start = { x: viewport.x, y: viewport.y };
     const origin = { x: event.clientX, y: event.clientY };
     let moved = false;
     canvas.setPointerCapture(event.pointerId);
     canvas.classList.add("panning");
     const move = moveEvent => {
-      viewport.x = start.x + moveEvent.clientX - origin.x;
-      viewport.y = start.y + moveEvent.clientY - origin.y;
+      viewport.x = clampBlockNumber(
+        start.x + moveEvent.clientX - origin.x,
+        -BLOCK_VIEWPORT_COORD_LIMIT,
+        BLOCK_VIEWPORT_COORD_LIMIT,
+        start.x,
+      );
+      viewport.y = clampBlockNumber(
+        start.y + moveEvent.clientY - origin.y,
+        -BLOCK_VIEWPORT_COORD_LIMIT,
+        BLOCK_VIEWPORT_COORD_LIMIT,
+        start.y,
+      );
       moved ||= Math.abs(viewport.x - start.x) >= .1 || Math.abs(viewport.y - start.y) >= .1;
       applyBlockViewport(world);
     };
@@ -2893,7 +3002,7 @@ function bindBlockCanvasPan(world) {
       canvas.removeEventListener("pointermove", move);
       canvas.removeEventListener("pointerup", end);
       canvas.removeEventListener("pointercancel", end);
-      if (moved) persistBlockLayout();
+      if (moved) persistBlockLayout(strategyName, layout);
     };
     canvas.addEventListener("pointermove", move);
     canvas.addEventListener("pointerup", end);
@@ -2915,14 +3024,52 @@ function bindBlockCanvasPan(world) {
       viewport.x -= event.deltaX + (event.shiftKey ? event.deltaY : 0);
       viewport.y -= event.shiftKey ? 0 : event.deltaY;
     }
+    constrainBlockViewport(viewport);
     applyBlockViewport(world);
     window.clearTimeout(canvas._blockViewPersistTimer);
-    canvas._blockViewPersistTimer = window.setTimeout(persistBlockLayout, 180);
+    const strategyName = state.selected;
+    const layout = state.blockPackage?.layout;
+    canvas._blockViewPersistTimer = window.setTimeout(
+      () => persistBlockLayout(strategyName, layout),
+      180,
+    );
+  };
+  const keyHandler = event => {
+    if (event.target !== canvas || event.ctrlKey || event.metaKey || event.altKey) return;
+    const viewport = ensureBlockLayout().viewport;
+    const step = event.shiftKey ? 120 : 40;
+    const movement = {
+      ArrowLeft: [step, 0], ArrowRight: [-step, 0], ArrowUp: [0, step], ArrowDown: [0, -step],
+    }[event.key];
+    if (movement) {
+      event.preventDefault();
+      viewport.x += movement[0];
+      viewport.y += movement[1];
+      constrainBlockViewport(viewport);
+      applyBlockViewport(world);
+      persistBlockLayout();
+      return;
+    }
+    if (["+", "="].includes(event.key)) {
+      event.preventDefault();
+      setBlockZoom(viewport.zoom + .1);
+    } else if (["-", "_"].includes(event.key)) {
+      event.preventDefault();
+      setBlockZoom(viewport.zoom - .1);
+    } else if (event.key === "0") {
+      event.preventDefault();
+      setBlockZoom(1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      fitBlockGraph();
+    }
   };
   canvas._blockPanHandler = panHandler;
   canvas._blockWheelHandler = wheelHandler;
+  canvas._blockKeyHandler = keyHandler;
   canvas.addEventListener("pointerdown", panHandler);
   canvas.addEventListener("wheel", wheelHandler, { passive: false });
+  canvas.addEventListener("keydown", keyHandler);
 }
 
 function setBlockZoom(nextZoom) {
@@ -3382,7 +3529,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
     node.style.left = `${point.x}px`;
     node.style.top = `${point.y}px`;
     world.append(node);
-    bindBlockNodeDrag(node, world, edgeLayer, running);
+    bindBlockNodeDrag(node, world, edgeLayer);
   }
   elements.blockCanvas.append(world);
   bindBlockCanvasPan(world);
@@ -3403,6 +3550,7 @@ function renderStrategyBlocks() {
   const parsed = currentBlockModel();
   const running = Boolean(selectedState()?.running);
   const managed = parsed.template === "condition-bollinger-v1" && Boolean(state.blockPackage);
+  state.blockRenderedRunning = managed ? running : null;
   const inspectorSnapshot = managed ? captureComposerInspectorView() : null;
   const zoomControls = elements.strategyBlocks.querySelector(".block-zoom-controls");
   if (zoomControls) zoomControls.hidden = !managed;
@@ -3582,6 +3730,15 @@ function updateControls() {
   elements.strategyState.textContent = !selected
     ? "선택된 전략 없음"
     : running ? "실행 중 · 편집하려면 먼저 중지하세요" : "중지됨 · 편집 가능";
+  if (
+    selected
+    && state.strategyType === "block"
+    && state.strategyTab === "blocks"
+    && state.blockRenderedRunning !== running
+  ) {
+    settleBlockFieldEditsForRerender();
+    renderStrategyBlocks();
+  }
   renderStrategyOverview();
 }
 
@@ -3647,6 +3804,10 @@ async function refreshStrategies({ force = false } = {}) {
 
 async function openStrategy(name) {
   if (name === state.selected && state.view === "strategy") {
+    if (state.openingStrategy && state.openingStrategy !== name) {
+      state.strategyOpenToken += 1;
+      state.openingStrategy = null;
+    }
     state.strategyBalanceTab = "balance";
     setStrategyTab("overview");
     return;
@@ -3685,6 +3846,17 @@ async function openStrategy(name) {
     state.logCursor = state.clearedLogCursors[name] || 0;
     resetActivity();
     renderStrategies();
+    if (strategyType === "block") {
+      try {
+        await refreshBlockConditions(openToken);
+      } catch (error) {
+        if (openToken === state.strategyOpenToken) {
+          state.blockConditionError = error.message;
+          if (state.strategyTab === "blocks") renderStrategyBlocks();
+        }
+      }
+    }
+    if (openToken !== state.strategyOpenToken) return;
     await refreshStrategyPermission();
     await Promise.all([refreshStrategySummary(), refreshLogs(), refreshOrders()]);
   } finally {
@@ -5033,6 +5205,11 @@ document.addEventListener("keydown", event => {
   }
   if (event.key === "Escape" && !elements.settingsModal.hidden) {
     closeSettings();
+    return;
+  }
+  if (event.key === "Escape" && elements.blockCanvas.querySelector(".composer-inspector")) {
+    event.preventDefault();
+    closeComposerInspector();
     return;
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
