@@ -2096,6 +2096,9 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   text-transform: uppercase;
 }
 .composer-inspector .strategy-block-fields { gap: 8px; }
+.composer-inspector .schedule-fields-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
 .composer-inspector .strategy-block-field {
   grid-template-columns: minmax(116px, .72fr) minmax(0, 1.28fr);
   gap: 9px;

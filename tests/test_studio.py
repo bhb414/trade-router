@@ -895,6 +895,9 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert static_styles.status_code == 200
         assert ".strategy-blocks.managed-composer" in static_styles.text
         assert ".composer-fixed-tree" in static_styles.text
+        assert """.composer-inspector .schedule-fields-grid {
+  grid-template-columns: minmax(0, 1fr);
+}""" in static_styles.text
         assert ".composer-tree-card" in static_styles.text
         assert ".composer-tree-branch" in static_styles.text
         assert ".composer-tree-children" in static_styles.text
