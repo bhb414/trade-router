@@ -1,5 +1,5 @@
 const LOG_CLEAR_STORAGE_KEY = "trade-router.log-clear-cursors.v1";
-const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v3";
+const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v4";
 
 const state = {
   view: "dashboard",
@@ -14,6 +14,7 @@ const state = {
   blockConditionError: null,
   blockGraphRedraw: null,
   blockGraphPlan: null,
+  blockSelectedNode: null,
   conditionGroupSerial: 0,
   blockScheduleExpanded: new Map(),
   strategySearch: "",
@@ -1596,6 +1597,7 @@ function addBlockBuyFlow() {
   };
   flows.push(flow);
   setScheduleSectionExpanded(`flow:${flow.id}`, true);
+  state.blockSelectedNode = `flow-${flow.id}-schedule`;
   setDirty(true);
   renderStrategyBlocks();
   refreshBlockConditions().catch(error => notify(error.message, true));
@@ -1606,6 +1608,7 @@ function removeBlockBuyFlow(flowId) {
   const index = flows.findIndex(flow => flow.id === flowId);
   if (index < 0 || flows.length <= 1 || selectedState()?.running) return;
   flows.splice(index, 1);
+  if (String(state.blockSelectedNode || "").startsWith(`flow-${flowId}-`)) state.blockSelectedNode = "connection";
   const nodes = state.blockPackage?.layout?.nodes || {};
   Object.keys(nodes).filter(id => id.startsWith(`flow-${flowId}-`)).forEach(id => delete nodes[id]);
   setDirty(true);
@@ -1927,6 +1930,122 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [],
   return node;
 }
 
+function createComposerGraphNode(definition, disabled) {
+  const node = document.createElement("article");
+  node.className = `strategy-block-node graph-node composer-node ${definition.tone || "general"}`;
+  node.dataset.blockNode = definition.id;
+  node.classList.toggle("selected", state.blockSelectedNode === definition.id);
+  node.classList.toggle("has-summary", Boolean(definition.summary?.filter(Boolean).length));
+  node.setAttribute("aria-selected", String(state.blockSelectedNode === definition.id));
+  const heading = document.createElement("div");
+  heading.className = "strategy-block-title";
+  const logic = document.createElement("span");
+  logic.className = `composer-logic-pill ${definition.logicTone || definition.tone || "general"}`;
+  logic.textContent = definition.logic || "블록";
+  const copy = document.createElement("span");
+  copy.className = "composer-node-copy";
+  const name = document.createElement("strong");
+  name.textContent = definition.title;
+  const detail = document.createElement("small");
+  detail.textContent = definition.meta || "";
+  copy.append(name, detail);
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.className = "composer-node-edit";
+  edit.textContent = "편집";
+  edit.disabled = false;
+  edit.setAttribute("aria-label", `${definition.title} 상세 편집`);
+  const select = event => {
+    event?.stopPropagation();
+    if (node._blockDraggedUntil && performance.now() < node._blockDraggedUntil) return;
+    state.blockSelectedNode = definition.id;
+    renderStrategyBlocks();
+  };
+  edit.addEventListener("pointerdown", event => event.stopPropagation());
+  edit.addEventListener("click", select);
+  heading.append(logic, copy, edit);
+  const summary = document.createElement("div");
+  summary.className = "composer-node-summary";
+  (definition.summary || []).filter(Boolean).slice(0, 3).forEach(text => {
+    const chip = document.createElement("span");
+    chip.className = "composer-summary-chip";
+    chip.textContent = text;
+    summary.append(chip);
+  });
+  node.append(heading);
+  if (summary.childElementCount) node.append(summary);
+  node.addEventListener("click", select);
+  node.setAttribute("aria-label", `${definition.title}. ${definition.meta || ""}. 클릭해 편집`);
+  node.classList.toggle("read-only", disabled);
+  return node;
+}
+
+function createComposerInspector(definition, running, flowCount) {
+  if (!definition) return null;
+  const inspector = document.createElement("aside");
+  inspector.className = "composer-inspector";
+  inspector.dataset.blockInspector = definition.id;
+  const heading = document.createElement("header");
+  heading.className = "composer-inspector-header";
+  const copy = document.createElement("div");
+  copy.className = "composer-inspector-heading";
+  const eyebrow = document.createElement("span");
+  eyebrow.className = `composer-logic-pill ${definition.logicTone || definition.tone || "general"}`;
+  eyebrow.textContent = definition.logic || "블록";
+  const title = document.createElement("strong");
+  title.textContent = definition.title;
+  const meta = document.createElement("small");
+  meta.textContent = definition.meta || "선택한 블록의 설정";
+  copy.append(eyebrow, title, meta);
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "composer-inspector-close";
+  close.textContent = "×";
+  close.title = "상세 편집 닫기";
+  close.addEventListener("click", () => {
+    state.blockSelectedNode = false;
+    renderStrategyBlocks();
+  });
+  heading.append(copy, close);
+  inspector.append(heading);
+
+  const body = document.createElement("div");
+  body.className = "composer-inspector-body";
+  if (definition.description) {
+    const description = document.createElement("p");
+    description.className = "composer-inspector-description";
+    description.textContent = definition.description;
+    body.append(description);
+  }
+  if (definition.fields?.length) body.append(createScheduleFields(definition.fields, running));
+  if (definition.conditionGroup) {
+    const group = definition.conditionGroup;
+    body.append(createConditionEditor(group.kind, group.index, running, group.flowId));
+  }
+  if (definition.emptyBuyFlowId) body.append(createEmptyBuyConditionEditor(running, definition.emptyBuyFlowId));
+  if (definition.actions?.length) {
+    const actions = document.createElement("div");
+    actions.className = "composer-inspector-actions";
+    definition.actions.forEach(action => {
+      const item = document.createElement("span");
+      item.textContent = action;
+      actions.append(item);
+    });
+    body.append(actions);
+  }
+  if (definition.flowId) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button quiet compact danger-text composer-remove-flow";
+    remove.textContent = "이 매수 흐름 삭제";
+    remove.disabled = running || flowCount <= 1;
+    remove.addEventListener("click", () => removeBlockBuyFlow(definition.flowId));
+    body.append(remove);
+  }
+  inspector.append(body);
+  return inspector;
+}
+
 const BLOCK_CONDITION_METRICS = [
   ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
   ["heikin_open", "하이킨아시 시가"], ["heikin_high", "하이킨아시 고가"],
@@ -2042,6 +2161,9 @@ function addConditionGroup(kind, flowId = null) {
   const group = newConditionGroup(kind);
   groups.push(group);
   setScheduleSectionExpanded(`condition:${flowId || kind}:${group.id}`, true);
+  state.blockSelectedNode = kind === "buy" && flowId
+    ? `flow-${flowId}-group-${group.id}`
+    : `${kind}Group-${group.id}`;
   setDirty(true);
   renderStrategyBlocks();
 }
@@ -2050,6 +2172,9 @@ function removeConditionGroup(kind, groupIndex, flowId = null) {
   const groups = blockConditionGroups(kind, flowId);
   if (!groups[groupIndex] || (kind === "sell" && groups.length <= 1)) return;
   const [removed] = groups.splice(groupIndex, 1);
+  const removedNode = removed?.id && (flowId ? `flow-${flowId}-group-${removed.id}` : `${kind}Group-${removed.id}`);
+  if (removedNode && state.blockSelectedNode === removedNode) state.blockSelectedNode = kind === "buy" && flowId
+    ? `flow-${flowId}-target` : "sellSchedule";
   if (removed?.id && state.blockPackage?.layout?.nodes) {
     delete state.blockPackage.layout.nodes[flowId ? `flow-${flowId}-group-${removed.id}` : `${kind}Group-${removed.id}`];
   }
@@ -2466,61 +2591,65 @@ const LEGACY_CONDITION_GRAPH_DEFAULTS = {
 function managedConditionGraphPlan(settings) {
   const flows = Array.isArray(settings?.buy_flows) ? settings.buy_flows : [];
   const sellGroups = Array.isArray(settings?.sell_condition_groups) ? settings.sell_condition_groups : [];
-  const conditionHeight = groups => Math.max(0, ...groups.map(group => 210 + (group.conditions?.length || 0) * 310));
-  const maxBuyGroups = Math.max(1, ...flows.map(flow => flow.buy_condition_groups?.length || 0));
-  const buyConditionStart = 1230;
-  const buyRulesX = buyConditionStart + maxBuyGroups * 510 + 110;
-  const sellConditionStart = 430;
-  const sellOrderX = sellConditionStart + Math.max(1, sellGroups.length) * 530;
-  const defaults = { connection: { x: 60, y: 100 } };
-  const labels = { connection: { text: "공통 계좌 · 데이터 연결", x: 60, y: 48 } };
-  const edges = [["buyRules", "buyOrder", "주문 가능"], ["closeSchedule", "sellOrder", "장 마감"]];
-  let nextY = 100;
+  const rootX = 50;
+  const branchX = rootX + 68;
+  const detailX = branchX + 68;
+  const rowGap = 144;
+  const defaults = { connection: { x: rootX, y: 90 } };
+  const labels = { connection: { text: "전략 공통 연결", x: rootX, y: 45 } };
+  const edges = [];
+  const buyExits = [];
+  let nextY = 240;
   flows.forEach((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
     const groups = flow.buy_condition_groups || [];
     const y = nextY;
-    labels[prefix] = { text: `${flow.name || `매수 흐름 ${flowIndex + 1}`} · ${flow.buy_start_time} ≤ 시각 < ${flow.buy_end_time}`, x: 450, y: y - 48 };
-    defaults[`${prefix}-schedule`] = { x: 450, y };
-    defaults[`${prefix}-target`] = { x: 840, y };
-    edges.push(["connection", `${prefix}-schedule`, "공통 연결"], [`${prefix}-schedule`, `${prefix}-target`, "시간 내 조회"]);
-    // Common account/API settings apply to every branch. The branch lines themselves
-    // represent candidate progression, so unrelated branches never form an AND chain.
+    labels[prefix] = { text: `${flow.name || `매수 흐름 ${flowIndex + 1}`} · ${flow.buy_start_time}–${flow.buy_end_time}`, x: rootX, y: y - 38 };
+    defaults[`${prefix}-schedule`] = { x: rootX, y };
+    defaults[`${prefix}-target`] = { x: branchX, y: y + rowGap };
+    edges.push(["connection", `${prefix}-schedule`, flowIndex ? "병렬 일정" : "매수 일정"]);
+    edges.push([`${prefix}-schedule`, `${prefix}-target`, "조회"]);
     const first = groups.length ? `${prefix}-group-${groups[0].id}` : `${prefix}-empty`;
-    edges.push([`${prefix}-target`, first, "종목 목록"]);
+    edges.push([`${prefix}-target`, first, "후보 종목"]);
     if (!groups.length) {
-      defaults[first] = { x: buyConditionStart, y };
-      edges.push([first, "buyRules", "이 흐름 통과"]);
+      defaults[first] = { x: detailX, y: y + rowGap * 2 };
+      buyExits.push(first);
     }
     groups.forEach((group, index) => {
       const nodeId = `${prefix}-group-${group.id}`;
-      defaults[nodeId] = { x: buyConditionStart + index * 510, y };
-      if (index) edges.push([`${prefix}-group-${groups[index - 1].id}`, nodeId, "AND"]);
+      defaults[nodeId] = { x: detailX, y: y + rowGap * (index + 2) };
+      if (index) edges.push([`${prefix}-group-${groups[index - 1].id}`, nodeId, "그리고"]);
     });
-    if (groups.length) edges.push([`${prefix}-group-${groups[groups.length - 1].id}`, "buyRules", "이 흐름 통과"]);
-    nextY += Math.max(480, conditionHeight(groups)) + 160;
+    if (groups.length) buyExits.push(`${prefix}-group-${groups[groups.length - 1].id}`);
+    nextY += rowGap * (Math.max(1, groups.length) + 2) + 86;
   });
-  defaults.buyRules = { x: buyRulesX, y: 100 };
-  defaults.buyOrder = { x: buyRulesX + 400, y: 100 };
-  labels.buyShared = { text: "모든 흐름이 공유 · 예산 · 보유종목 · 주문", x: buyRulesX, y: 48 };
-  const sellBaseY = Math.max(780, nextY + 60);
-  const closeY = sellBaseY + Math.max(560, conditionHeight(sellGroups)) + 100;
-  defaults.sellSchedule = { x: 60, y: sellBaseY + 50 };
-  defaults.sellOrder = { x: sellOrderX, y: sellBaseY + 20 };
-  defaults.closeSchedule = { x: sellOrderX, y: closeY };
+  defaults.buyRules = { x: branchX, y: nextY };
+  defaults.buyOrder = { x: detailX, y: nextY + rowGap };
+  labels.buyShared = { text: "공통 예산 · 보유종목 · 매수 주문", x: branchX, y: nextY - 38 };
+  buyExits.forEach((id, index) => edges.push([id, "buyRules", index ? "공통 예산" : "조건 통과"]));
+  edges.push(["buyRules", "buyOrder", "주문 가능"]);
+
+  const sellBaseY = nextY + rowGap * 2 + 130;
+  defaults.sellSchedule = { x: rootX, y: sellBaseY };
+  labels.sell = { text: "공통 보유종목 · 매도 판단", x: rootX, y: sellBaseY - 38 };
   sellGroups.forEach((group, index) => {
     const id = `sellGroup-${group.id}`;
-    defaults[id] = { x: sellConditionStart + index * 530, y: sellBaseY };
+    defaults[id] = { x: branchX, y: sellBaseY + rowGap * (index + 1) };
     edges.push(index
-      ? [`sellGroup-${sellGroups[index - 1].id}`, id, "AND"]
+      ? [`sellGroup-${sellGroups[index - 1].id}`, id, "그리고"]
       : ["sellSchedule", id, "판단 시점"]);
   });
-  if (sellGroups.length) edges.push([`sellGroup-${sellGroups[sellGroups.length - 1].id}`, "sellOrder", "모두 통과"]);
-  labels.sell = { text: "공통 보유종목 · 매수 흐름과 별도로 매도 판단", x: sellConditionStart, y: sellBaseY - 48 };
-  labels.close = { text: "장 마감", x: sellOrderX, y: closeY - 48 };
+  const sellOrderY = sellBaseY + rowGap * (sellGroups.length + 1);
+  defaults.sellOrder = { x: detailX, y: sellOrderY };
+  if (sellGroups.length) edges.push([`sellGroup-${sellGroups[sellGroups.length - 1].id}`, "sellOrder", "조건 충족"]);
+  else edges.push(["sellSchedule", "sellOrder", "매도"]);
+  const closeY = sellOrderY + rowGap + 120;
+  defaults.closeSchedule = { x: rootX, y: closeY };
+  edges.push(["closeSchedule", "sellOrder", "장 마감 청산"]);
+  labels.close = { text: "장 마감", x: rootX, y: closeY - 38 };
   return {
     defaults, edges, labels,
-    size: { width: Math.max(2200, buyRulesX + 760, sellOrderX + 420), height: Math.max(1760, closeY + 360) },
+    size: { width: 1540, height: Math.max(1760, closeY + 260) },
   };
 }
 
@@ -2540,16 +2669,10 @@ function prepareBlockVisualLayout(name) {
     state.blockPackage.layout = localLayout;
     return;
   }
-  const layout = cloneBlockLayout(state.blockPackage.layout);
-  const nodeCount = Object.keys(layout.nodes).length;
-  const hasCurrentNodes = Object.keys(layout.nodes).some(id => id.startsWith("flow-"))
-    && !Object.keys(layout.nodes).some(id => id.includes("Calc-"));
-  if (!nodeCount || !hasCurrentNodes || graphLayoutMatches(layout.nodes, LEGACY_CONDITION_GRAPH_DEFAULTS)) {
-    layout.nodes = Object.fromEntries(
-      Object.entries(plan.defaults).map(([id, point]) => [id, { ...point }])
-    );
-  }
-  state.blockPackage.layout = layout;
+  state.blockPackage.layout = {
+    nodes: Object.fromEntries(Object.entries(plan.defaults).map(([id, point]) => [id, { ...point }])),
+    viewport: { x: 34, y: 34, zoom: .82 },
+  };
 }
 
 function ensureBlockLayout() {
@@ -2703,7 +2826,7 @@ function bindBlockNodeDrag(node, world, edgeLayer, running) {
   const handle = node.querySelector(".strategy-block-title");
   if (!handle || running) return;
   handle.addEventListener("pointerdown", event => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || event.target.closest("button, input, select, textarea, a")) return;
     event.preventDefault();
     event.stopPropagation();
     const viewport = ensureBlockLayout().viewport;
@@ -2732,7 +2855,10 @@ function bindBlockNodeDrag(node, world, edgeLayer, running) {
       handle.removeEventListener("pointermove", move);
       handle.removeEventListener("pointerup", end);
       handle.removeEventListener("pointercancel", end);
-      if (moved) persistBlockLayout();
+      if (moved) {
+        node._blockDraggedUntil = performance.now() + 250;
+        persistBlockLayout();
+      }
     };
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", end);
@@ -2745,7 +2871,7 @@ function bindBlockCanvasPan(world) {
   if (canvas._blockPanHandler) canvas.removeEventListener("pointerdown", canvas._blockPanHandler);
   if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
   const panHandler = event => {
-    if (event.button !== 0 || event.target.closest(".strategy-block-node")) return;
+    if (event.button !== 0 || event.target.closest(".strategy-block-node, .composer-inspector")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     const start = { x: viewport.x, y: viewport.y };
@@ -2774,6 +2900,7 @@ function bindBlockCanvasPan(world) {
     canvas.addEventListener("pointercancel", end);
   };
   const wheelHandler = event => {
+    if (event.target.closest(".composer-inspector")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     if (event.ctrlKey || event.metaKey) {
@@ -2912,6 +3039,41 @@ function restoreScheduleView(snapshot) {
   }
   elements.blockCanvas.scrollTop = snapshot.top;
   elements.blockCanvas.scrollLeft = snapshot.left;
+}
+
+function captureComposerInspectorView() {
+  const inspector = elements.blockCanvas?.querySelector(".composer-inspector");
+  const body = inspector?.querySelector(".composer-inspector-body");
+  if (!inspector || !body) return null;
+  const controls = [...inspector.querySelectorAll("input, select, textarea, button")];
+  const active = inspector.contains(document.activeElement) ? document.activeElement : null;
+  let selection = null;
+  try { if (active?.selectionStart != null) selection = [active.selectionStart, active.selectionEnd]; } catch (_) { /* Non-text control. */ }
+  return {
+    node: inspector.dataset.blockInspector,
+    top: body.scrollTop,
+    left: body.scrollLeft,
+    id: active?.id || null,
+    controlIndex: active ? controls.indexOf(active) : -1,
+    selection,
+  };
+}
+
+function restoreComposerInspectorView(snapshot) {
+  if (!snapshot) return;
+  const inspector = elements.blockCanvas?.querySelector(".composer-inspector");
+  const body = inspector?.querySelector(".composer-inspector-body");
+  if (!inspector || !body || inspector.dataset.blockInspector !== snapshot.node) return;
+  const controls = [...inspector.querySelectorAll("input, select, textarea, button")];
+  const control = snapshot.id ? inspector.querySelector(`#${CSS.escape(snapshot.id)}`) : controls[snapshot.controlIndex];
+  if (control && !control.disabled) {
+    control.focus({ preventScroll: true });
+    if (snapshot.selection) {
+      try { control.setSelectionRange(...snapshot.selection); } catch (_) { /* Non-text control. */ }
+    }
+  }
+  body.scrollTop = snapshot.top;
+  body.scrollLeft = snapshot.left;
 }
 
 function createScheduleSection({ key, title, summary = "", badge = "", tone = "", open = false, action = null }) {
@@ -3114,7 +3276,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
   restoreScheduleView(snapshot);
 }
 
-function renderConditionBollingerBlocks(parsed, running) {
+function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = null) {
   const fields = new Map(parsed.fields.filter(field => !field.flowId).map(field => [field.settingKey, field]));
   const take = (...keys) => keys.map(key => fields.get(key)).filter(Boolean);
   const settings = state.blockPackage.settings;
@@ -3143,21 +3305,28 @@ function renderConditionBollingerBlocks(parsed, running) {
   edgeLayer.style.height = `${plan.size.height}px`;
   world.append(edgeLayer);
   Object.values(plan.labels).forEach(label => createGraphSectionLabel(world, label.text, label.x, label.y));
+  const money = value => `${Number(value || 0).toLocaleString("ko-KR")}원`;
+  const valueOf = key => fields.get(key)?.value;
   const nodes = [
-    { id: "connection", title: "전략 연결", meta: "모든 흐름 공통", tone: "connection", width: 330,
+    { id: "connection", title: "전략 연결", meta: "모든 흐름 공통", tone: "connection", logic: "공통", logicTone: "root", width: 460,
       fields: take("strategy_id", "trading_account", "condition_source", "market_venue", "route"),
-      actions: ["같은 계좌 · 예산 · 보유종목 공유"], vertical: true },
-    { id: "buyRules", title: "매수 주문 조건", meta: "전략 전체 공유", tone: "risk", width: 340,
+      summary: [valueOf("trading_account"), valueOf("condition_source"), `${valueOf("market_venue")} → ${valueOf("route")}`],
+      description: "계좌와 API, 시세 시장, 주문 경로를 모든 매수 일정과 매도 판단에서 공유합니다.",
+      actions: ["같은 계좌", "공통 예산", "공통 보유종목"] },
+    { id: "buyRules", title: "매수 주문 조건", meta: "전략 전체 공유", tone: "risk", logic: "ALL", logicTone: "all", width: 460,
       fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
+      summary: [`종목당 ${money(valueOf("buy_budget_per_symbol"))}`, `총 ${money(valueOf("total_operating_budget"))}`, `조회당 ${valueOf("max_new_buys_per_scan")}종목`],
       actions: ["미보유", "미체결 없음", "가능 수량 ≥ 1", "운용 예산 이내"] },
-    { id: "buyOrder", title: "매수 주문", meta: "중앙 주문 처리", tone: "event", width: 300,
+    { id: "buyOrder", title: "매수 주문", meta: "중앙 주문 처리", tone: "event", logic: "BUY", logicTone: "buy", width: 460,
       fields: take("buy_order_type"), actions: ["시간 재확인", "멱등성 예약", "위험 검사", "주문 제출", "상태 조정"], vertical: true },
-    { id: "sellOrder", title: "매도 주문", meta: "공통 보유종목", tone: "event", width: 300,
+    { id: "sellOrder", title: "매도 주문", meta: "공통 보유종목", tone: "event", logic: "SELL", logicTone: "sell", width: 460,
       fields: take("sell_order_type"), actions: ["전략 소유 수량", "주문 제출", "상태 조정"], vertical: true },
-    { id: "sellSchedule", title: "매도 판단 일정", meta: sellScheduleMeta, tone: "schedule", width: 320,
-      fields: take("sell_start_time", "sell_end_time"), actions: sellScheduleActions, vertical: true },
-    { id: "closeSchedule", title: "장 마감 청산", meta: "정시 · 재확인", tone: "schedule", width: 360,
-      fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time") },
+    { id: "sellSchedule", title: "매도 판단 일정", meta: sellScheduleMeta, tone: "schedule", logic: "감시", logicTone: "schedule", width: 460,
+      fields: take("sell_start_time", "sell_end_time"), summary: [`${valueOf("sell_start_time")}–${valueOf("sell_end_time")}`, sellScheduleMeta],
+      actions: sellScheduleActions, vertical: true },
+    { id: "closeSchedule", title: "장 마감 청산", meta: "정시 · 재확인", tone: "schedule", logic: "마감", logicTone: "close", width: 460,
+      fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"),
+      summary: [`청산 ${valueOf("close_time")}`, `재확인 ${valueOf("close_retry_start")}–${valueOf("close_retry_end")}`] },
   ];
   flows.forEach((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
@@ -3168,53 +3337,47 @@ function renderConditionBollingerBlocks(parsed, running) {
     const targetFields = flow.target_source === "RANKING"
       ? takeFlow("target_source", "ranking_kind", "ranking_venue", "ranking_market", "ranking_limit")
       : flow.target_source === "SYMBOLS" ? takeFlow("target_source", "symbols") : takeFlow("target_source", "hts_user_id", "condition_id");
+    const selectedCondition = conditions.conditions?.find(item => String(item.id) === String(flow.condition_id));
+    const targetSummary = flow.target_source === "HTS_CONDITION"
+      ? (selectedCondition?.name || flow.expected_condition_name || `조건식 ${flow.condition_id || "미선택"}`)
+      : flow.target_source === "RANKING" ? `${flow.ranking_kind} · ${flow.ranking_market} · ${flow.ranking_limit}개`
+        : (flow.symbols || []).join(", ") || "종목 미지정";
     nodes.push({
-      id: `${prefix}-schedule`, title: flow.name || `매수 흐름 ${flowIndex + 1}`, meta: "한국 시각 · 종료 시각 제외", tone: "schedule", width: 340,
+      id: `${prefix}-schedule`, title: flow.name || `매수 흐름 ${flowIndex + 1}`, meta: "한국 시각 · 종료 시각 제외", tone: "schedule", logic: "시간", logicTone: "schedule", width: 460,
       fields: takeFlow("name", "buy_start_time", "buy_end_time", "buy_scan_seconds"), flowId: flow.id,
+      summary: [`${flow.buy_start_time}–${flow.buy_end_time}`, `${flow.buy_scan_seconds}초마다`],
+      description: "이 시간대의 종목 조회와 매수 조건은 다른 매수 흐름과 독립적으로 실행됩니다.",
     }, {
       id: `${prefix}-target`, title: targetLabels[flow.target_source] || "종목 데이터", meta: flow.target_source === "HTS_CONDITION"
         ? (conditions.loading ? "조건식 조회 중" : conditions.error ? "조회 실패" : `${conditions.conditions.length}개 조건식`) : "이 흐름에서 조회",
-      tone: "target", width: 340, fields: targetFields, actions: ["조회 결과를 이 흐름의 조건에 전달"], vertical: true,
+      tone: "target", logic: "대상", logicTone: "universe", width: 460, fields: targetFields,
+      summary: [targetSummary], actions: ["조회 결과를 이 흐름의 조건에 전달"], vertical: true,
     });
     if (!groups.length) nodes.push({
-      id: `${prefix}-empty`, title: "매수 조건", meta: "조건 없이 통과", tone: "risk", width: 410,
+      id: `${prefix}-empty`, title: "매수 조건", meta: "조건 없이 통과", tone: "risk", logic: "PASS", logicTone: "any", width: 460,
+      summary: ["대상 종목을 바로 주문 조건으로 전달"],
       emptyBuyFlowId: flow.id,
     });
     groups.forEach((group, index) => nodes.push({
       id: `${prefix}-group-${group.id}`, title: `매수 조건 ${index + 1}`,
       meta: `${group.conditions.length}개 · 내부 OR${index ? " · 이전 블록과 AND" : ""}`,
-      tone: "risk", width: 460, conditionGroup: { kind: "buy", index, flowId: flow.id },
+      tone: "risk", logic: index ? "AND" : "ANY", logicTone: index ? "all" : "any", width: 460,
+      summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "buy", index, flowId: flow.id },
     }));
   });
   sellGroups.forEach((group, index) => nodes.push({
     id: `sellGroup-${group.id}`, title: `매도 조건 ${index + 1}`,
     meta: `${group.conditions.length}개 · 내부 OR${index ? " · 이전 블록과 AND" : ""}`,
-    tone: "risk", width: 480, conditionGroup: { kind: "sell", index },
+    tone: "risk", logic: index ? "AND" : "ANY", logicTone: index ? "all" : "any", width: 460,
+    summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "sell", index },
   }));
+  const nodeIds = new Set(nodes.map(node => node.id));
+  if (state.blockSelectedNode == null || (state.blockSelectedNode && !nodeIds.has(state.blockSelectedNode))) {
+    state.blockSelectedNode = "connection";
+  }
   for (const definition of nodes) {
-    const node = createStrategyBlockNode(definition, running);
-    if (definition.conditionGroup) {
-      const group = definition.conditionGroup;
-      node.append(createConditionEditor(group.kind, group.index, running, group.flowId));
-    }
-    if (definition.emptyBuyFlowId) node.append(createEmptyBuyConditionEditor(running, definition.emptyBuyFlowId));
-    if (definition.flowId) {
-      const actions = document.createElement("div");
-      actions.className = "block-flow-settings-actions";
-      const hint = document.createElement("p");
-      hint.textContent = "이 시간에 조회한 종목만 아래 조건으로 판단합니다. 시간이 겹치면 각 흐름이 독립적으로 실행됩니다.";
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "button quiet compact danger-text";
-      remove.textContent = "이 매수 흐름 삭제";
-      remove.disabled = running || flows.length <= 1;
-      remove.addEventListener("click", () => removeBlockBuyFlow(definition.flowId));
-      actions.append(hint, remove);
-      node.append(actions);
-    }
+    const node = createComposerGraphNode(definition, running);
     const point = blockNodePosition(definition.id);
-    node.classList.add("graph-node");
-    node.dataset.blockNode = definition.id;
     node.style.width = `${definition.width}px`;
     node.style.left = `${point.x}px`;
     node.style.top = `${point.y}px`;
@@ -3226,6 +3389,12 @@ function renderConditionBollingerBlocks(parsed, running) {
   applyBlockViewport(world);
   state.blockGraphRedraw = () => drawBlockGraphEdges(world, edgeLayer);
   window.requestAnimationFrame(state.blockGraphRedraw);
+  const selected = nodes.find(node => node.id === state.blockSelectedNode);
+  const inspector = createComposerInspector(selected, running, flows.length);
+  if (inspector) {
+    elements.blockCanvas.append(inspector);
+    restoreComposerInspectorView(inspectorSnapshot);
+  }
 }
 
 function renderStrategyBlocks() {
@@ -3234,16 +3403,20 @@ function renderStrategyBlocks() {
   const parsed = currentBlockModel();
   const running = Boolean(selectedState()?.running);
   const managed = parsed.template === "condition-bollinger-v1" && Boolean(state.blockPackage);
-  const scheduleSnapshot = captureScheduleView();
+  const inspectorSnapshot = managed ? captureComposerInspectorView() : null;
   const zoomControls = elements.strategyBlocks.querySelector(".block-zoom-controls");
-  if (zoomControls) zoomControls.hidden = managed;
+  if (zoomControls) zoomControls.hidden = !managed;
   const footer = elements.strategyBlocks.querySelector(".block-editor-status");
-  if (footer) footer.hidden = managed;
-  elements.blockCanvas.classList.toggle("schedule-mode", managed);
-  elements.strategyBlocks.classList.toggle("managed-schedule", managed);
-  elements.blockCanvas.setAttribute("aria-label", managed ? "전략 일정 편집" : "블록 전략 캔버스");
-  elements.blockCanvas.classList.remove("graph-mode", "panning");
+  if (footer) footer.hidden = !managed;
+  elements.blockCanvas.classList.remove("schedule-mode", "graph-mode", "composer-mode", "panning");
+  elements.strategyBlocks.classList.remove("managed-schedule", "managed-composer");
+  elements.strategyBlocks.classList.toggle("managed-composer", managed);
+  elements.blockCanvas.setAttribute("aria-label", managed ? "이동 가능한 전략 블록 캔버스" : "블록 전략 캔버스");
   if (managed) {
+    elements.blockCanvas.classList.add("graph-mode", "composer-mode");
+    elements.blockCanvas.scrollTop = 0;
+    elements.blockCanvas.scrollLeft = 0;
+  } else {
     elements.blockCanvas.style.backgroundPosition = "";
     elements.blockCanvas.style.backgroundSize = "";
     state.blockGraphRedraw = null;
@@ -3275,7 +3448,7 @@ function renderStrategyBlocks() {
   }
 
   if (parsed.template === "condition-bollinger-v1" && state.blockPackage) {
-    renderConditionSchedule(parsed, running, scheduleSnapshot);
+    renderConditionBollingerBlocks(parsed, running, inspectorSnapshot);
     return;
   }
 
@@ -3336,6 +3509,13 @@ function renderStrategyBlocks() {
   }
 }
 
+function syncBlockEditorFocus() {
+  document.body.classList.toggle(
+    "block-editor-focus",
+    state.view === "strategy" && state.strategyType === "block" && state.strategyTab === "blocks",
+  );
+}
+
 function setStrategyTab(tab) {
   const allowed = state.strategyType === "block"
     ? new Set(["overview", "blocks"])
@@ -3354,6 +3534,7 @@ function setStrategyTab(tab) {
   if (tab === "blocks" && state.selected && state.blockSource !== elements.editor.value) {
     renderStrategyBlocks();
   }
+  syncBlockEditorFocus();
 }
 
 function configureStrategyTabs() {
@@ -3373,6 +3554,7 @@ function showWorkspaceView(view) {
   elements.dashboardView.hidden = view !== "dashboard";
   elements.strategyView.hidden = view !== "strategy";
   elements.dashboardButton.classList.toggle("active", view === "dashboard");
+  syncBlockEditorFocus();
 }
 
 function updateControls() {
@@ -3472,6 +3654,7 @@ async function openStrategy(name) {
   if (name === state.openingStrategy) return;
   if (state.dirty && !window.confirm("저장하지 않은 변경 사항이 있습니다. 저장하지 않고 다른 전략을 열까요?")) return;
   const openToken = ++state.strategyOpenToken;
+  state.blockSelectedNode = null;
   state.openingStrategy = name;
   try {
     const payload = await api(`/api/strategies/${encodeURIComponent(name)}`);

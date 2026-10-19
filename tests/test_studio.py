@@ -834,6 +834,13 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'button.addEventListener("pointerdown"' in static_script.text
         assert "buy_condition_groups" in static_script.text
         assert "매수 주문 조건" in static_script.text
+        assert "createComposerGraphNode" in static_script.text
+        assert "createComposerInspector" in static_script.text
+        assert "captureComposerInspectorView" in static_script.text
+        assert "restoreComposerInspectorView" in static_script.text
+        assert 'classList.add("graph-mode", "composer-mode")' in static_script.text
+        assert 'event.target.closest(".strategy-block-node, .composer-inspector")' in static_script.text
+        assert 'event.target.closest(".composer-inspector")' in static_script.text
         assert "createCalculationEditor" not in static_script.text
         assert "previousTable.scrollTop" in static_script.text
         assert "previousSignature !== JSON.stringify(state.strategyPermission)" in static_script.text
@@ -846,6 +853,12 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다." in static_script.text
         assert "선택한 봉의 종가와 평균 매수가로 계산" not in static_script.text
         page = client.get("/")
+        static_styles = client.get("/static/styles.css")
+        assert static_styles.status_code == 200
+        assert ".strategy-blocks.managed-composer" in static_styles.text
+        assert ".composer-inspector" in static_styles.text
+        assert "전략 블록 편집" in page.text
+        assert "제목줄을 끌어 블록을 옮기고" in page.text
         chart_script = client.get("/static/chart.js")
         assert chart_script.status_code == 200
         assert "HEIKIN_ASHI" in chart_script.text
