@@ -386,6 +386,90 @@ def test_managed_block_compares_heikin_ashi_prices_with_a_stable_warmup() -> Non
     assert values[-1][3] == Decimal("124")
 
 
+def test_managed_block_compares_obv_at_two_completed_bar_offsets() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    bars = [
+        SimpleNamespace(
+            open=Decimal(str(100 + index)),
+            high=Decimal(str(102 + index)),
+            low=Decimal(str(99 + index)),
+            close=Decimal(str(101 + index)),
+            volume=Decimal("100"),
+        )
+        for index in range(11)
+    ]
+    # COMPLETE_ONLY offset 0 is the latest completed bar (HTS 1봉 전), and
+    # offset 10 is ten completed bars earlier (HTS 11봉 전).
+    condition = BlockTradeCondition(
+        left="obv", operator="GT", right="obv",
+        left_offset=0, right_offset=10,
+        left_bar_interval="3m", right_bar_interval="3m",
+        left_bar_data_mode="COMPLETE_ONLY", right_bar_data_mode="COMPLETE_ONLY",
+    ).model_dump(mode="json")
+
+    assert strategy._condition_requests(condition) == {("3m", True): 11}
+    assert strategy._obv_values(bars) == [Decimal(index * 100) for index in range(11)]
+    assert strategy._condition_matches(condition, {("3m", True): bars}, None) is True
+
+
+def test_managed_block_obv_handles_up_down_and_unchanged_closes() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    bars = [
+        SimpleNamespace(close=Decimal(close), volume=Decimal(volume))
+        for close, volume in (("100", "10"), ("101", "20"), ("99", "30"), ("99", "40"), ("102", "50"))
+    ]
+
+    assert strategy._obv_values(bars) == [
+        Decimal("0"), Decimal("20"), Decimal("-10"), Decimal("-10"), Decimal("40"),
+    ]
+
+
+def test_managed_block_obv_condition_round_trips_through_the_compiler() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = [{
+        "id": "obv-rise",
+        "conditions": [{
+            "left": "obv", "operator": "GT", "right": "obv", "value": "0",
+            "left_offset": 0, "right_offset": 10,
+            "left_bar_interval": "3m", "right_bar_interval": "3m",
+            "left_bar_data_mode": "COMPLETE_ONLY",
+            "right_bar_data_mode": "COMPLETE_ONLY",
+            "left_bollinger_period": 55, "right_bollinger_period": 55,
+            "left_bollinger_stddev": "1.04", "right_bollinger_stddev": "1.04",
+        }],
+    }]
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
+
+    restored = block_package_from_source("OBV 조건", render_block_strategy(settings))
+    condition = restored.settings.buy_condition_groups[0].conditions[0]
+
+    assert condition.left == "obv"
+    assert condition.right == "obv"
+    assert condition.left_offset == 0
+    assert condition.right_offset == 10
+
+
+def test_managed_block_rejects_obv_comparisons_with_an_unstable_baseline() -> None:
+    for right, changes in (
+        ("value", {}),
+        ("obv", {}),
+        ("obv", {"right_offset": 10, "right_bar_interval": "1m"}),
+        ("obv", {"right_offset": 10, "right_bar_data_mode": "INCLUDE_CURRENT"}),
+    ):
+        try:
+            BlockTradeCondition(left="obv", right=right, **changes)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("OBV must compare two offsets from the same bar series.")
+
+
 def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> None:
     settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
         update={"market_venue": "NXT", "route": "NXT"}
@@ -886,6 +970,13 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'elements.chartButton.addEventListener("click"' in static_script.text
         assert "left_bar_interval" in static_script.text
         assert "하이킨아시 종가" in static_script.text
+        assert '["obv", "OBV"]' in static_script.text
+        assert "function displayedConditionOffset(condition, side)" in static_script.text
+        assert 'mode === "COMPLETE_ONLY" ? Math.max(0, displayed - 1) : displayed' in static_script.text
+        assert "1봉 전이 가장 최근 완성봉입니다." in static_script.text
+        assert 'condition[other] = "obv"' in static_script.text
+        assert "condition.right_offset = 10" in static_script.text
+        assert 'condition[`right_${suffix}`] = normalized' in static_script.text
         assert "왼쪽 값 설정" in static_script.text
         assert "오른쪽 값 설정" in static_script.text
         assert "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다." in static_script.text
@@ -922,6 +1013,9 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         chart_script = client.get("/static/chart.js")
         assert chart_script.status_code == 200
         assert "HEIKIN_ASHI" in chart_script.text
+        assert '["OBV", "OBV"]' in chart_script.text
+        assert 'direction * rawRows[index].volume' in chart_script.text
+        assert "indicatorSeries(indicator, rows, state.bars)" in chart_script.text
         assert "/api/chart/bars" in chart_script.text
         assert 'addEventListener("wheel"' in chart_script.text
         assert 'addEventListener("pointerdown"' in chart_script.text

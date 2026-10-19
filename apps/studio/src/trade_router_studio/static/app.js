@@ -2107,7 +2107,7 @@ const BLOCK_CONDITION_METRICS = [
   ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
   ["heikin_open", "하이킨아시 시가"], ["heikin_high", "하이킨아시 고가"],
   ["heikin_low", "하이킨아시 저가"], ["heikin_close", "하이킨아시 종가"],
-  ["volume", "거래량"], ["bollinger_upper", "볼린저 상단"],
+  ["volume", "거래량"], ["obv", "OBV"], ["bollinger_upper", "볼린저 상단"],
   ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
   ["average_price", "평균 매수가"], ["profit_rate", "실시간 수익률(평균가 대비 %)"],
 ];
@@ -2122,6 +2122,25 @@ function isLiveProfitCondition(condition) {
   return metrics.has("profit_rate") && [...metrics].every(metric => ["profit_rate", "value"].includes(metric));
 }
 
+function displayedConditionOffset(condition, side) {
+  const offset = Math.max(0, Number.parseInt(condition?.[`${side}_offset`], 10) || 0);
+  return (condition?.[`${side}_bar_data_mode`] || "COMPLETE_ONLY") === "COMPLETE_ONLY"
+    ? offset + 1
+    : offset;
+}
+
+function storedConditionOffset(value, mode) {
+  const displayed = Math.max(0, Number.parseInt(value, 10) || 0);
+  return mode === "COMPLETE_ONLY" ? Math.max(0, displayed - 1) : displayed;
+}
+
+function blockConditionBarPosition(condition, side) {
+  const mode = condition?.[`${side}_bar_data_mode`] || "COMPLETE_ONLY";
+  const displayed = displayedConditionOffset(condition, side);
+  if (mode === "COMPLETE_ONLY") return `${displayed}봉 전 완성봉`;
+  return displayed === 0 ? "현재 진행봉" : `${displayed}봉 전 (진행봉 포함)`;
+}
+
 function blockConditionTiming(condition) {
   if (isLiveProfitCondition(condition)) return "실시간 현재가";
   const labels = [];
@@ -2130,10 +2149,7 @@ function blockConditionTiming(condition) {
     if (!metric || metric === "value" || metric === "average_price" || metric === "profit_rate") continue;
     const interval = condition[`${side}_bar_interval`] || "3m";
     const intervalLabel = interval === "1d" ? "일봉" : `${interval.replace("m", "")}분봉`;
-    const modeLabel = (condition[`${side}_bar_data_mode`] || "COMPLETE_ONLY") === "COMPLETE_ONLY"
-      ? "완성봉"
-      : "진행봉 포함";
-    labels.push(`${intervalLabel} ${modeLabel}`);
+    labels.push(`${intervalLabel} ${blockConditionBarPosition(condition, side)}`);
   }
   return [...new Set(labels)].join(" · ") || "계좌 값";
 }
@@ -2182,12 +2198,34 @@ function blockConditionGroups(kind, flowId = null) {
 function updateBlockCondition(kind, groupIndex, conditionIndex, key, value, flowId = null, render = true) {
   const rows = blockConditionGroups(kind, flowId)[groupIndex]?.conditions;
   if (!Array.isArray(rows) || !rows[conditionIndex]) return;
-  rows[conditionIndex][key] = [
+  const condition = rows[conditionIndex];
+  const normalized = [
     "left_offset", "right_offset", "left_bollinger_period", "right_bollinger_period",
   ].includes(key)
     ? Math.max(0, Number.parseInt(value, 10) || 0)
     : ["value", "left_bollinger_stddev", "right_bollinger_stddev"].includes(key)
       ? String(value || "0") : value;
+  condition[key] = normalized;
+  if (["left", "right"].includes(key)) {
+    const other = key === "left" ? "right" : "left";
+    if (normalized === "obv") {
+      condition[other] = "obv";
+      condition[`${other}_bar_interval`] = condition[`${key}_bar_interval`] || "3m";
+      condition[`${other}_bar_data_mode`] = condition[`${key}_bar_data_mode`] || "COMPLETE_ONLY";
+      if (Number(condition.left_offset || 0) === Number(condition.right_offset || 0)) {
+        condition.left_offset = 0;
+        condition.right_offset = 10;
+      }
+    } else if (condition[other] === "obv") {
+      condition[other] = key === "left" ? "value" : "close";
+    }
+  }
+  if (condition.left === "obv" && condition.right === "obv") {
+    for (const suffix of ["bar_interval", "bar_data_mode"]) {
+      if (key === `left_${suffix}`) condition[`right_${suffix}`] = normalized;
+      if (key === `right_${suffix}`) condition[`left_${suffix}`] = normalized;
+    }
+  }
   setDirty(true);
   if (render) renderStrategyBlocks();
 }
@@ -2245,6 +2283,8 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
   const title = document.createElement("strong");
   title.textContent = metric === "profit_rate"
     ? "실시간 계산"
+    : metric === "obv"
+      ? "OBV 계산"
     : metric === "average_price"
       ? "계좌 값"
       : side === "right" && metric === "value"
@@ -2305,16 +2345,31 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
   bindBlockConditionControl(mode, (value, render) => updateBlockCondition(kind, groupIndex, conditionIndex, `${side}_bar_data_mode`, value, flowId, render));
   modeRow.append(mode);
   const offsetRow = document.createElement("label");
-  offsetRow.textContent = "N봉 전";
+  offsetRow.textContent = "봉 위치";
   const offset = document.createElement("input");
   offset.type = "number";
-  offset.min = "0";
-  offset.max = "200";
-  offset.value = condition[`${side}_offset`] ?? 0;
+  const barDataMode = condition[`${side}_bar_data_mode`] || "COMPLETE_ONLY";
+  offset.min = barDataMode === "COMPLETE_ONLY" ? "1" : "0";
+  offset.max = barDataMode === "COMPLETE_ONLY" ? "201" : "200";
+  offset.value = displayedConditionOffset(condition, side);
   offset.disabled = disabled;
-  bindBlockConditionControl(offset, (value, render) => updateBlockCondition(kind, groupIndex, conditionIndex, `${side}_offset`, value, flowId, render));
+  bindBlockConditionControl(offset, (value, render) => updateBlockCondition(
+    kind, groupIndex, conditionIndex, `${side}_offset`, storedConditionOffset(value, barDataMode), flowId, render,
+  ));
   offsetRow.append(offset);
   panel.append(intervalRow, modeRow, offsetRow);
+  const offsetHint = document.createElement("span");
+  offsetHint.className = "block-condition-operand-hint";
+  offsetHint.textContent = barDataMode === "COMPLETE_ONLY"
+    ? "1봉 전이 가장 최근 완성봉입니다. 예: 1봉 전과 11봉 전을 비교할 수 있습니다."
+    : "0봉 전은 현재 진행봉이며, 1봉 전부터 이전 봉입니다.";
+  panel.append(offsetHint);
+  if (metric === "obv") {
+    const obvHint = document.createElement("span");
+    obvHint.className = "block-condition-operand-hint";
+    obvHint.textContent = "OBV는 실제 종가 방향에 따라 거래량을 누적합니다. 양쪽 봉 주기와 봉 상태는 자동으로 같게 맞추며, 처음 선택하면 1봉 전과 11봉 전을 비교합니다.";
+    panel.append(obvHint);
+  }
   if (metric.startsWith("bollinger_")) {
     const periodRow = document.createElement("label");
     periodRow.textContent = "볼린저 기간";
@@ -3118,7 +3173,16 @@ function scheduleConditionSummary(group) {
   const labels = new Map([...BLOCK_CONDITION_METRICS, ["value", "직접 값"]]);
   const operators = new Map(BLOCK_CONDITION_OPERATORS);
   const rows = group.conditions || [];
-  const snippets = rows.slice(0, 2).map(row => `${labels.get(row.left) || row.left} ${operators.get(row.operator) || row.operator} ${row.right === "value" ? row.value : labels.get(row.right) || row.right}`);
+  const operand = (row, side) => {
+    const metric = row[side];
+    if (side === "right" && metric === "value") return row.value;
+    const label = labels.get(metric) || metric;
+    if (metric !== "obv") return label;
+    const interval = row[`${side}_bar_interval`] || "3m";
+    const intervalLabel = interval === "1d" ? "일봉" : `${interval.replace("m", "")}분봉`;
+    return `${label}(${intervalLabel} · ${blockConditionBarPosition(row, side)})`;
+  };
+  const snippets = rows.slice(0, 2).map(row => `${operand(row, "left")} ${operators.get(row.operator) || row.operator} ${operand(row, "right")}`);
   return `${snippets.join(" 또는 ")}${rows.length > 2 ? ` 외 ${rows.length - 2}개` : ""}`;
 }
 

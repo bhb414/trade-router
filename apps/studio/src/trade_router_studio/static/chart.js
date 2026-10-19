@@ -138,7 +138,7 @@
     return result;
   }
 
-  function indicatorSeries(indicator, rows) {
+  function indicatorSeries(indicator, rows, rawRows = rows) {
     const closes = rows.map(row => row.close);
     if (indicator.type === "SMA") return [{ name: `SMA ${indicator.period}`, values: sma(closes, indicator.period), color: indicator.color }];
     if (indicator.type === "EMA") return [{ name: `EMA ${indicator.period}`, values: ema(closes, indicator.period), color: indicator.color }];
@@ -161,6 +161,17 @@
       ];
     }
     if (indicator.type === "VOLUME") return [{ name: "거래량", values: rows.map(row => row.volume), color: indicator.color, bars: true }];
+    if (indicator.type === "OBV") {
+      // Standard OBV always follows the actual close and volume. Keep it
+      // stable when only the visual candle type changes to Heikin-Ashi.
+      const obvCloses = rawRows.map(row => row.close);
+      const values = Array(rawRows.length).fill(0);
+      for (let index = 1; index < rawRows.length; index += 1) {
+        const direction = obvCloses[index] > obvCloses[index - 1] ? 1 : obvCloses[index] < obvCloses[index - 1] ? -1 : 0;
+        values[index] = values[index - 1] + direction * rawRows[index].volume;
+      }
+      return [{ name: "OBV", values, color: indicator.color }];
+    }
     if (indicator.type === "RSI") {
       const values = Array(rows.length).fill(null);
       let gains = 0;
@@ -349,7 +360,7 @@
     state.viewEnd = end;
     const step = pricePanel.w / Math.max(1, actualCount);
     const xAt = index => pricePanel.x + (index - start + .5) * step;
-    const overlays = seriesIndicators.flatMap(item => indicatorSeries(item, rows));
+    const overlays = seriesIndicators.flatMap(item => indicatorSeries(item, rows, state.bars));
     const priceValues = rows.slice(start, end).flatMap(row => [row.low, row.high]);
     overlays.filter(item => !item.bars && !item.fixedRange).forEach(item => {
       priceValues.push(...item.values.slice(start, end).filter(Number.isFinite));
@@ -407,7 +418,7 @@
     let panelY = pricePanel.y + pricePanel.h + gap;
     panelIndicators.forEach(indicator => {
       const panel = { x: left, y: panelY, w: pricePanel.w, h: panelHeight };
-      drawSeriesPanel(ctx, indicatorSeries(indicator, rows), panel, start, end, xAt, indicatorLabel(indicator));
+      drawSeriesPanel(ctx, indicatorSeries(indicator, rows, state.bars), panel, start, end, xAt, indicatorLabel(indicator));
       panelY += panelHeight + gap;
     });
 
@@ -435,6 +446,7 @@
     if (indicator.type === "BOLLINGER") return `볼린저밴드 (${indicator.period}, ${indicator.deviation})`;
     if (indicator.type === "MACD") return `MACD (${indicator.fast}, ${indicator.slow}, ${indicator.signal})`;
     if (indicator.type === "VOLUME") return "거래량";
+    if (indicator.type === "OBV") return "OBV";
     return `${indicator.type} (${indicator.period})`;
   }
 
@@ -442,7 +454,7 @@
     container.replaceChildren();
     const definitions = indicator.type === "MACD"
       ? [["fast", "단기", 2], ["slow", "장기", 3], ["signal", "시그널", 2]]
-      : indicator.type === "VOLUME"
+      : ["VOLUME", "OBV"].includes(indicator.type)
         ? []
         : [["period", "기간", 2], ...(indicator.type === "BOLLINGER" ? [["deviation", "표준편차", .1]] : [])];
     definitions.forEach(([key, label, min]) => {
@@ -468,7 +480,7 @@
       const row = document.createElement("div");
       row.className = "chart-indicator-row";
       const type = document.createElement("select");
-      for (const [value, label] of [["SMA", "단순이동평균"], ["EMA", "지수이동평균"], ["BOLLINGER", "볼린저밴드"], ["VOLUME", "거래량"], ["RSI", "RSI"], ["MACD", "MACD"]]) {
+      for (const [value, label] of [["SMA", "단순이동평균"], ["EMA", "지수이동평균"], ["BOLLINGER", "볼린저밴드"], ["VOLUME", "거래량"], ["OBV", "OBV"], ["RSI", "RSI"], ["MACD", "MACD"]]) {
         type.add(new Option(label, value));
       }
       type.value = indicator.type;
@@ -483,7 +495,14 @@
       color.type = "color"; color.value = indicator.color;
       const remove = document.createElement("button");
       remove.type = "button"; remove.className = "chart-indicator-remove"; remove.textContent = "삭제";
-      type.addEventListener("change", () => { indicator.type = type.value; renderIndicatorParameters(indicator, parameters); saveSettings(); drawChart(); });
+      type.addEventListener("change", () => {
+        indicator.type = type.value;
+        if (indicator.type === "OBV") {
+          indicator.placement = "PANEL";
+          placement.value = "PANEL";
+        }
+        renderIndicatorParameters(indicator, parameters); saveSettings(); drawChart();
+      });
       placement.addEventListener("change", () => { indicator.placement = placement.value; saveSettings(); drawChart(); });
       color.addEventListener("input", () => { indicator.color = color.value; saveSettings(); drawChart(); });
       remove.addEventListener("click", () => { state.indicators = state.indicators.filter(item => item !== indicator); renderIndicators(); saveSettings(); drawChart(); });
@@ -492,7 +511,7 @@
     });
     const names = {
       SMA: "이동평균", EMA: "지수이동평균", BOLLINGER: "볼린저밴드",
-      VOLUME: "거래량", RSI: "RSI", MACD: "MACD",
+      VOLUME: "거래량", OBV: "OBV", RSI: "RSI", MACD: "MACD",
     };
     el.indicatorSummary.textContent = state.indicators.length
       ? state.indicators.map(item => names[item.type] || item.type).join(" · ")

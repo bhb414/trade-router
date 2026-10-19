@@ -65,6 +65,7 @@ class BlockTradeCondition(BaseModel):
         "open", "high", "low", "close", "volume",
         "heikin_open", "heikin_high", "heikin_low", "heikin_close",
         "bollinger_upper", "bollinger_middle", "bollinger_lower",
+        "obv",
         "average_price", "profit_rate",
     ] = "close"
     operator: Literal["LT", "LTE", "GT", "GTE", "EQ", "CROSS_UP", "CROSS_DOWN"] = "LT"
@@ -72,6 +73,7 @@ class BlockTradeCondition(BaseModel):
         "open", "high", "low", "close", "volume",
         "heikin_open", "heikin_high", "heikin_low", "heikin_close",
         "bollinger_upper", "bollinger_middle", "bollinger_lower",
+        "obv",
         "average_price", "profit_rate", "value",
     ] = "bollinger_upper"
     value: Decimal = Decimal("0")
@@ -89,6 +91,21 @@ class BlockTradeCondition(BaseModel):
     _validate_intervals = field_validator(
         "left_bar_interval", "right_bar_interval",
     )(_normalize_managed_bar_interval)
+
+    @model_validator(mode="after")
+    def validate_obv_comparison(self) -> "BlockTradeCondition":
+        if "obv" not in {self.left, self.right}:
+            return self
+        if self.left != "obv" or self.right != "obv":
+            raise ValueError("OBV는 기준점에 따라 절대값이 달라지므로 다른 시점의 OBV와 비교해야 합니다.")
+        if (
+            self.left_bar_interval != self.right_bar_interval
+            or self.left_bar_data_mode != self.right_bar_data_mode
+        ):
+            raise ValueError("OBV 비교의 양쪽은 같은 봉 주기와 봉 상태를 사용해야 합니다.")
+        if self.left_offset == self.right_offset:
+            raise ValueError("OBV 비교의 양쪽은 서로 다른 봉 위치를 사용해야 합니다.")
+        return self
 
 
 DEFAULT_SELL_CONDITIONS = (
@@ -598,6 +615,7 @@ BAR_METRICS = {
     "open", "high", "low", "close", "volume",
     "heikin_open", "heikin_high", "heikin_low", "heikin_close",
     "bollinger_upper", "bollinger_middle", "bollinger_lower",
+    "obv",
 }
 NEEDS_BARS = any(
     condition.get(side) in BAR_METRICS
@@ -831,6 +849,29 @@ class ManagedBlockStrategy(Strategy):
             previous_open, previous_close = open_value, close
         return values
 
+    @staticmethod
+    def _obv_values(bars):
+        """Return an OBV series anchored at zero for the fetched window.
+
+        OBV levels depend on the arbitrary beginning of a data set, while the
+        difference between two points does not.  Starting the first point at
+        zero therefore preserves comparisons such as the latest completed OBV
+        versus the value ten completed bars earlier without requesting the
+        instrument's complete trading history.
+        """
+        values = []
+        current = Decimal("0")
+        previous_close = None
+        for bar in bars:
+            if previous_close is not None:
+                if bar.close > previous_close:
+                    current += bar.volume
+                elif bar.close < previous_close:
+                    current -= bar.volume
+            values.append(current)
+            previous_close = bar.close
+        return values
+
     def _indicator_value(self, metric, bars, offset, average_price, source, current_price=None):
         if metric == "average_price":
             return average_price if average_price and average_price > 0 else None
@@ -854,6 +895,9 @@ class ManagedBlockStrategy(Strategy):
                 "heikin_low": 2,
                 "heikin_close": 3,
             }[metric]]
+        if metric == "obv":
+            values = self._obv_values(bars)
+            return values[index] if index < len(values) else None
         if metric in {"bollinger_upper", "bollinger_middle", "bollinger_lower"}:
             values = self._bollinger_values(bars, offset, source)
             if values is None:
