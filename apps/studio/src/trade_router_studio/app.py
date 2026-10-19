@@ -3633,26 +3633,58 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     async def import_block_strategy(
         package: BlockStrategyPackage,
     ) -> dict[str, object]:
-        display_name = package.name.strip()
-        if display_name.lower().endswith(".py"):
-            display_name = display_name[:-3].rstrip()
-        name = f"{display_name}.py"
+        requested_display_name = package.name.strip()
+        if requested_display_name.lower().endswith(".py"):
+            requested_display_name = requested_display_name[:-3].rstrip()
         try:
-            path = manager.resolve(name)
-            if path.exists():
-                raise HTTPException(
-                    status_code=409,
-                    detail="A strategy with the same name already exists.",
-                )
-            return await manager.save(
+            display_name = requested_display_name
+            copy_number = 1
+            while manager.resolve(f"{display_name}.py").exists():
+                copy_number += 1
+                suffix = f" ({copy_number})"
+                display_name = f"{requested_display_name[:120 - len(suffix)]}{suffix}"
+            name = f"{display_name}.py"
+
+            existing_strategy_ids: set[str] = set()
+            for item in manager.list():
+                existing_name = str(item.get("name") or "")
+                if not existing_name:
+                    continue
+                try:
+                    parsed = _strategy_config_from_source(manager.read(existing_name))
+                except (FileNotFoundError, StrategyNameError, SyntaxError, ValueError):
+                    continue
+                existing_id = parsed.get("strategy_id")
+                if existing_id:
+                    existing_strategy_ids.add(str(existing_id).casefold())
+
+            requested_strategy_id = package.settings.strategy_id.strip()
+            strategy_id = requested_strategy_id
+            id_copy_number = 1
+            while strategy_id.casefold() in existing_strategy_ids:
+                id_copy_number += 1
+                suffix = f"-{id_copy_number}"
+                strategy_id = f"{requested_strategy_id[:128 - len(suffix)]}{suffix}"
+            settings = package.settings.model_copy(
+                update={"strategy_id": strategy_id},
+            )
+            result = await manager.save(
                 name,
                 compile_block_strategy(
-                    package.settings,
+                    settings,
                     template=package.template,
                     layout=package.layout,
                 ),
                 strategy_type="block",
             )
+            return {
+                **result,
+                "strategy_id": strategy_id,
+                "copied": (
+                    display_name != requested_display_name
+                    or strategy_id != requested_strategy_id
+                ),
+            }
         except StrategyNameError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:

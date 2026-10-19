@@ -22,7 +22,12 @@ from trade_router import (
     RouterErrorCode,
     Venue,
 )
-from trade_router_studio.connections import ConnectionRuntime, _parse_period_row
+from trade_router_studio.connections import (
+    ConnectionRuntime,
+    _aggregate_minute_bars,
+    _is_market_minute,
+    _parse_period_row,
+)
 from trade_router_studio.paths import WorkspacePaths
 from trade_router_studio.settings import SettingsStore
 
@@ -68,6 +73,83 @@ def test_daily_bar_completes_only_after_the_selected_market_closes() -> None:
     assert parsed(Venue.NXT, 19, 59).complete is False
     assert parsed(Venue.NXT, 20, 0).complete is True
     assert parsed(Venue.INTEGRATED, 20, 0).complete is True
+
+
+def test_minute_bars_only_include_the_selected_market_session() -> None:
+    seoul = ZoneInfo("Asia/Seoul")
+    instrument = InstrumentId("003200")
+    day = datetime(2026, 10, 16, tzinfo=seoul)
+    values = (Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"))
+    raw = {
+        day.replace(hour=7, minute=59): values,
+        day.replace(hour=8, minute=0): values,
+        day.replace(hour=8, minute=49): values,
+        day.replace(hour=8, minute=50): values,
+        day.replace(hour=9, minute=0): values,
+        day.replace(hour=9, minute=0, second=30): values,
+        day.replace(hour=15, minute=19, second=59): values,
+        day.replace(hour=15, minute=20): values,
+        day.replace(hour=15, minute=27): values,
+        day.replace(hour=15, minute=30): values,
+        day.replace(hour=15, minute=39, second=59): values,
+        day.replace(hour=15, minute=40): values,
+        day.replace(hour=19, minute=57): values,
+        day.replace(hour=20, minute=0): values,
+    }
+
+    def opens(venue: Venue) -> list[str]:
+        bars = _aggregate_minute_bars(
+            instrument,
+            raw,
+            minutes=3,
+            venue=venue,
+            provider="kis",
+            correlation_id="session-filter-test",
+            source_alias="primary",
+            received_at=day.replace(hour=20, minute=1),
+        )
+        return [bar.open_time.strftime("%H:%M") for bar in bars]
+
+    assert opens(Venue.KRX) == ["09:00", "15:18", "15:27"]
+    assert opens(Venue.NXT) == ["08:00", "08:48", "09:00", "15:18", "15:39", "19:57"]
+    assert opens(Venue.INTEGRATED) == [
+        "08:00",
+        "08:48",
+        "09:00",
+        "15:18",
+        "15:27",
+        "15:39",
+        "19:57",
+    ]
+
+
+def test_market_minute_boundaries_follow_each_venue_session() -> None:
+    seoul = ZoneInfo("Asia/Seoul")
+
+    def at(hour: int, minute: int, second: int = 0) -> datetime:
+        return datetime(2026, 10, 16, hour, minute, second, tzinfo=seoul)
+
+    assert _is_market_minute(at(8, 49, 59), Venue.NXT)
+    assert not _is_market_minute(at(8, 50), Venue.NXT)
+    assert not _is_market_minute(at(9, 0, 29), Venue.NXT)
+    assert _is_market_minute(at(9, 0, 30), Venue.NXT)
+    assert _is_market_minute(at(15, 19, 59), Venue.NXT)
+    assert not _is_market_minute(at(15, 20), Venue.NXT)
+    assert not _is_market_minute(at(15, 39, 59), Venue.NXT)
+    assert _is_market_minute(at(15, 40), Venue.NXT)
+    assert _is_market_minute(at(19, 59, 59), Venue.NXT)
+    assert not _is_market_minute(at(20, 0), Venue.NXT)
+
+    assert _is_market_minute(at(9, 0), Venue.KRX)
+    assert _is_market_minute(at(15, 29, 59), Venue.KRX)
+    assert not _is_market_minute(at(15, 30), Venue.KRX)
+
+    assert _is_market_minute(at(8, 49, 59), Venue.INTEGRATED)
+    assert not _is_market_minute(at(8, 50), Venue.INTEGRATED)
+    assert _is_market_minute(at(9, 0), Venue.INTEGRATED)
+    assert _is_market_minute(at(15, 29, 59), Venue.INTEGRATED)
+    assert not _is_market_minute(at(15, 30), Venue.INTEGRATED)
+    assert _is_market_minute(at(15, 40), Venue.INTEGRATED)
 
 
 def test_rate_limit_scope_is_shared_by_the_same_api_key(tmp_path: Path) -> None:
@@ -290,6 +372,157 @@ def test_kis_connection_token_quote_and_balance_share_runtime(tmp_path: Path) ->
             }
             encrypted = (settings.paths.config / "secrets.dpapi").read_bytes()
             assert b"encrypted-after-use" not in encrypted
+        finally:
+            await runtime.close()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_kis_integrated_minute_bars_fall_back_to_krx_history(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "workspace"))
+        connection = settings.add_connection(
+            provider="kis",
+            target="LIVE",
+            label="live-source",
+            app_key="live-app-key",
+            app_secret="live-app-secret",
+        )
+        market_codes: list[str] = []
+
+        def minute_row(hour: str, price: int) -> dict[str, str]:
+            return {
+                "stck_bsop_date": "20261019",
+                "stck_cntg_hour": hour,
+                "stck_oprc": str(price),
+                "stck_hgpr": str(price + 10),
+                "stck_lwpr": str(price - 10),
+                "stck_prpr": str(price),
+                "cntg_vol": "10",
+            }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/tokenP":
+                expiry = (datetime.now().astimezone() + timedelta(hours=24)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "integrated-fallback-token",
+                        "token_type": "Bearer",
+                        "access_token_token_expired": expiry,
+                    },
+                )
+            assert request.url.path.endswith("/inquire-time-dailychartprice")
+            market_code = request.url.params["FID_COND_MRKT_DIV_CODE"]
+            market_codes.append(market_code)
+            if market_code == "UN":
+                # KIS behaves this way for a symbol unavailable on NXT: the
+                # integrated endpoint keeps returning only the current row,
+                # even when an older cursor is requested.
+                rows = [minute_row("093600", 9300)]
+            else:
+                rows = [
+                    minute_row(f"09{minute:02d}00", 9200 + minute)
+                    for minute in range(27, 36)
+                ]
+            return httpx.Response(200, json={"rt_cd": "0", "output2": rows})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConnectionRuntime(settings, http_client=client)
+        try:
+            bars = await runtime.bars(
+                connection["id"],
+                "266690",
+                "3m",
+                count=3,
+                venue=Venue.INTEGRATED,
+                end=datetime.fromisoformat("2026-10-19T09:37:00+09:00"),
+            )
+            assert len(bars) == 3
+            assert bars[-1].open_time == datetime.fromisoformat(
+                "2026-10-19T09:36:00+09:00"
+            )
+            assert bars[-1].venue is Venue.INTEGRATED
+            assert any(bar.venue is Venue.KRX for bar in bars[:-1])
+            assert market_codes == ["UN", "UN", "UN", "J"]
+        finally:
+            await runtime.close()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_kis_integrated_minute_bars_cross_the_overnight_boundary(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "workspace"))
+        connection = settings.add_connection(
+            provider="kis",
+            target="LIVE",
+            label="live-integrated-source",
+            app_key="integrated-app-key",
+            app_secret="integrated-app-secret",
+        )
+        market_codes: list[str] = []
+
+        def rows(day: str, hours: tuple[str, ...]) -> list[dict[str, str]]:
+            return [
+                {
+                    "stck_bsop_date": day,
+                    "stck_cntg_hour": hour,
+                    "stck_oprc": "100",
+                    "stck_hgpr": "101",
+                    "stck_lwpr": "99",
+                    "stck_prpr": "100",
+                    "cntg_vol": "10",
+                }
+                for hour in hours
+            ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/tokenP":
+                expiry = (datetime.now().astimezone() + timedelta(hours=24)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "integrated-overnight-token",
+                        "token_type": "Bearer",
+                        "access_token_token_expired": expiry,
+                    },
+                )
+            market_code = request.url.params["FID_COND_MRKT_DIV_CODE"]
+            market_codes.append(market_code)
+            assert market_code == "UN"
+            if request.url.params["FID_INPUT_DATE_1"] == "20261019":
+                output = rows("20261019", ("080000", "080100", "080200"))
+            else:
+                output = rows(
+                    "20261018",
+                    ("195400", "195500", "195600", "195700", "195800", "195900"),
+                )
+            return httpx.Response(200, json={"rt_cd": "0", "output2": output})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConnectionRuntime(settings, http_client=client)
+        try:
+            bars = await runtime.bars(
+                connection["id"],
+                "003200",
+                "3m",
+                count=3,
+                venue=Venue.INTEGRATED,
+                end=datetime.fromisoformat("2026-10-19T09:00:00+09:00"),
+            )
+            assert [bar.open_time.isoformat() for bar in bars] == [
+                "2026-10-18T19:54:00+09:00",
+                "2026-10-18T19:57:00+09:00",
+                "2026-10-19T08:00:00+09:00",
+            ]
+            assert market_codes == ["UN", "UN", "UN"]
         finally:
             await runtime.close()
             await client.aclose()

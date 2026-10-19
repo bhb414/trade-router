@@ -36,6 +36,12 @@
           <span class="navigation-icon" aria-hidden="true">⌂</span>
           <span>대시보드</span>
         </button>
+        <button class="workspace-navigation-item" id="chart-button" type="button">
+          <span class="navigation-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M4 18h16M5 15l4-4 3 3 6-7"></path><path d="M15 7h3v3"></path></svg>
+          </span>
+          <span>차트</span>
+        </button>
       </nav>
       <div class="strategy-section-heading">
         <div><strong>전략</strong><span class="count" id="strategy-count">0</span></div>
@@ -64,7 +70,6 @@
           <div class="dashboard-header-actions">
             <span id="dashboard-updated">계좌 상태 확인 중</span>
             <button class="button quiet compact" id="dashboard-refresh" type="button">새로고침</button>
-            <button class="button quiet compact" id="dashboard-chart" type="button">차트</button>
           </div>
         </header>
         <div class="dashboard-content">
@@ -167,8 +172,8 @@
           <header class="block-editor-heading">
             <div>
               <span class="eyebrow">STRUCTURED STRATEGY</span>
-              <h3>블록 편집</h3>
-              <p>제공된 연결·대상·위험 한도·일정 블록을 조합하고 값을 설정합니다.</p>
+              <h3>전략 일정 편집</h3>
+              <p>시간대별 종목 조회와 매수 조건을 설정하고, 공통 예산과 보유종목을 관리합니다.</p>
             </div>
             <div class="block-editor-actions">
               <span id="block-editor-summary">분석 전</span>
@@ -179,11 +184,12 @@
                 <button type="button" id="block-fit" title="전체 블록 맞춤">맞춤</button>
                 <button type="button" id="block-auto-layout" title="기본 배치로 정렬">정렬</button>
               </div>
+              <button class="button quiet compact" id="block-add-flow" type="button" hidden>+ 매수 흐름</button>
               <button class="button quiet compact" id="block-export-button" type="button">내보내기</button>
             </div>
           </header>
           <div class="block-editor-notice" id="block-editor-notice">
-            블록 전략은 이 화면에서 제공하는 블록과 필드만 편집할 수 있습니다. 실행용 코드는 Trade Router가 자동으로 관리합니다.
+            항목을 펼쳐 설정을 편집하세요. 각 매수 흐름은 독립적으로 판단하며, 예산·보유종목은 한 전략에서 공유합니다.
           </div>
           <div class="block-canvas" id="block-canvas" aria-live="polite" tabindex="0" aria-label="블록 전략 캔버스"></div>
           <footer class="block-editor-status">

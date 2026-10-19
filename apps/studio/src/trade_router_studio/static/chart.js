@@ -258,6 +258,25 @@
     });
   }
 
+  function barDateKey(value) {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(new Date(value));
+  }
+
+  function formatAxisBarTime(value, showDate) {
+    if (!el.interval.value.endsWith("m")) return formatBarTime(value);
+    const time = new Date(value);
+    const clock = time.toLocaleTimeString("ko-KR", {
+      timeZone: "Asia/Seoul", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    });
+    if (!showDate) return clock;
+    const date = time.toLocaleDateString("ko-KR", {
+      timeZone: "Asia/Seoul", month: "2-digit", day: "2-digit",
+    }).replace(/\s/g, "").replace(/\.$/, "");
+    return `${date} ${clock}`;
+  }
+
   function drawCrosshair(ctx, rows, geometry) {
     if (!state.crosshair || state.drag) return;
     const { pricePanel, start, end, xAt, yAt, minimum, maximum, bounds } = geometry;
@@ -394,10 +413,16 @@
 
     const labelCount = 6;
     ctx.fillStyle = "#7a8493";
+    let previousLabelDate = null;
     for (let index = 0; index <= labelCount; index += 1) {
       const rowIndex = Math.min(end - 1, start + Math.floor((visibleCount - 1) * index / labelCount));
-      const label = formatBarTime(rows[rowIndex].open_time);
-      ctx.fillText(label, xAt(rowIndex) - 18, bounds.height - 7);
+      const dateKey = barDateKey(rows[rowIndex].open_time);
+      const label = formatAxisBarTime(
+        rows[rowIndex].open_time,
+        index === 0 || dateKey !== previousLabelDate,
+      );
+      ctx.fillText(label, xAt(rowIndex) - (index === 0 || dateKey !== previousLabelDate ? 34 : 18), bounds.height - 7);
+      previousLabelDate = dateKey;
     }
     state.geometry = { bounds, pricePanel, start, end, step, xAt, yAt, minimum, maximum };
     drawCrosshair(ctx, rows, state.geometry);

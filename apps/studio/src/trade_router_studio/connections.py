@@ -1584,6 +1584,7 @@ class ConnectionRuntime:
         received_at = datetime.now(SEOUL)
         raw: dict[datetime, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]] = {}
         correlation_ids: list[str] = []
+        integrated_empty_pages = 0
         # One KIS historical minute request returns at most 120 rows. A bounded
         # backward walk lets a 55 x 3-minute indicator obtain its required
         # source window without making one request per candle.
@@ -1636,6 +1637,17 @@ class ConnectionRuntime:
             if len(bars) >= count:
                 return tuple(bars[-count:])
 
+            # Some symbols that are not available on NXT return only the latest
+            # row for the KIS integrated (UN) minute endpoint. Repeating the
+            # request with an older cursor never makes progress in that case.
+            # Stop the backward walk and fill the history from KRX below.
+            if venue is Venue.INTEGRATED and raw and not parsed_times:
+                integrated_empty_pages += 1
+                if integrated_empty_pages >= 2:
+                    break
+            elif parsed_times:
+                integrated_empty_pages = 0
+
             if parsed_times:
                 next_cursor = min(parsed_times) - timedelta(minutes=1)
             else:
@@ -1657,6 +1669,21 @@ class ConnectionRuntime:
             source_alias=source_alias,
             received_at=received_at,
         )
+        if venue is Venue.INTEGRATED and len(bars) < count:
+            krx_bars = await self._kis_minute_bars(
+                connection,
+                instrument,
+                minutes=minutes,
+                count=count,
+                venue=Venue.KRX,
+                source_alias=source_alias,
+                end=end,
+            )
+            merged = {bar.open_time: bar for bar in krx_bars}
+            # Preserve any genuine integrated rows, especially the live/current
+            # bucket, while using KRX as the historical fallback.
+            merged.update({bar.open_time: bar for bar in bars})
+            return tuple(sorted(merged.values(), key=lambda bar: bar.open_time)[-count:])
         return tuple(bars[-count:])
 
     async def _kis_period_bars(
@@ -3131,6 +3158,23 @@ def _parse_minute_row(
     return stamp, values
 
 
+def _is_market_minute(stamp: datetime, venue: Venue) -> bool:
+    local_time = stamp.astimezone(SEOUL).time().replace(tzinfo=None)
+    if venue is Venue.KRX:
+        return time(9, 0) <= local_time < time(15, 30)
+    if venue is Venue.NXT:
+        return (
+            time(8, 0) <= local_time < time(8, 50)
+            or time(9, 0, 30) <= local_time < time(15, 20)
+            or time(15, 40) <= local_time < time(20, 0)
+        )
+    return (
+        time(8, 0) <= local_time < time(8, 50)
+        or time(9, 0) <= local_time < time(15, 30)
+        or time(15, 40) <= local_time < time(20, 0)
+    )
+
+
 def _aggregate_minute_bars(
     instrument: InstrumentId,
     raw: dict[datetime, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]],
@@ -3147,6 +3191,8 @@ def _aggregate_minute_bars(
         list[tuple[datetime, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]],
     ] = {}
     for stamp, values in raw.items():
+        if not _is_market_minute(stamp, venue):
+            continue
         minute_of_day = stamp.hour * 60 + stamp.minute
         bucket_minute = minute_of_day - (minute_of_day % minutes)
         bucket = stamp.replace(

@@ -176,6 +176,190 @@ def test_managed_block_compiles_generic_comparisons() -> None:
     assert requests[("3m", True)] == 56
 
 
+def test_managed_block_suppresses_market_quote_rejections_for_the_day() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    values: dict[str, object] = {}
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    ctx = SimpleNamespace(state=State())
+    first_day = datetime(2026, 10, 19, 10, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    next_day = first_day + timedelta(days=1)
+
+    assert strategy._is_non_retryable_buy_rejection(
+        "시장가호가불가로 주문이 불가합니다. [APBK1943]"
+    )
+    strategy._exclude_buy_for_day(
+        ctx,
+        first_day,
+        "050110",
+        "시장가호가불가로 주문이 불가합니다. [APBK1943]",
+    )
+
+    today = strategy._buy_exclusions_for_day(ctx, first_day)
+    assert set(today["symbols"]) == {"050110"}
+    assert strategy._buy_exclusions_for_day(ctx, next_day) == {
+        "date": "2026-10-20",
+        "symbols": {},
+    }
+    assert "if code in excluded_codes:" in source
+    assert "오늘은 다시 시도하지 않습니다" in source
+
+
+def test_managed_block_routes_sor_orders_to_krx_when_nxt_is_unavailable() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"route": "SOR"}
+    )
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    values: dict[str, object] = {}
+    messages: list[str] = []
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    class Market:
+        def __init__(self) -> None:
+            self.calls: list[Venue] = []
+
+        async def quote(self, code, *, venue):
+            self.calls.append(venue)
+            return SimpleNamespace(
+                price=Decimal("0"), delayed=False, stale=False,
+            )
+
+    market = Market()
+    ctx = SimpleNamespace(
+        state=State(),
+        market=market,
+        log=SimpleNamespace(info=messages.append),
+    )
+    at = datetime(2026, 10, 19, 10, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    first = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "393890", at, current_price=Decimal("10020")
+        )
+    )
+    second = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "393890", at, current_price=Decimal("10030")
+        )
+    )
+
+    assert first == second == "KRX"
+    assert market.calls == [Venue.NXT]
+    assert values["daily_order_routes"]["routes"] == {"393890": "KRX"}
+    assert messages == ["393890 주문 경로: NXT 거래 시세가 없어 KRX로 전송합니다."]
+
+
+def test_managed_block_keeps_sor_when_nxt_is_available() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"route": "SOR"}
+    )
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    values: dict[str, object] = {}
+    messages: list[str] = []
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    class Market:
+        def __init__(self) -> None:
+            self.calls: list[Venue] = []
+
+        async def quote(self, code, *, venue):
+            self.calls.append(venue)
+            return SimpleNamespace(
+                price=Decimal("217500"), delayed=False, stale=False,
+            )
+
+    market = Market()
+    ctx = SimpleNamespace(
+        state=State(),
+        market=market,
+        log=SimpleNamespace(info=messages.append),
+    )
+    at = datetime(2026, 10, 19, 10, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    first = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "005930", at, current_price=Decimal("217250")
+        )
+    )
+    second = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "005930", at, current_price=Decimal("217300")
+        )
+    )
+
+    assert first == second == "SOR"
+    assert market.calls == [Venue.NXT]
+    assert values["daily_order_routes"]["routes"] == {"005930": "SOR"}
+    assert messages == []
+
+
+def test_managed_block_skips_nxt_market_buy_pauses() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"route": "NXT", "buy_order_type": "MARKET"}
+    )
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    def at(hour: int, minute: int, second: int = 0) -> datetime:
+        return datetime(
+            2026, 10, 19, hour, minute, second,
+            tzinfo=ZoneInfo("Asia/Seoul"),
+        )
+
+    assert strategy._buy_order_session_is_open(at(8, 0)) is True
+    assert strategy._buy_order_session_is_open(at(8, 50)) is False
+    assert strategy._buy_order_session_is_open(at(9, 0)) is False
+    assert strategy._buy_order_session_is_open(at(9, 0, 30)) is True
+    assert strategy._buy_order_session_is_open(at(15, 19, 59)) is True
+    assert strategy._buy_order_session_is_open(at(15, 20)) is False
+    assert strategy._buy_order_session_is_open(at(15, 39, 59)) is False
+    assert strategy._buy_order_session_is_open(at(15, 40)) is True
+    assert strategy._buy_order_session_is_open(at(19, 59, 59)) is True
+    assert strategy._buy_order_session_is_open(at(20, 0)) is False
+
+
+def test_managed_block_allows_nxt_limit_orders_during_after_auction() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"route": "NXT", "buy_order_type": "LIMIT"}
+    )
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    at = datetime(2026, 10, 19, 15, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    assert strategy._buy_order_session_is_open(at) is True
+
+
 def test_managed_block_compares_heikin_ashi_prices_with_a_stable_warmup() -> None:
     source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
     namespace: dict[str, object] = {}
@@ -213,7 +397,7 @@ def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> N
     assert 'BAR_DATA_MODE = "COMPLETE_ONLY"' in source
     assert "complete_only=key[1]" in source
     assert 'condition[f"{side}_bar_interval"]' in source
-    assert "route=ORDER_ROUTE" in source
+    assert "route=order_route" in source
 
     package = block_package_from_source("nxt-block", source)
     assert package.settings.market_venue == "NXT"
@@ -651,6 +835,10 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "buy_condition_groups" in static_script.text
         assert "매수 주문 조건" in static_script.text
         assert "createCalculationEditor" not in static_script.text
+        assert "previousTable.scrollTop" in static_script.text
+        assert "previousSignature !== JSON.stringify(state.strategyPermission)" in static_script.text
+        assert 'rowClass: "chart-open-row"' in static_script.text
+        assert 'elements.chartButton.addEventListener("click"' in static_script.text
         assert "left_bar_interval" in static_script.text
         assert "하이킨아시 종가" in static_script.text
         assert "왼쪽 값 설정" in static_script.text
@@ -664,7 +852,8 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "/api/chart/bars" in chart_script.text
         assert 'addEventListener("wheel"' in chart_script.text
         assert 'addEventListener("pointerdown"' in chart_script.text
-        assert 'id="dashboard-chart"' in page.text
+        assert 'id="dashboard-chart"' not in page.text
+        assert 'id="chart-button"' in page.text
         assert 'id="chart-modal"' in page.text
         assert 'id="chart-indicator-modal"' in page.text
         assert 'aria-autocomplete="list"' in page.text
@@ -748,9 +937,20 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         )
         assert imported_source.status_code == 200
         assert "ManagedBlockStrategy" in imported_source.json()["source"]
+        assert 'STRATEGY_ID = "block-example-2"' in imported_source.json()["source"]
         assert "ctx.discovery.matches" in imported_source.json()["source"]
         assert "ctx.orders.market_buy" in imported_source.json()["source"]
         assert "ctx.orders.market_sell" in imported_source.json()["source"]
+        imported_copy = client.post("/api/strategies/import-block", json=package)
+        assert imported_copy.status_code == 200
+        assert imported_copy.json()["name"] == "가져온 블록 예제 (2).py"
+        assert imported_copy.json()["strategy_id"] == "block-example-3"
+        assert imported_copy.json()["copied"] is True
+        imported_copy_source = client.get(
+            "/api/strategies/%EA%B0%80%EC%A0%B8%EC%98%A8%20%EB%B8%94%EB%A1%9D%20%EC%98%88%EC%A0%9C%20%282%29.py"
+        )
+        assert imported_copy_source.status_code == 200
+        assert 'STRATEGY_ID = "block-example-3"' in imported_copy_source.json()["source"]
         package["source"] = "print('hidden code')"
         rejected_hidden_source = client.post(
             "/api/strategies/import-block",
