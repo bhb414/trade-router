@@ -182,19 +182,19 @@
                 <button type="button" id="block-zoom-label" title="100%로 초기화">100%</button>
                 <button type="button" id="block-zoom-in" title="확대">＋</button>
                 <button type="button" id="block-fit" title="전체 블록 맞춤">맞춤</button>
-                <button type="button" id="block-auto-layout" title="기본 배치로 정렬">정렬</button>
+                <button type="button" id="block-auto-layout" title="전체 전략 트리 보기를 초기화">보기 초기화</button>
               </div>
               <button class="button quiet compact" id="block-add-flow" type="button" hidden>+ 매수 흐름</button>
               <button class="button quiet compact" id="block-export-button" type="button">내보내기</button>
             </div>
           </header>
           <div class="block-editor-notice" id="block-editor-notice">
-            블록을 눌러 상세 설정을 편집하세요. 제목줄을 끌어 블록을 옮기고, 빈 공간을 끌어 캔버스를 이동할 수 있습니다.
+            블록을 눌러 상세 설정을 편집하세요. 빈 공간을 끌면 전체 전략 트리가 함께 이동합니다.
           </div>
           <div class="block-canvas" id="block-canvas" tabindex="0" aria-label="블록 전략 캔버스" aria-describedby="block-editor-status"></div>
           <footer class="block-editor-status" id="block-editor-status">
-            <span>제목줄 드래그: 블록 이동 · 빈 공간 드래그: 캔버스 이동 · Ctrl+휠: 확대/축소</span>
-            <span>방향키: 이동 · Enter: 편집 · Esc: 닫기 · 보기 배치 자동 저장</span>
+            <span>빈 공간 드래그: 전체 트리 이동 · Ctrl+휠: 확대/축소 · 블록 클릭: 설정</span>
+            <span>방향키: 캔버스 이동 · +/−: 확대/축소 · Home: 전체 맞춤 · 보기 상태 자동 저장</span>
           </footer>
         </section>
         <section class="strategy-code" id="strategy-code" hidden>

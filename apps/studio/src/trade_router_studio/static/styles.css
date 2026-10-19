@@ -2193,3 +2193,486 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   .composer-inspector .block-condition-expression { grid-template-columns: minmax(0, 1fr); }
   .composer-inspector .block-condition-operands { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Fixed Composer-style strategy tree. Blocks keep their semantic order while the
+   containing world remains pannable and zoomable. */
+.block-canvas.graph-mode.composer-mode {
+  background-color: #f6f7f8;
+  background-image: radial-gradient(circle, rgba(91, 101, 115, .21) 1px, transparent 1.15px);
+  background-size: 20px 20px;
+}
+.block-canvas.graph-mode.composer-mode.panning,
+.block-canvas.graph-mode.composer-mode.panning .composer-fixed-tree { cursor: grabbing; }
+
+.composer-fixed-tree {
+  width: 850px;
+  min-width: 680px;
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  align-content: start;
+  gap: 11px;
+  padding: 38px 44px 92px;
+  box-sizing: border-box;
+  color: #28313f;
+  cursor: default;
+  transform-origin: 0 0;
+  user-select: none;
+  will-change: transform;
+}
+.composer-fixed-tree *,
+.composer-fixed-tree *::before,
+.composer-fixed-tree *::after { box-sizing: border-box; }
+.composer-fixed-tree .block-edge-layer,
+.composer-fixed-tree .block-graph-section-label { display: none; }
+.composer-fixed-tree .strategy-block-node.graph-node,
+.composer-fixed-tree .strategy-block-node.graph-node.composer-node {
+  width: 100% !important;
+  min-width: 0;
+  position: relative;
+  inset: auto !important;
+  overflow: visible;
+  transform: none;
+}
+.composer-fixed-tree .strategy-block-node.graph-node::before,
+.composer-fixed-tree .strategy-block-node.graph-node::after { display: none; }
+.composer-fixed-tree .strategy-block-title,
+.composer-fixed-tree .graph-node .strategy-block-title {
+  min-height: 44px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.composer-tree-section {
+  min-width: 0;
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 9px;
+}
+.composer-tree-section + .composer-tree-section { margin-top: 3px; }
+
+.composer-tree-card,
+.composer-tree-row,
+.composer-tree-action,
+.composer-tree-add-row {
+  width: 100%;
+  min-width: 0;
+  position: relative;
+  border: 1px solid #c9cfd7;
+  border-radius: 5px;
+  background: #fff;
+  color: #28313f;
+  box-shadow: 0 1px 2px rgba(25, 32, 44, .09), 0 3px 8px rgba(25, 32, 44, .045);
+}
+.composer-tree-card {
+  display: grid;
+  align-content: start;
+  overflow: visible;
+}
+.composer-tree-row,
+.composer-tree-action,
+.composer-tree-add-row {
+  min-height: 46px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font: inherit;
+  text-align: left;
+}
+.composer-tree-row,
+.composer-tree-action {
+  min-height: 0;
+  display: block;
+  padding: 0;
+  cursor: pointer;
+}
+.composer-tree-row-main {
+  min-height: 46px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 11px;
+}
+.composer-fixed-tree .composer-node-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  line-height: 1.25;
+}
+.composer-fixed-tree .composer-node-copy strong,
+.composer-fixed-tree .composer-node-copy small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-fixed-tree .composer-node-copy strong {
+  color: #202938;
+  font-size: 13px;
+  font-weight: 720;
+}
+.composer-fixed-tree .composer-node-copy small {
+  color: #697386;
+  font-size: 11px;
+  font-weight: 520;
+}
+.composer-tree-row.has-summary > .composer-tree-row-main {
+  border-bottom: 1px solid #e7eaee;
+}
+button.composer-tree-row,
+button.composer-tree-action,
+button.composer-tree-add-row { cursor: pointer; }
+.composer-tree-card > .composer-tree-row {
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+}
+.composer-tree-card > .composer-tree-children {
+  margin: 0 10px 11px 16px;
+}
+.composer-tree-card:hover,
+.composer-tree-row:hover,
+.composer-tree-action:hover,
+.composer-tree-add-row:hover {
+  border-color: #aeb7c3;
+  box-shadow: 0 2px 4px rgba(25, 32, 44, .1), 0 6px 14px rgba(25, 32, 44, .055);
+}
+.composer-tree-card:focus-within,
+.composer-tree-row:focus-visible,
+.composer-tree-action:focus-visible,
+.composer-tree-add-row:focus-visible,
+.composer-tree-card.selected,
+.composer-tree-row.selected,
+.composer-tree-row[aria-selected="true"] {
+  border-color: #6e95da;
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(52, 105, 199, .14), 0 4px 12px rgba(25, 32, 44, .08);
+}
+.composer-tree-row:disabled,
+.composer-tree-action:disabled,
+.composer-tree-add-row:disabled {
+  opacity: .52;
+  cursor: default;
+}
+.composer-tree-card[aria-expanded="false"] > .composer-tree-children,
+.composer-tree-section[aria-expanded="false"] > .composer-tree-children,
+.composer-tree-flow[aria-expanded="false"] > .composer-tree-children { display: none; }
+
+.composer-tree-summary {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 6px 10px 7px;
+  background: #fafbfc;
+  border-radius: 0 0 4px 4px;
+  line-height: 1.3;
+}
+.composer-tree-summary strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #202938;
+  font-size: 13px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-tree-summary small,
+.composer-tree-summary span {
+  min-width: 0;
+  overflow: hidden;
+  color: #697386;
+  font-size: 11px;
+  font-weight: 520;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-tree-summary code {
+  border-radius: 3px;
+  background: #eef1f4;
+  color: #384558;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 10px;
+}
+
+.composer-tree-badge,
+.composer-tree-logic {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: max-content;
+  max-width: 100%;
+  padding: 4px 9px;
+  border: 1px solid #b9c4d1;
+  border-radius: 999px;
+  background: #eef2f6;
+  color: #4b596d;
+  font-size: 10px;
+  font-weight: 780;
+  letter-spacing: .015em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.composer-tree-badge.schedule,
+.composer-tree-badge.time,
+.composer-tree-logic.schedule,
+.composer-tree-logic.time,
+.composer-tree-badge[data-tone="schedule"],
+.composer-tree-logic[data-tone="schedule"] {
+  border-color: #79aa91;
+  background: #28714e;
+  color: #fff;
+}
+.composer-tree-badge.target,
+.composer-tree-badge.universe,
+.composer-tree-logic.target,
+.composer-tree-logic.universe,
+.composer-tree-badge[data-tone="target"],
+.composer-tree-logic[data-tone="target"] {
+  border-color: #abc3ea;
+  background: #edf4ff;
+  color: #2d5f9f;
+}
+.composer-tree-badge.any,
+.composer-tree-badge.or,
+.composer-tree-logic.any,
+.composer-tree-logic.or,
+.composer-tree-badge[data-tone="any"],
+.composer-tree-logic[data-tone="any"] {
+  border-color: #6d8ed0;
+  background: #3670c8;
+  color: #fff;
+}
+.composer-tree-badge.all,
+.composer-tree-badge.and,
+.composer-tree-logic.all,
+.composer-tree-logic.and,
+.composer-tree-badge[data-tone="all"],
+.composer-tree-logic[data-tone="all"] {
+  border-color: #b89bcf;
+  background: #76509a;
+  color: #fff;
+}
+.composer-tree-badge.buy,
+.composer-tree-logic.buy,
+.composer-tree-badge[data-tone="buy"],
+.composer-tree-logic[data-tone="buy"] {
+  border-color: #6aa594;
+  background: #267764;
+  color: #fff;
+}
+.composer-tree-badge.sell,
+.composer-tree-logic.sell,
+.composer-tree-badge[data-tone="sell"],
+.composer-tree-logic[data-tone="sell"] {
+  border-color: #d77d8b;
+  background: #b94d60;
+  color: #fff;
+}
+.composer-tree-badge.close,
+.composer-tree-logic.close,
+.composer-tree-badge[data-tone="close"],
+.composer-tree-logic[data-tone="close"] {
+  border-color: #a9aeba;
+  background: #596273;
+  color: #fff;
+}
+.composer-tree-badge.shared,
+.composer-tree-logic.shared,
+.composer-tree-badge[data-tone="shared"],
+.composer-tree-logic[data-tone="shared"] {
+  border-color: #405064;
+  background: #344054;
+  color: #fff;
+}
+.composer-tree-badge.root,
+.composer-tree-badge.connection,
+.composer-tree-logic.root,
+.composer-tree-logic.connection,
+.composer-tree-badge[data-tone="root"],
+.composer-tree-logic[data-tone="root"] {
+  border-color: #405064;
+  background: #344054;
+  color: #fff;
+}
+
+/* Each nested child owns a short right-angle connector. The fixed normal-flow
+   layout keeps these rails aligned without SVG paths or movable ports. */
+.composer-tree-branch {
+  min-width: 0;
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 9px;
+}
+.composer-tree-children {
+  min-width: 0;
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  margin-left: 13px;
+  padding: 7px 0 1px 29px;
+}
+.composer-tree-children::before {
+  width: 1px;
+  position: absolute;
+  top: -7px;
+  bottom: 23px;
+  left: 10px;
+  background: #829787;
+  content: "";
+}
+.composer-tree-children > * { position: relative; }
+.composer-tree-children > *::before {
+  width: 19px;
+  height: 1px;
+  position: absolute;
+  top: 23px;
+  left: -19px;
+  z-index: 0;
+  background: #829787;
+  content: "";
+  pointer-events: none;
+}
+.composer-tree-children > .composer-tree-badge::before,
+.composer-tree-children > .composer-tree-logic::before { top: 12px; }
+.composer-fixed-tree > .composer-tree-branch {
+  margin-left: 0;
+  padding: 0;
+}
+.composer-fixed-tree > .composer-tree-branch::before,
+.composer-fixed-tree > .composer-tree-branch > .composer-tree-row::before,
+.composer-fixed-tree > .composer-tree-branch > .composer-tree-flow::before { display: none; }
+.composer-tree-branch[data-tone="condition"] > .composer-tree-children::before { background: #7991b4; }
+.composer-tree-branch[data-tone="sell"] > .composer-tree-children::before { background: #b47b84; }
+
+.composer-tree-flow {
+  min-width: 0;
+  position: relative;
+  min-height: 46px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 11px;
+  border: 1px solid #c6ccd5;
+  border-radius: 5px;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(25, 32, 44, .055);
+}
+.composer-tree-flow:hover { border-color: #aeb7c3; }
+
+.composer-tree-action { background: #fbfcfd; }
+.composer-tree-action.buy,
+.composer-tree-action[data-tone="buy"] {
+  border-color: #bad7cc;
+  background: #f2faf7;
+}
+.composer-tree-action.sell,
+.composer-tree-action[data-tone="sell"] {
+  border-color: #edc8ce;
+  background: #fff6f7;
+}
+.composer-tree-action.close,
+.composer-tree-action[data-tone="close"] {
+  border-color: #d3d7df;
+  background: #f7f8fa;
+}
+.composer-tree-row[data-block-node="buyOrder"] {
+  border-color: #bad7cc;
+  background: #f2faf7;
+}
+.composer-tree-row[data-block-node="sellOrder"] {
+  border-color: #edc8ce;
+  background: #fff6f7;
+}
+
+.composer-tree-add-row {
+  min-height: 42px;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  border-color: #bbc3cd;
+  background: #f8f9fa;
+  box-shadow: 0 1px 2px rgba(25, 32, 44, .06);
+  color: #4a5567;
+  font-size: 12px;
+  font-weight: 650;
+}
+.composer-tree-badge.add {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #cf9f31;
+  border-radius: 50%;
+  background: #f7bf42;
+  color: #3e3626;
+  font-size: 18px;
+  font-weight: 720;
+  line-height: 1;
+}
+.composer-tree-add-row:hover {
+  border-color: #98a5b5;
+  background: #fff;
+}
+
+/* The Composer tree already exposes the insertion point in context. */
+.strategy-blocks.managed-composer #block-add-flow { display: none; }
+
+.composer-fixed-tree .composer-node-edit {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #7a8493;
+  font-size: 0;
+  pointer-events: none;
+}
+.composer-fixed-tree .composer-node-edit::after {
+  content: "›";
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1;
+}
+.composer-fixed-tree .composer-node-edit:hover,
+.composer-fixed-tree .composer-node-edit:focus-visible {
+  background: #eef2f6;
+  color: #344054;
+}
+
+@media (max-width: 820px) {
+  .composer-fixed-tree {
+    width: 740px;
+    min-width: 620px;
+    padding: 30px 34px 84px;
+  }
+}
+
+@media (max-width: 680px) {
+  .composer-fixed-tree {
+    width: 650px;
+    min-width: 560px;
+    padding: 24px 26px 78px;
+  }
+  .composer-tree-children {
+    margin-left: 8px;
+    padding-left: 25px;
+  }
+  .composer-tree-children::before { left: 8px; }
+  .composer-tree-children > *::before {
+    width: 17px;
+    left: -17px;
+  }
+}

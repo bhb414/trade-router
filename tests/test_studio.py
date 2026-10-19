@@ -834,18 +834,49 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'button.addEventListener("pointerdown"' in static_script.text
         assert "buy_condition_groups" in static_script.text
         assert "매수 주문 조건" in static_script.text
-        assert "createComposerGraphNode" in static_script.text
+        assert "buildComposerTreeModel" in static_script.text
+        assert "createComposerTreeRow" in static_script.text
+        assert "renderComposerTreeBranch" in static_script.text
         assert "createComposerInspector" in static_script.text
         assert "captureComposerInspectorView" in static_script.text
         assert "restoreComposerInspectorView" in static_script.text
         assert 'classList.add("graph-mode", "composer-mode")' in static_script.text
-        assert 'event.target.closest(".strategy-block-node, .composer-inspector")' in static_script.text
+        assert "composer-fixed-tree" in static_script.text
+        assert "composer-tree-world" in static_script.text
+        assert "composer-tree-branch" in static_script.text
+        assert "composer-tree-card" in static_script.text
+        for tree_marker in (
+            "composer-tree-row",
+            "composer-tree-badge",
+            "composer-tree-add-row",
+            "composer-tree-summary",
+            "composer-tree-section",
+            "composer-tree-action",
+            "composer-tree-logic",
+            "composer-tree-flow",
+        ):
+            assert tree_marker in static_script.text
         assert 'event.target.closest(".composer-inspector")' in static_script.text
-        assert "function bindBlockNodeDrag(node, world, edgeLayer)" in static_script.text
+        assert "function bindBlockCanvasPan(world)" in static_script.text
+        assert 'event.target.closest(".composer-tree-row, .composer-tree-add-row' in static_script.text
+        assert "function applyBlockViewport(world)" in static_script.text
+        assert "function setBlockZoom(nextZoom)" in static_script.text
+        assert "function fitBlockGraph()" in static_script.text
+        assert "function bindBlockNodeDrag(" not in static_script.text
+        assert "function blockNodePosition(" not in static_script.text
+        assert "BLOCK_NODE_COORD_LIMIT" not in static_script.text
+        assert (
+            'const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v5"'
+            in static_script.text
+        )
+        assert "state.blockPackage.layout.nodes = {}" in static_script.text
+        clone_layout_source = static_script.text.split(
+            "function cloneBlockLayout(layout)", 1
+        )[1].split("function blockLayoutIdentity", 1)[0]
+        assert "nodes: {}" in clone_layout_source
+        assert "layout?.nodes" not in clone_layout_source
         assert "() => persistBlockLayout(strategyName, layout)" in static_script.text
-        assert "const packageLayout = cloneBlockLayout(state.blockPackage.layout)" in static_script.text
-        assert "BLOCK_NODE_COORD_LIMIT = 20000" in static_script.text
-        assert 'node.addEventListener("keydown"' in static_script.text
+        assert "BLOCK_VIEWPORT_COORD_LIMIT = 20000" in static_script.text
         assert "focusComposerInspector" in static_script.text
         assert "closeComposerInspector" in static_script.text
         assert "createCalculationEditor" not in static_script.text
@@ -863,9 +894,25 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         static_styles = client.get("/static/styles.css")
         assert static_styles.status_code == 200
         assert ".strategy-blocks.managed-composer" in static_styles.text
+        assert ".composer-fixed-tree" in static_styles.text
+        assert ".composer-tree-card" in static_styles.text
+        assert ".composer-tree-branch" in static_styles.text
+        assert ".composer-tree-children" in static_styles.text
+        for tree_selector in (
+            ".composer-tree-row",
+            ".composer-tree-badge",
+            ".composer-tree-add-row",
+            ".composer-tree-summary",
+            ".composer-tree-section",
+            ".composer-tree-action",
+            ".composer-tree-logic",
+            ".composer-tree-flow",
+        ):
+            assert tree_selector in static_styles.text
         assert ".composer-inspector" in static_styles.text
         assert "전략 블록 편집" in page.text
-        assert "제목줄을 끌어 블록을 옮기고" in page.text
+        assert "빈 공간 드래그" in page.text
+        assert "블록 이동" not in page.text
         assert 'aria-describedby="block-editor-status"' in page.text
         assert 'id="block-canvas" aria-live=' not in page.text
         chart_script = client.get("/static/chart.js")

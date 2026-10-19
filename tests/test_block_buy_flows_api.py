@@ -88,3 +88,42 @@ def test_invalid_flow_window_does_not_replace_saved_strategy(tmp_path: Path) -> 
         rejected = client.put(endpoint, json=package)
         assert rejected.status_code == 422
         assert source_path.read_text(encoding="utf-8") == original
+
+
+def test_legacy_freeform_layout_remains_importable_for_fixed_tree_ui(
+    tmp_path: Path,
+) -> None:
+    """Older exports may contain node coordinates the fixed tree no longer uses.
+
+    The API must continue accepting and round-tripping those files so a UI-only
+    layout redesign never makes a user's strategy definition unimportable.  The
+    browser is responsible for ignoring ``nodes`` and retaining only ``viewport``.
+    """
+
+    with TestClient(create_app(_workspace(tmp_path / "workspace"))) as client:
+        endpoint = f"/api/strategies/{quote('블록 예제.py')}/block-package"
+        package = client.get(endpoint).json()
+        original_settings = deepcopy(package["settings"])
+        package["name"] = "구형 자유 배치 가져오기"
+        package["layout"] = {
+            "nodes": {
+                "connection": {"x": -12_345.5, "y": 19_999.0},
+                "flow-buy-flow-1-target": {"x": 7_777.0, "y": 14_426.0},
+                "removed-node-from-old-version": {"x": 20.0, "y": 30.0},
+            },
+            "viewport": {"x": 81.0, "y": 62.0, "zoom": 1.1},
+        }
+
+        imported = client.post("/api/strategies/import-block", json=package)
+        assert imported.status_code == 200, imported.text
+        imported_name = imported.json()["name"]
+        restored = client.get(
+            f"/api/strategies/{quote(imported_name)}/block-package"
+        ).json()
+
+        assert restored["settings"]["buy_flows"] == original_settings["buy_flows"]
+        assert restored["settings"]["total_operating_budget"] == original_settings[
+            "total_operating_budget"
+        ]
+        assert restored["layout"] == package["layout"]
+        assert client.get("/api/status").json()["running"] == 0

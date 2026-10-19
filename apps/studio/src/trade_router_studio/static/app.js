@@ -1,6 +1,5 @@
 const LOG_CLEAR_STORAGE_KEY = "trade-router.log-clear-cursors.v1";
-const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v4";
-const BLOCK_NODE_COORD_LIMIT = 20000;
+const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v5";
 const BLOCK_VIEWPORT_COORD_LIMIT = 20000;
 const BLOCK_ZOOM_MIN = .2;
 const BLOCK_ZOOM_MAX = 2;
@@ -220,19 +219,16 @@ function clampBlockNumber(value, minimum, maximum, fallback) {
 }
 
 function cloneBlockLayout(layout) {
-  const nodes = {};
-  Object.entries(layout?.nodes || {}).forEach(([id, point]) => {
-    const x = clampBlockNumber(point?.x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
-    const y = clampBlockNumber(point?.y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
-    if (x != null && y != null) nodes[id] = { x, y };
-  });
   const viewport = layout?.viewport || {};
   return {
-    nodes,
+    // Node coordinates belonged to the former free-form graph. Keep the
+    // package field empty so legacy files still validate without allowing an
+    // imported arrangement to change the fixed Composer hierarchy.
+    nodes: {},
     viewport: {
       x: clampBlockNumber(viewport.x, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24),
       y: clampBlockNumber(viewport.y, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24),
-      zoom: clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, .75),
+      zoom: clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, 1),
     },
   };
 }
@@ -1619,8 +1615,6 @@ function removeBlockBuyFlow(flowId) {
   if (index < 0 || flows.length <= 1 || selectedState()?.running) return;
   flows.splice(index, 1);
   if (String(state.blockSelectedNode || "").startsWith(`flow-${flowId}-`)) state.blockSelectedNode = "connection";
-  const nodes = state.blockPackage?.layout?.nodes || {};
-  Object.keys(nodes).filter(id => id.startsWith(`flow-${flowId}-`)).forEach(id => delete nodes[id]);
   setDirty(true);
   renderStrategyBlocks();
 }
@@ -1953,18 +1947,21 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [],
   return node;
 }
 
-function createComposerGraphNode(definition, disabled) {
+function createComposerTreeRow(definition, disabled) {
   const node = document.createElement("article");
-  node.className = `strategy-block-node graph-node composer-node ${definition.tone || "general"}`;
+  node.className = `composer-tree-card composer-tree-row ${definition.tone || "general"}`;
+  node.classList.toggle("composer-tree-action", ["buyOrder", "sellOrder"].includes(definition.id));
   node.dataset.blockNode = definition.id;
-  node.classList.toggle("selected", state.blockSelectedNode === definition.id);
+  const selected = state.blockSelectedNode === definition.id;
+  node.classList.toggle("selected", selected);
   node.classList.toggle("has-summary", Boolean(definition.summary?.filter(Boolean).length));
-  node.tabIndex = 0;
-  node.setAttribute("role", "group");
+  node.tabIndex = state.blockSelectedNode ? (selected ? 0 : -1) : (definition.id === "connection" ? 0 : -1);
+  node.setAttribute("role", "treeitem");
+  node.setAttribute("aria-selected", selected ? "true" : "false");
   const heading = document.createElement("div");
-  heading.className = "strategy-block-title";
+  heading.className = "composer-tree-row-main";
   const logic = document.createElement("span");
-  logic.className = `composer-logic-pill ${definition.logicTone || definition.tone || "general"}`;
+  logic.className = `composer-tree-badge composer-tree-logic ${definition.logicTone || definition.tone || "general"}`;
   logic.textContent = definition.logic || "블록";
   const copy = document.createElement("span");
   copy.className = "composer-node-copy";
@@ -1973,24 +1970,18 @@ function createComposerGraphNode(definition, disabled) {
   const detail = document.createElement("small");
   detail.textContent = definition.meta || "";
   copy.append(name, detail);
-  const edit = document.createElement("button");
-  edit.type = "button";
-  edit.className = "composer-node-edit";
-  edit.textContent = "편집";
-  edit.disabled = false;
-  edit.setAttribute("aria-label", `${definition.title} 상세 편집`);
+  const edit = document.createElement("span");
+  edit.className = "composer-tree-edit composer-node-edit";
+  edit.setAttribute("aria-hidden", "true");
   const select = event => {
     event?.stopPropagation();
-    if (node._blockDraggedUntil && performance.now() < node._blockDraggedUntil) return;
     state.blockSelectedNode = definition.id;
     renderStrategyBlocks();
     focusComposerInspector();
   };
-  edit.addEventListener("pointerdown", event => event.stopPropagation());
-  edit.addEventListener("click", select);
   heading.append(logic, copy, edit);
   const summary = document.createElement("div");
-  summary.className = "composer-node-summary";
+  summary.className = "composer-tree-summary";
   (definition.summary || []).filter(Boolean).slice(0, 3).forEach(text => {
     const chip = document.createElement("span");
     chip.className = "composer-summary-chip";
@@ -2000,7 +1991,26 @@ function createComposerGraphNode(definition, disabled) {
   node.append(heading);
   if (summary.childElementCount) node.append(summary);
   node.addEventListener("click", select);
-  node.setAttribute("aria-label", `${definition.title}. ${definition.meta || ""}. Enter로 편집, 방향키로 이동`);
+  node.addEventListener("keydown", event => {
+    if (event.target !== node) return;
+    if (["Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      select(event);
+      return;
+    }
+    if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    const rows = [...elements.blockCanvas.querySelectorAll(".composer-tree-row[data-block-node]")];
+    const index = rows.indexOf(node);
+    const nextIndex = event.key === "Home" ? 0
+      : event.key === "End" ? rows.length - 1
+        : Math.min(rows.length - 1, Math.max(0, index + (event.key === "ArrowDown" ? 1 : -1)));
+    const next = rows[nextIndex];
+    if (!next || next === node) return;
+    event.preventDefault();
+    rows.forEach(row => { row.tabIndex = row === next ? 0 : -1; });
+    next.focus({ preventScroll: true });
+  });
+  node.setAttribute("aria-label", `${definition.title}. ${definition.meta || ""}. Enter로 편집`);
   node.classList.toggle("read-only", disabled);
   return node;
 }
@@ -2222,9 +2232,6 @@ function removeConditionGroup(kind, groupIndex, flowId = null) {
   const removedNode = removed?.id && (flowId ? `flow-${flowId}-group-${removed.id}` : `${kind}Group-${removed.id}`);
   if (removedNode && state.blockSelectedNode === removedNode) state.blockSelectedNode = kind === "buy" && flowId
     ? `flow-${flowId}-target` : "sellSchedule";
-  if (removed?.id && state.blockPackage?.layout?.nodes) {
-    delete state.blockPackage.layout.nodes[flowId ? `flow-${flowId}-group-${removed.id}` : `${kind}Group-${removed.id}`];
-  }
   setDirty(true);
   renderStrategyBlocks();
 }
@@ -2617,349 +2624,207 @@ function conditionJoin(text = "또는 (OR)") {
   return join;
 }
 
-const LEGACY_CONDITION_GRAPH_DEFAULTS = {
-  connection: { x: 70, y: 80 },
-  target: { x: 470, y: 80 },
-  buyConditions: { x: 850, y: 80 },
-  buyRules: { x: 470, y: 470 },
-  buyOrder: { x: 900, y: 500 },
-  sellConditions: { x: 70, y: 760 },
-  sellOrder: { x: 650, y: 800 },
-  buySchedule: { x: 70, y: 1150 },
-  sellSchedule: { x: 450, y: 1150 },
-  closeSchedule: { x: 830, y: 1150 },
-};
-
-function managedConditionGraphPlan(settings) {
+function buildComposerTreeModel(settings) {
   const flows = Array.isArray(settings?.buy_flows) ? settings.buy_flows : [];
   const sellGroups = Array.isArray(settings?.sell_condition_groups) ? settings.sell_condition_groups : [];
-  const rootX = 50;
-  const branchX = rootX + 68;
-  const detailX = branchX + 68;
-  const rowGap = 144;
-  const defaults = { connection: { x: rootX, y: 90 } };
-  const labels = { connection: { text: "전략 공통 연결", x: rootX, y: 45 } };
-  const edges = [];
-  const buyExits = [];
-  let nextY = 240;
-  flows.forEach((flow, flowIndex) => {
+  const flowBranches = flows.map((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
     const groups = flow.buy_condition_groups || [];
-    const y = nextY;
-    labels[prefix] = { text: `${flow.name || `매수 흐름 ${flowIndex + 1}`} · ${flow.buy_start_time}–${flow.buy_end_time}`, x: rootX, y: y - 38 };
-    defaults[`${prefix}-schedule`] = { x: rootX, y };
-    defaults[`${prefix}-target`] = { x: branchX, y: y + rowGap };
-    edges.push(["connection", `${prefix}-schedule`, flowIndex ? "병렬 일정" : "매수 일정"]);
-    edges.push([`${prefix}-schedule`, `${prefix}-target`, "조회"]);
-    const first = groups.length ? `${prefix}-group-${groups[0].id}` : `${prefix}-empty`;
-    edges.push([`${prefix}-target`, first, "후보 종목"]);
-    if (!groups.length) {
-      defaults[first] = { x: detailX, y: y + rowGap * 2 };
-      buyExits.push(first);
-    }
-    groups.forEach((group, index) => {
-      const nodeId = `${prefix}-group-${group.id}`;
-      defaults[nodeId] = { x: detailX, y: y + rowGap * (index + 2) };
-      if (index) edges.push([`${prefix}-group-${groups[index - 1].id}`, nodeId, "그리고"]);
-    });
-    if (groups.length) buyExits.push(`${prefix}-group-${groups[groups.length - 1].id}`);
-    nextY += rowGap * (Math.max(1, groups.length) + 2) + 86;
+    return {
+      kind: "branch",
+      id: prefix,
+      title: flow.name || `매수 흐름 ${flowIndex + 1}`,
+      badge: `${flow.buy_start_time}–${flow.buy_end_time}`,
+      tone: "schedule",
+      nodeId: `${prefix}-schedule`,
+      children: [
+        { kind: "node", nodeId: `${prefix}-target` },
+        ...(groups.length
+          ? groups.map(group => ({ kind: "node", nodeId: `${prefix}-group-${group.id}` }))
+          : [{ kind: "node", nodeId: `${prefix}-empty` }]),
+        {
+          kind: "add",
+          id: `${prefix}-add-condition`,
+          label: "매수 조건 블록 추가",
+          action: "add-buy-condition",
+          flowId: flow.id,
+          disabled: groups.length >= 8,
+        },
+      ],
+    };
   });
-  defaults.buyRules = { x: branchX, y: nextY };
-  defaults.buyOrder = { x: detailX, y: nextY + rowGap };
-  labels.buyShared = { text: "공통 예산 · 보유종목 · 매수 주문", x: branchX, y: nextY - 38 };
-  buyExits.forEach((id, index) => edges.push([id, "buyRules", index ? "공통 예산" : "조건 통과"]));
-  edges.push(["buyRules", "buyOrder", "주문 가능"]);
-
-  const sellBaseY = nextY + rowGap * 2 + 130;
-  defaults.sellSchedule = { x: rootX, y: sellBaseY };
-  labels.sell = { text: "공통 보유종목 · 매도 판단", x: rootX, y: sellBaseY - 38 };
-  sellGroups.forEach((group, index) => {
-    const id = `sellGroup-${group.id}`;
-    defaults[id] = { x: branchX, y: sellBaseY + rowGap * (index + 1) };
-    edges.push(index
-      ? [`sellGroup-${sellGroups[index - 1].id}`, id, "그리고"]
-      : ["sellSchedule", id, "판단 시점"]);
-  });
-  const sellOrderY = sellBaseY + rowGap * (sellGroups.length + 1);
-  defaults.sellOrder = { x: detailX, y: sellOrderY };
-  if (sellGroups.length) edges.push([`sellGroup-${sellGroups[sellGroups.length - 1].id}`, "sellOrder", "조건 충족"]);
-  else edges.push(["sellSchedule", "sellOrder", "매도"]);
-  const closeY = sellOrderY + rowGap + 120;
-  defaults.closeSchedule = { x: rootX, y: closeY };
-  edges.push(["closeSchedule", "sellOrder", "장 마감 청산"]);
-  labels.close = { text: "장 마감", x: rootX, y: closeY - 38 };
   return {
-    defaults, edges, labels,
-    size: { width: 1540, height: Math.max(1760, closeY + 260) },
+    kind: "branch",
+    id: "strategy-root",
+    nodeId: "connection",
+    children: [{
+      kind: "section",
+      id: "buy-section",
+      title: "매수 구성",
+      badge: "BUY",
+      tone: "buy",
+      description: "시간대별 종목 선정과 조건 · 예산과 보유종목은 전략 전체 공유",
+      children: [
+        ...flowBranches,
+        {
+          kind: "add",
+          id: "add-buy-flow",
+          label: "시간대별 매수 흐름 추가",
+          action: "add-buy-flow",
+          disabled: flows.length >= 8,
+        },
+        {
+          kind: "branch",
+          id: "shared-buy-order",
+          title: "공통 주문 처리",
+          badge: "SHARED",
+          tone: "shared",
+          nodeId: "buyRules",
+          children: [{ kind: "node", nodeId: "buyOrder" }],
+        },
+      ],
+    }, {
+      kind: "section",
+      id: "sell-section",
+      title: "매도 구성",
+      badge: "SELL",
+      tone: "sell",
+      description: "전략 보유종목을 공통 조건으로 판단하고 주문",
+      children: [{
+        kind: "branch",
+        id: "sell-decision",
+        nodeId: "sellSchedule",
+        children: [
+          ...sellGroups.map(group => ({ kind: "node", nodeId: `sellGroup-${group.id}` })),
+          {
+            kind: "add",
+            id: "add-sell-condition",
+            label: "매도 조건 블록 추가",
+            action: "add-sell-condition",
+            disabled: sellGroups.length >= 8,
+          },
+          { kind: "node", nodeId: "sellOrder" },
+        ],
+      }, {
+        kind: "branch",
+        id: "close-position",
+        title: "장 마감",
+        badge: "CLOSE",
+        tone: "close",
+        nodeId: "closeSchedule",
+      }],
+    }],
   };
 }
 
-function graphLayoutMatches(nodes, preset) {
-  const entries = Object.entries(preset);
-  return entries.every(([id, point]) => (
-    Number(nodes?.[id]?.x) === point.x && Number(nodes?.[id]?.y) === point.y
-  ));
+function createComposerTreeAddRow(entry, running) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "composer-tree-add-row";
+  button.dataset.composerAdd = entry.action || "";
+  button.disabled = running || Boolean(entry.disabled);
+  const badge = document.createElement("span");
+  badge.className = "composer-tree-badge add";
+  badge.textContent = "+";
+  const label = document.createElement("span");
+  label.textContent = entry.label || "블록 추가";
+  button.append(badge, label);
+  button.addEventListener("click", event => {
+    event.stopPropagation();
+    if (entry.action === "add-buy-flow") addBlockBuyFlow();
+    else if (entry.action === "add-buy-condition") addConditionGroup("buy", entry.flowId);
+    else if (entry.action === "add-sell-condition") addConditionGroup("sell");
+  });
+  return button;
+}
+
+function createComposerTreeBranchHeader(entry) {
+  const header = document.createElement("div");
+  header.className = "composer-tree-flow";
+  const badge = document.createElement("span");
+  badge.className = `composer-tree-badge ${entry.tone || "general"}`;
+  badge.textContent = entry.badge || "GROUP";
+  const copy = document.createElement("span");
+  copy.className = "composer-node-copy";
+  const title = document.createElement("strong");
+  title.textContent = entry.title || "전략 흐름";
+  copy.append(title);
+  if (entry.description) {
+    const description = document.createElement("small");
+    description.textContent = entry.description;
+    copy.append(description);
+  }
+  header.append(badge, copy);
+  return header;
+}
+
+function renderComposerTreeBranch(entry, definitions, running) {
+  if (entry.kind === "add") return createComposerTreeAddRow(entry, running);
+  const branch = document.createElement(entry.kind === "section" ? "section" : "div");
+  branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}`;
+  if (entry.tone) {
+    branch.classList.add(entry.tone);
+    branch.dataset.tone = entry.tone;
+  }
+  branch.dataset.composerBranch = entry.id || entry.nodeId || "branch";
+  if (entry.title) branch.append(createComposerTreeBranchHeader(entry));
+  if (entry.nodeId) {
+    const definition = definitions.get(entry.nodeId);
+    if (definition) branch.append(createComposerTreeRow(definition, running));
+  }
+  if (entry.children?.length) {
+    const children = document.createElement("div");
+    children.className = "composer-tree-children";
+    children.setAttribute("role", "group");
+    entry.children.forEach(child => children.append(renderComposerTreeBranch(child, definitions, running)));
+    branch.append(children);
+  }
+  return branch;
 }
 
 function prepareBlockVisualLayout(name) {
   if (!state.blockPackage || state.blockPackage.template !== "condition-bollinger-v1") return;
-  const plan = managedConditionGraphPlan(state.blockPackage.settings);
-  state.blockGraphPlan = plan;
   const localLayout = storedBlockLayout(name);
-  if (localLayout && Object.keys(localLayout.nodes).some(id => id.startsWith("flow-"))) {
-    state.blockPackage.layout = localLayout;
-    return;
-  }
   const packageLayout = cloneBlockLayout(state.blockPackage.layout);
-  if (Object.keys(packageLayout.nodes).some(id => id.startsWith("flow-"))) {
-    state.blockPackage.layout = packageLayout;
-    return;
-  }
+  const legacyFreeLayout = Object.keys(state.blockPackage.layout?.nodes || {}).length > 0;
   state.blockPackage.layout = {
-    nodes: Object.fromEntries(Object.entries(plan.defaults).map(([id, point]) => [id, { ...point }])),
-    viewport: { x: 34, y: 34, zoom: .82 },
+    nodes: {},
+    // The fixed tree has one canonical arrangement. Only the user's local
+    // canvas view is preferred. A fixed-tree package may carry its viewport,
+    // while a legacy free-graph package starts from the canonical 100% view.
+    viewport: localLayout?.viewport || (!legacyFreeLayout ? packageLayout.viewport : null) || { x: 34, y: 34, zoom: 1 },
   };
+  state.blockGraphPlan = null;
 }
 
 function ensureBlockLayout() {
   if (!state.blockPackage) return null;
   state.blockPackage.layout ||= {};
-  state.blockPackage.layout.nodes ||= {};
-  state.blockPackage.layout.viewport ||= { x: 24, y: 24, zoom: .75 };
-  Object.entries(state.blockPackage.layout.nodes).forEach(([id, point]) => {
-    const x = clampBlockNumber(point?.x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
-    const y = clampBlockNumber(point?.y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, null);
-    if (x == null || y == null) delete state.blockPackage.layout.nodes[id];
-    else state.blockPackage.layout.nodes[id] = { x, y };
-  });
+  // Older packages may contain freely dragged node coordinates. They remain
+  // accepted by the backend for import compatibility, but the fixed tree UI
+  // intentionally never reads or persists them.
+  state.blockPackage.layout.nodes = {};
+  state.blockPackage.layout.viewport ||= { x: 24, y: 24, zoom: 1 };
   const viewport = state.blockPackage.layout.viewport;
   viewport.x = clampBlockNumber(viewport.x, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
   viewport.y = clampBlockNumber(viewport.y, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
-  viewport.zoom = clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, .75);
+  viewport.zoom = clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, 1);
   return state.blockPackage.layout;
-}
-
-function blockNodePosition(id) {
-  const layout = ensureBlockLayout();
-  const saved = layout?.nodes?.[id];
-  const fallback = state.blockGraphPlan?.defaults?.[id] || { x: 40, y: 40 };
-  return {
-    x: clampBlockNumber(saved?.x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, fallback.x),
-    y: clampBlockNumber(saved?.y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, fallback.y),
-  };
 }
 
 function constrainBlockViewport(viewport) {
   viewport.x = clampBlockNumber(viewport.x, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
   viewport.y = clampBlockNumber(viewport.y, -BLOCK_VIEWPORT_COORD_LIMIT, BLOCK_VIEWPORT_COORD_LIMIT, 24);
-  viewport.zoom = clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, .75);
+  viewport.zoom = clampBlockNumber(viewport.zoom, BLOCK_ZOOM_MIN, BLOCK_ZOOM_MAX, 1);
   return viewport;
 }
 
 function applyBlockViewport(world) {
-  const viewport = constrainBlockViewport(ensureBlockLayout()?.viewport || { x: 24, y: 24, zoom: .75 });
+  const viewport = constrainBlockViewport(ensureBlockLayout()?.viewport || { x: 24, y: 24, zoom: 1 });
   world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`;
   elements.blockCanvas.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`;
   elements.blockCanvas.style.backgroundSize = `${18 * viewport.zoom}px ${18 * viewport.zoom}px`;
   if (elements.blockZoomLabel) elements.blockZoomLabel.textContent = `${Math.round(viewport.zoom * 100)}%`;
-}
-
-function blockEdgeGeometry(from, to) {
-  const source = {
-    left: from.offsetLeft,
-    top: from.offsetTop,
-    width: from.offsetWidth,
-    height: from.offsetHeight,
-  };
-  const target = {
-    left: to.offsetLeft,
-    top: to.offsetTop,
-    width: to.offsetWidth,
-    height: to.offsetHeight,
-  };
-  source.right = source.left + source.width;
-  source.bottom = source.top + source.height;
-  source.cx = source.left + source.width / 2;
-  source.cy = source.top + source.height / 2;
-  target.right = target.left + target.width;
-  target.bottom = target.top + target.height;
-  target.cx = target.left + target.width / 2;
-  target.cy = target.top + target.height / 2;
-
-  const dx = target.cx - source.cx;
-  const dy = target.cy - source.cy;
-  const horizontalClearance = Math.abs(dx) - (source.width + target.width) / 2;
-  const verticalClearance = Math.abs(dy) - (source.height + target.height) / 2;
-  const horizontal = horizontalClearance >= verticalClearance;
-
-  if (horizontal) {
-    const direction = dx >= 0 ? 1 : -1;
-    const x1 = direction > 0 ? source.right : source.left;
-    const y1 = source.cy;
-    const x2 = direction > 0 ? target.left : target.right;
-    const y2 = target.cy;
-    const bend = Math.max(48, Math.min(220, Math.abs(x2 - x1) * .45 + Math.abs(y2 - y1) * .08));
-    return {
-      x1, y1, x2, y2,
-      c1x: x1 + direction * bend,
-      c1y: y1,
-      c2x: x2 - direction * bend,
-      c2y: y2,
-      labelX: (x1 + x2) / 2,
-      labelY: (y1 + y2) / 2 - 9,
-    };
-  }
-
-  const direction = dy >= 0 ? 1 : -1;
-  const x1 = source.cx;
-  const y1 = direction > 0 ? source.bottom : source.top;
-  const x2 = target.cx;
-  const y2 = direction > 0 ? target.top : target.bottom;
-  const bend = Math.max(48, Math.min(220, Math.abs(y2 - y1) * .45 + Math.abs(x2 - x1) * .08));
-  return {
-    x1, y1, x2, y2,
-    c1x: x1,
-    c1y: y1 + direction * bend,
-    c2x: x2,
-    c2y: y2 - direction * bend,
-    labelX: (x1 + x2) / 2 + 12,
-    labelY: (y1 + y2) / 2 + 3,
-  };
-}
-
-function drawBlockGraphEdges(world, edgeLayer) {
-  [...edgeLayer.children].forEach(child => {
-    if (child.tagName.toLowerCase() !== "defs") child.remove();
-  });
-  const plan = state.blockGraphPlan || managedConditionGraphPlan(state.blockPackage?.settings);
-  edgeLayer.setAttribute("viewBox", `0 0 ${plan.size.width} ${plan.size.height}`);
-  for (const [fromId, toId, label] of plan.edges) {
-    const from = world.querySelector(`[data-block-node="${fromId}"]`);
-    const to = world.querySelector(`[data-block-node="${toId}"]`);
-    if (!from || !to) continue;
-    const edge = blockEdgeGeometry(from, to);
-    const port = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-    port.setAttribute("cx", String(edge.x1));
-    port.setAttribute("cy", String(edge.y1));
-    port.setAttribute("r", "4");
-    port.setAttribute("class", "block-edge-port");
-    edgeLayer.append(port);
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", `M ${edge.x1} ${edge.y1} C ${edge.c1x} ${edge.c1y}, ${edge.c2x} ${edge.c2y}, ${edge.x2} ${edge.y2}`);
-    path.setAttribute("class", "block-edge-path");
-    path.setAttribute("marker-end", "url(#block-edge-arrow)");
-    edgeLayer.append(path);
-    if (label) {
-      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      text.setAttribute("x", String(edge.labelX));
-      text.setAttribute("y", String(edge.labelY));
-      text.setAttribute("class", "block-edge-label");
-      text.textContent = label;
-      edgeLayer.append(text);
-    }
-  }
-}
-
-function createBlockEdgeLayer() {
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("class", "block-edge-layer");
-  svg.setAttribute("aria-hidden", "true");
-  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-  const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-  marker.setAttribute("id", "block-edge-arrow");
-  marker.setAttribute("viewBox", "0 0 10 10");
-  marker.setAttribute("refX", "8");
-  marker.setAttribute("refY", "5");
-  marker.setAttribute("markerWidth", "6");
-  marker.setAttribute("markerHeight", "6");
-  marker.setAttribute("orient", "auto-start-reverse");
-  const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  arrow.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
-  marker.append(arrow);
-  defs.append(marker);
-  svg.append(defs);
-  return svg;
-}
-
-function bindBlockNodeDrag(node, world, edgeLayer) {
-  const handle = node.querySelector(".strategy-block-title");
-  if (!handle) return;
-  const moveNode = (x, y) => {
-    const constrained = {
-      x: Math.round(clampBlockNumber(x, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, 0) * 10) / 10,
-      y: Math.round(clampBlockNumber(y, -BLOCK_NODE_COORD_LIMIT, BLOCK_NODE_COORD_LIMIT, 0) * 10) / 10,
-    };
-    ensureBlockLayout().nodes[node.dataset.blockNode] = constrained;
-    node.style.left = `${constrained.x}px`;
-    node.style.top = `${constrained.y}px`;
-    drawBlockGraphEdges(world, edgeLayer);
-    return constrained;
-  };
-  node.addEventListener("keydown", event => {
-    if (event.target !== node) return;
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      node.querySelector(".composer-node-edit")?.click();
-      return;
-    }
-    const directions = {
-      ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
-    };
-    const direction = directions[event.key];
-    if (!direction) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const step = event.shiftKey ? 40 : 10;
-    const start = blockNodePosition(node.dataset.blockNode);
-    moveNode(start.x + direction[0] * step, start.y + direction[1] * step);
-    persistBlockLayout();
-  });
-  handle.addEventListener("pointerdown", event => {
-    if (event.button !== 0 || event.target.closest("button, input, select, textarea, a")) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const viewport = ensureBlockLayout().viewport;
-    const strategyName = state.selected;
-    const layout = state.blockPackage?.layout;
-    const start = blockNodePosition(node.dataset.blockNode);
-    const origin = { x: event.clientX, y: event.clientY };
-    let moved = false;
-    handle.setPointerCapture(event.pointerId);
-    node.classList.add("dragging");
-    const move = moveEvent => {
-      const x = clampBlockNumber(
-        start.x + (moveEvent.clientX - origin.x) / viewport.zoom,
-        -BLOCK_NODE_COORD_LIMIT,
-        BLOCK_NODE_COORD_LIMIT,
-        start.x,
-      );
-      const y = clampBlockNumber(
-        start.y + (moveEvent.clientY - origin.y) / viewport.zoom,
-        -BLOCK_NODE_COORD_LIMIT,
-        BLOCK_NODE_COORD_LIMIT,
-        start.y,
-      );
-      moved ||= Math.abs(x - start.x) >= .1 || Math.abs(y - start.y) >= .1;
-      moveNode(x, y);
-    };
-    const end = endEvent => {
-      if (handle.hasPointerCapture?.(endEvent.pointerId)) {
-        handle.releasePointerCapture(endEvent.pointerId);
-      }
-      node.classList.remove("dragging");
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("pointerup", end);
-      handle.removeEventListener("pointercancel", end);
-      if (moved) {
-        node._blockDraggedUntil = performance.now() + 250;
-        persistBlockLayout(strategyName, layout);
-      }
-    };
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("pointerup", end);
-    handle.addEventListener("pointercancel", end);
-  });
 }
 
 function bindBlockCanvasPan(world) {
@@ -2968,7 +2833,7 @@ function bindBlockCanvasPan(world) {
   if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
   if (canvas._blockKeyHandler) canvas.removeEventListener("keydown", canvas._blockKeyHandler);
   const panHandler = event => {
-    if (event.button !== 0 || event.target.closest(".strategy-block-node, .composer-inspector")) return;
+    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-add-row, .composer-inspector, button, input, select, textarea, a")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     const strategyName = state.selected;
@@ -3090,12 +2955,13 @@ function setBlockZoom(nextZoom) {
 
 function fitBlockGraph() {
   const world = elements.blockCanvas.querySelector(".block-canvas-world");
-  const nodes = [...(world?.querySelectorAll(".strategy-block-node") || [])];
-  if (!world || !nodes.length || !state.blockPackage) return;
-  const minX = Math.min(...nodes.map(node => node.offsetLeft));
-  const minY = Math.min(...nodes.map(node => node.offsetTop));
-  const maxX = Math.max(...nodes.map(node => node.offsetLeft + node.offsetWidth));
-  const maxY = Math.max(...nodes.map(node => node.offsetTop + node.offsetHeight));
+  const tree = world?.querySelector(".composer-fixed-tree");
+  if (!world || !tree || !state.blockPackage) return;
+  const minX = tree.offsetLeft;
+  const minY = tree.offsetTop;
+  const maxX = minX + Math.max(tree.offsetWidth, tree.scrollWidth);
+  const maxY = minY + Math.max(tree.offsetHeight, tree.scrollHeight);
+  if (maxX <= minX || maxY <= minY) return;
   const padding = 46;
   const zoom = Math.min(1.25, Math.max(.2, Math.min(
     (elements.blockCanvas.clientWidth - padding * 2) / (maxX - minX),
@@ -3111,41 +2977,13 @@ function fitBlockGraph() {
 
 function resetBlockGraphLayout() {
   if (!state.blockPackage) return;
-  const viewport = { ...ensureBlockLayout().viewport };
-  const plan = managedConditionGraphPlan(state.blockPackage.settings);
-  state.blockGraphPlan = plan;
   state.blockPackage.layout = {
-    nodes: Object.fromEntries(Object.entries(plan.defaults).map(([id, point]) => [id, { ...point }])),
-    viewport,
+    nodes: {},
+    viewport: { x: 34, y: 34, zoom: 1 },
   };
+  state.blockGraphPlan = null;
   persistBlockLayout();
   renderStrategyBlocks();
-}
-
-function createGraphSectionLabel(world, text, x, y) {
-  const label = document.createElement("div");
-  label.className = "block-graph-section-label";
-  label.textContent = text;
-  label.style.left = `${x}px`;
-  label.style.top = `${y}px`;
-  world.append(label);
-}
-
-function reflowUnmovedBlockNodes(plan) {
-  const previous = state.blockGraphPlan?.defaults;
-  const layout = ensureBlockLayout();
-  if (!previous || !layout) return;
-  for (const [id, point] of Object.entries(previous)) {
-    const saved = layout.nodes[id];
-    const next = plan.defaults[id];
-    if (!next) {
-      delete layout.nodes[id];
-    } else if (saved && Number(saved.x) === point.x && Number(saved.y) === point.y) {
-      // Only automatically placed blocks follow structural changes. Dragged blocks
-      // retain their user's positions; camera/layout updates never dirty the strategy.
-      layout.nodes[id] = { ...next };
-    }
-  }
 }
 
 function scheduleSectionKey(key) {
@@ -3440,18 +3278,9 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
     ...(hasLiveSellConditions ? ["수익률 · 실시간 현재가"] : []),
     ...(hasBarSellConditions ? ["차트 값 · 각 조건의 봉 설정"] : []),
   ];
-  const plan = managedConditionGraphPlan(settings);
-  reflowUnmovedBlockNodes(plan);
-  state.blockGraphPlan = plan;
   const world = document.createElement("div");
-  world.className = "block-canvas-world";
-  world.style.width = `${plan.size.width}px`;
-  world.style.height = `${plan.size.height}px`;
-  const edgeLayer = createBlockEdgeLayer();
-  edgeLayer.style.width = `${plan.size.width}px`;
-  edgeLayer.style.height = `${plan.size.height}px`;
-  world.append(edgeLayer);
-  Object.values(plan.labels).forEach(label => createGraphSectionLabel(world, label.text, label.x, label.y));
+  world.className = "block-canvas-world composer-tree-world";
+  state.blockGraphPlan = null;
   const money = value => `${Number(value || 0).toLocaleString("ko-KR")}원`;
   const valueOf = key => fields.get(key)?.value;
   const nodes = [
@@ -3520,22 +3349,23 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
   }));
   const nodeIds = new Set(nodes.map(node => node.id));
   if (state.blockSelectedNode == null || (state.blockSelectedNode && !nodeIds.has(state.blockSelectedNode))) {
-    state.blockSelectedNode = "connection";
+    state.blockSelectedNode = false;
   }
-  for (const definition of nodes) {
-    const node = createComposerGraphNode(definition, running);
-    const point = blockNodePosition(definition.id);
-    node.style.width = `${definition.width}px`;
-    node.style.left = `${point.x}px`;
-    node.style.top = `${point.y}px`;
-    world.append(node);
-    bindBlockNodeDrag(node, world, edgeLayer);
-  }
+  const definitions = new Map(nodes.map(node => [node.id, node]));
+  const tree = document.createElement("div");
+  tree.className = "composer-fixed-tree";
+  tree.setAttribute("role", "tree");
+  tree.setAttribute("aria-label", "전략 실행 계층");
+  tree.append(renderComposerTreeBranch(buildComposerTreeModel(settings), definitions, running));
+  world.append(tree);
   elements.blockCanvas.append(world);
   bindBlockCanvasPan(world);
   applyBlockViewport(world);
-  state.blockGraphRedraw = () => drawBlockGraphEdges(world, edgeLayer);
-  window.requestAnimationFrame(state.blockGraphRedraw);
+  state.blockGraphRedraw = null;
+  window.requestAnimationFrame(() => {
+    world.style.width = `${Math.max(1120, tree.scrollWidth + tree.offsetLeft + 180)}px`;
+    world.style.height = `${Math.max(1100, tree.scrollHeight + tree.offsetTop + 180)}px`;
+  });
   const selected = nodes.find(node => node.id === state.blockSelectedNode);
   const inspector = createComposerInspector(selected, running, flows.length);
   if (inspector) {
@@ -3559,7 +3389,7 @@ function renderStrategyBlocks() {
   elements.blockCanvas.classList.remove("schedule-mode", "graph-mode", "composer-mode", "panning");
   elements.strategyBlocks.classList.remove("managed-schedule", "managed-composer");
   elements.strategyBlocks.classList.toggle("managed-composer", managed);
-  elements.blockCanvas.setAttribute("aria-label", managed ? "이동 가능한 전략 블록 캔버스" : "블록 전략 캔버스");
+  elements.blockCanvas.setAttribute("aria-label", managed ? "전체 구성을 이동하고 확대할 수 있는 전략 트리 캔버스" : "블록 전략 캔버스");
   if (managed) {
     elements.blockCanvas.classList.add("graph-mode", "composer-mode");
     elements.blockCanvas.scrollTop = 0;
