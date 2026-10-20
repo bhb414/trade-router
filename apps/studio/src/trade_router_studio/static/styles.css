@@ -3003,6 +3003,7 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-tree-rule-add {
   width: max-content;
   max-width: 100%;
+  position: relative;
   padding: 0;
   border: 0;
   background: transparent;
@@ -3022,6 +3023,22 @@ button.composer-tree-add-row { cursor: pointer; }
   cursor: pointer;
   list-style: none;
 }
+.composer-rule-toolbar-condition { padding-top: 2px; padding-bottom: 0; }
+.composer-rule-add-trigger {
+  opacity: 0;
+  pointer-events: none;
+}
+.composer-rule-toolbar:hover > .composer-tree-rule-add > .composer-rule-add-trigger,
+.composer-rule-toolbar:focus-within > .composer-tree-rule-add > .composer-rule-add-trigger,
+.composer-rule-branch > .composer-tree-row:hover ~ .composer-tree-children > .composer-rule-toolbar-condition > .composer-tree-rule-add > .composer-rule-add-trigger,
+.composer-tree-rule-add[open] > .composer-rule-add-trigger {
+  opacity: 1;
+  pointer-events: auto;
+}
+.composer-tree-rule-add > summary:focus-visible {
+  outline: 2px solid #4f80cc;
+  outline-offset: 2px;
+}
 .composer-tree-rule-add > summary::-webkit-details-marker { display: none; }
 .composer-tree-rule-add > summary:hover {
   border-color: #8fa8d0;
@@ -3029,15 +3046,26 @@ button.composer-tree-add-row { cursor: pointer; }
   color: #315f9d;
 }
 .composer-tree-rule-add-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+  width: max-content;
+  min-width: 210px;
+  max-width: min(360px, calc(100vw - 64px));
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 0;
+  z-index: 18;
+  display: grid;
+  gap: 4px;
+  margin: 0;
   padding: 6px;
   border: 1px solid #dce2e9;
   border-radius: 7px;
   background: rgba(255, 255, 255, .94);
   box-shadow: 0 4px 12px rgba(31, 41, 55, .08);
+  overflow-y: auto;
+}
+.composer-tree-rule-add.opens-up > .composer-tree-rule-add-options {
+  top: auto;
+  bottom: calc(100% + 5px);
 }
 .composer-tree-rule-add-options button {
   min-height: 29px;
@@ -3048,9 +3076,16 @@ button.composer-tree-add-row { cursor: pointer; }
   color: #556378;
   font-size: 10px;
   font-weight: 650;
+  text-align: left;
   cursor: pointer;
 }
 .composer-tree-rule-add-options button:hover:not(:disabled) { border-color: #8fa8d0; color: #315f9d; }
+@media (hover: none), (pointer: coarse) {
+  .composer-rule-add-trigger {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
 .composer-rule-draggable {
   position: relative;
 }
@@ -3078,6 +3113,24 @@ button.composer-tree-add-row { cursor: pointer; }
 }
 .composer-rule-draggable.rule-drag-source {
   opacity: .42;
+}
+.composer-fixed-tree.composer-rule-drag-ghost {
+  min-width: 0;
+  position: fixed;
+  z-index: 90;
+  display: block;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  border-radius: 5px;
+  opacity: .78;
+  box-shadow: 0 8px 24px rgba(27, 47, 77, .2), 0 1px 5px rgba(27, 47, 77, .15);
+  pointer-events: none;
+}
+.composer-rule-drag-ghost * { pointer-events: none; }
+.composer-rule-drag-ghost > .composer-tree-row {
+  border-color: #86a7d7;
+  box-shadow: none;
 }
 .composer-rule-draggable.rule-drop-before::before,
 .composer-rule-draggable.rule-drop-after::after {

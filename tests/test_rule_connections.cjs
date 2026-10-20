@@ -214,17 +214,41 @@ test("moving the last child prunes empty actionless ancestors but rejects orphan
   assert.deepEqual(original, before);
 });
 
-test("moving rejects self, descendants, the root, and conflicting AND branch actions", () => {
+test("moving onto itself is a no-op while descendants, the root and conflicting AND actions remain rejected", () => {
   const original = logic("ANY", [
     condition("A", action("order-a")),
     logic("ALL", [condition("B", action("order-b")), condition("C")], null, "G"),
   ]);
   const before = structuredClone(original);
-  assert.match(context.rewriteBlockRuleMove(original, "A", "A", "after").error, /자기 자신/);
+  for (const placement of ["before", "after", "inside"]) {
+    const unchanged = context.rewriteBlockRuleMove(original, "A", "A", placement);
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.error, "");
+    assert.equal(unchanged.tree, null);
+  }
   assert.match(context.rewriteBlockRuleMove(original, "G", "B", "before").error, /하위 단계/);
   assert.equal(context.rewriteBlockRuleMove(original, "root", "G", "inside").tree, null);
   assert.match(context.rewriteBlockRuleMove(original, "A", "G", "inside").error, /각각 주문/);
   assert.deepEqual(original, before);
+});
+
+test("same-position moves leave the original tree and dirty state untouched", () => {
+  const original = logic("ANY", [condition("A"), condition("B"), condition("C")]);
+  let commits = 0;
+  context.state = { blockPackage: { settings: { buy_rule_tree: original } }, blockSelectedNode: "buy-rule-B" };
+  context.selectedState = () => ({ running: false });
+  context.blockRuleTree = () => context.state.blockPackage.settings.buy_rule_tree;
+  context.commitBlockRuleMutation = () => { commits += 1; };
+  context.notify = message => assert.fail(message);
+  for (const [source, target, placement] of [
+    ["A", "A", "before"], ["B", "B", "after"], ["C", "C", "inside"],
+    ["A", "B", "before"], ["B", "A", "after"], ["C", "root", "inside"],
+  ]) {
+    assert.equal(context.moveBlockRuleNode("buy", null, source, target, placement), false);
+    assert.equal(context.state.blockPackage.settings.buy_rule_tree, original);
+    assert.equal(context.state.blockSelectedNode, "buy-rule-B");
+  }
+  assert.equal(commits, 0);
 });
 
 test("moves enforce final depth, child limit, and SELL condition requirement", () => {

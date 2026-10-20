@@ -2186,11 +2186,46 @@ function clearComposerRuleDropMarks() {
     });
 }
 
+function createComposerRuleDragGhost(element, origin) {
+  const bounds = element.getBoundingClientRect();
+  const width = element.offsetWidth || bounds.width;
+  const height = element.offsetHeight || bounds.height;
+  const ghost = document.createElement("div");
+  ghost.className = "composer-rule-drag-ghost composer-fixed-tree";
+  ghost.setAttribute("aria-hidden", "true");
+  ghost.inert = true;
+  // The source remains in the tree. The fixed overlay mirrors its zoomed size
+  // without participating in layout or becoming a candidate drop target.
+  Object.assign(ghost.style, {
+    position: "fixed", pointerEvents: "none", width: `${width}px`, height: `${height}px`,
+    transformOrigin: "top left",
+    transform: `scale(${width ? bounds.width / width : 1}, ${height ? bounds.height / height : 1})`,
+  });
+  const preview = element.cloneNode(true);
+  preview.classList.remove(
+    "selected", "rule-drag-source", "rule-drop-before", "rule-drop-after", "rule-drop-inside", "rule-drop-invalid",
+  );
+  for (const node of [preview, ...preview.querySelectorAll("*")]) {
+    ["id", "tabindex", "data-block-node", "data-rule-drop-target", "data-rule-drop-error"].forEach(attribute => node.removeAttribute(attribute));
+    node.draggable = false;
+  }
+  ghost.append(preview);
+  document.body.append(ghost);
+  return { element: ghost, grabX: origin.x - bounds.left, grabY: origin.y - bounds.top };
+}
+
+function updateComposerRuleDragGhost(ghost, clientX, clientY) {
+  if (!ghost) return;
+  ghost.element.style.left = `${clientX - ghost.grabX}px`;
+  ghost.element.style.top = `${clientY - ghost.grabY}px`;
+}
+
 function finishComposerRuleDrag() {
   const session = state.blockRulePointerDrag;
   const wasDragging = Boolean(state.blockRuleDrag);
   state.blockRulePointerDrag = null;
   state.blockRuleDrag = null;
+  session?.ghost?.element.remove();
   session?.cleanup();
   if (wasDragging) state.blockRuleDragClickUntil = Date.now() + 300;
   elements.blockCanvas.classList.remove("rule-dragging");
@@ -2217,7 +2252,7 @@ function bindComposerRuleDrag(element, reference, disabled) {
     };
     const origin = { x: event.clientX, y: event.clientY };
     const pointerId = event.pointerId;
-    const session = { started: false, cleanup: null };
+    const session = { started: false, cleanup: null, ghost: null };
     const move = moveEvent => {
       if (moveEvent.pointerId !== pointerId || state.blockRulePointerDrag !== session) return;
       if (selectedState()?.running || source.strategy !== state.selected) {
@@ -2230,9 +2265,11 @@ function bindComposerRuleDrag(element, reference, disabled) {
         state.blockRuleDrag = source;
         element.classList.add("rule-drag-source");
         elements.blockCanvas.classList.add("rule-dragging");
+        session.ghost = createComposerRuleDragGhost(element, origin);
       }
       moveEvent.preventDefault();
       moveEvent.stopPropagation();
+      updateComposerRuleDragGhost(session.ghost, moveEvent.clientX, moveEvent.clientY);
       updateComposerRulePointerDrop(moveEvent.clientX, moveEvent.clientY);
     };
     const end = endEvent => {
@@ -2291,7 +2328,7 @@ function composerRulePointerDropAt(clientX, clientY) {
 function updateComposerRulePointerDrop(clientX, clientY) {
   clearComposerRuleDropMarks();
   const drop = composerRulePointerDropAt(clientX, clientY);
-  if (!drop) return;
+  if (!drop || drop.plan.unchanged) return;
   drop.target.classList.add(drop.plan.error ? "rule-drop-invalid" : `rule-drop-${drop.placement}`);
   if (drop.plan.error) drop.target.dataset.ruleDropError = drop.plan.error;
 }
@@ -2408,38 +2445,6 @@ function createComposerInspector(definition, running, flowCounts = {}) {
   return inspector;
 }
 
-function createAttachedRuleActionEditor(kind, flowId, node, disabled) {
-  const section = document.createElement("section");
-  section.className = "rule-attached-action";
-  const heading = document.createElement("div");
-  heading.className = "rule-editor-section-heading";
-  const title = document.createElement("strong");
-  title.textContent = "통과하면";
-  const hint = document.createElement("span");
-  hint.textContent = node.action ? "여기서 주문 실행" : "주문 없이 다음 판단으로";
-  heading.append(title, hint);
-  section.append(heading);
-  if (node.action) {
-    const summary = document.createElement("div");
-    summary.className = `rule-action-summary ${kind}`;
-    const side = document.createElement("strong");
-    side.textContent = kind === "sell" ? "매도 주문" : "매수 주문";
-    const order = document.createElement("span");
-    order.textContent = node.action.order_type === "LIMIT" ? "현재가 지정가" : "시장가";
-    summary.append(side, order);
-    section.append(summary);
-  } else {
-    const add = document.createElement("button");
-    add.type = "button";
-    add.className = "button quiet compact rule-add-action";
-    add.textContent = `+ ${kind === "sell" ? "매도" : "매수"} 행동 추가`;
-    add.disabled = disabled;
-    add.addEventListener("click", () => addBlockRuleAction(kind, flowId, node.id));
-    section.append(add);
-  }
-  return section;
-}
-
 function createBlockRuleNodeEditor(reference, disabled) {
   const found = findBlockRuleNode(reference.kind, reference.flowId, reference.nodeId);
   const node = found?.node;
@@ -2491,7 +2496,6 @@ function createBlockRuleNodeEditor(reference, disabled) {
   } else {
     wrap.append(createConditionFormulaEditor(reference.kind, node, disabled));
   }
-  wrap.append(createAttachedRuleActionEditor(reference.kind, reference.flowId, node, disabled));
   if (!reference.isRoot) {
     wrap.append(createBlockRuleMoveControls(reference, found, disabled));
     const group = document.createElement("button");
@@ -3295,11 +3299,17 @@ function rewriteBlockRuleMove(root, sourceId, targetId, placement, side = "BUY")
     if (node.id === targetId) target = { node, parent, index };
   });
   if (!source?.parent || !target) return rejected("이동할 조건과 위치를 다시 선택하세요.");
-  if (source.node === target.node || blockRuleNodePath(source.node, targetId)) {
-    return rejected("조건을 자기 자신이나 자신의 하위 단계로 이동할 수 없습니다.");
+  if (source.node === target.node) return { tree: null, error: "", unchanged: true };
+  if (blockRuleNodePath(source.node, targetId)) {
+    return rejected("조건을 자신의 하위 단계로 이동할 수 없습니다.");
   }
   const destination = placement === "inside" ? target.node : target.parent;
   if (destination?.kind !== "logic") return rejected("조건이 들어갈 단계를 선택하세요.");
+  if (destination === source.parent && (
+    (placement === "inside" && source.index === destination.children.length - 1)
+    || (placement === "before" && target.index === source.index + 1)
+    || (placement === "after" && target.index === source.index - 1)
+  )) return { tree: null, error: "", unchanged: true };
   source.parent.children.splice(source.index, 1);
   const insertIndex = placement === "inside"
     ? destination.children.length
@@ -3352,11 +3362,17 @@ function moveBlockRuleNode(kind, flowId, sourceId, targetId, placement, selectMo
   return true;
 }
 
-function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL") {
+function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL", afterId = null) {
+  if (selectedState()?.running) return;
   const parentFound = findBlockRuleNode(kind, flowId, parentId);
   const parent = parentFound?.node;
   const root = blockRuleTree(kind, flowId);
   if (parent?.kind !== "logic") return;
+  const insertAfterIndex = afterId == null ? -1 : (parent.children || []).findIndex(child => child.id === afterId);
+  if (afterId != null && insertAfterIndex < 0) {
+    notify("조건 위치가 변경되었습니다. 추가할 위치를 다시 선택하세요.", true);
+    return;
+  }
   if ((parent.children || []).length >= 20) {
     notify("한 조건 묶음에는 자식을 20개까지 넣을 수 있습니다.", true);
     return;
@@ -3374,7 +3390,8 @@ function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL") 
   const child = childKind === "logic"
     ? newBlockRuleLogic(kind, operator, [newBlockRuleCondition(kind)], false)
     : newBlockRuleCondition(kind);
-  parent.children.push(child);
+  if (afterId == null) parent.children.push(child);
+  else parent.children.splice(insertAfterIndex + 1, 0, child);
   state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${child.id}`;
   commitBlockRuleMutation();
 }
@@ -5077,7 +5094,7 @@ function ruleComposerActionId(kind, flowId, actionId) {
   return `${blockFlowNodePrefix(kind, flowId)}-action-${actionId}`;
 }
 
-function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, totalCount = null) {
+function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, totalCount = null, parent = null) {
   const ruleCount = totalCount ?? blockRuleNodeCount(node);
   const children = [];
   if (node.kind === "logic") {
@@ -5093,7 +5110,7 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
           operator: node.operator || "ALL",
         });
       }
-      children.push(buildComposerRuleBranch(kind, flowId, child, false, depth + 1, ruleCount));
+      children.push(buildComposerRuleBranch(kind, flowId, child, false, depth + 1, ruleCount, node));
     });
     children.push({
       kind: "rule-add",
@@ -5101,6 +5118,10 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
       ruleKind: kind,
       flowId,
       parentId: node.id,
+      ownerId: node.id,
+      ownerKind: "logic",
+      hasAction: Boolean(node.action),
+      empty: !(node.children || []).length,
       nodeId: ruleComposerNodeId(kind, flowId, node.id),
       isRoot,
       depth,
@@ -5115,7 +5136,26 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
       ruleKind: kind,
       flowId,
       ownerId: node.id,
+      ownerKind: node.kind,
       children: [{ kind: "node", nodeId: ruleComposerActionId(kind, flowId, node.action.id) }],
+    });
+  }
+  if (node.kind === "condition" && parent) {
+    children.push({
+      kind: "rule-add",
+      id: `${node.id}-add-block`,
+      ruleKind: kind,
+      flowId,
+      parentId: parent.id,
+      ownerId: node.id,
+      ownerKind: "condition",
+      hasAction: Boolean(node.action),
+      afterId: node.id,
+      nodeId: ruleComposerNodeId(kind, flowId, node.id),
+      isRoot: false,
+      depth: Math.max(0, depth - 1),
+      totalCount: ruleCount,
+      disabled: (parent.children || []).length >= 20,
     });
   }
   return {
@@ -5260,13 +5300,27 @@ function createComposerLogicConnector(entry, running) {
 }
 
 function createComposerRuleAddMenu(entry, running) {
+  const canvas = elements.blockCanvas;
+  if (!canvas._ruleAddMenuDismissHandler) {
+    canvas._ruleAddMenuDismissHandler = event => {
+      canvas.querySelectorAll(".composer-tree-rule-add[open]").forEach(openMenu => {
+        if (!openMenu.contains(event.target)) openMenu.open = false;
+      });
+    };
+    canvas.addEventListener("pointerdown", canvas._ruleAddMenuDismissHandler, true);
+  }
   const toolbar = document.createElement("div");
-  toolbar.className = "composer-rule-toolbar";
+  const conditionScope = entry.ownerKind === "condition";
+  toolbar.className = `composer-rule-toolbar composer-rule-toolbar-${conditionScope ? "condition" : "group"}`;
+  toolbar.classList.toggle("composer-rule-toolbar-empty", Boolean(entry.empty));
+  toolbar.dataset.ruleOwnerId = entry.ownerId;
+  toolbar.dataset.ownerKind = entry.ownerKind;
   const menu = document.createElement("details");
   menu.className = "composer-tree-rule-add";
   const summary = document.createElement("summary");
-  summary.textContent = "+ 조건 추가";
-  summary.setAttribute("aria-label", "조건식 또는 하위 계층 추가 메뉴");
+  summary.className = "composer-rule-add-trigger";
+  summary.textContent = "+ 블록 추가";
+  summary.setAttribute("aria-label", `${conditionScope ? "이 조건 다음" : "이 계층"} 블록 추가 메뉴`);
   menu.append(summary);
   const options = document.createElement("div");
   options.className = "composer-tree-rule-add-options";
@@ -5282,13 +5336,57 @@ function createComposerRuleAddMenu(entry, running) {
       || Number(entry.depth || 0) + addedDepth > 8;
     button.addEventListener("click", event => {
       event.stopPropagation();
-      addBlockRuleChild(entry.ruleKind, entry.flowId, entry.parentId, childKind, operator);
+      addBlockRuleChild(entry.ruleKind, entry.flowId, entry.parentId, childKind, operator, entry.afterId || null);
     });
     options.append(button);
   };
-  make("+ 조건식", "condition");
+  make(conditionScope ? "다음 조건식" : "조건식", "condition");
   make("하위 계층 추가", "logic", "ALL");
+  const order = document.createElement("button");
+  order.type = "button";
+  order.className = "composer-rule-order-add";
+  const orderLabel = entry.ruleKind === "sell" ? "매도 주문" : "매수 주문";
+  const owner = findBlockRuleNode(entry.ruleKind, entry.flowId, entry.ownerId)?.node;
+  const exists = Boolean(owner?.action);
+  const emptySell = entry.ruleKind === "sell"
+    && owner?.kind === "logic" && !blockRuleConditionNodes(owner).length;
+  const conflict = blockRuleActionConflict(blockRuleTree(entry.ruleKind, entry.flowId), entry.ownerId);
+  order.textContent = exists ? `${orderLabel} · 이미 추가됨` : orderLabel;
+  order.disabled = running || !owner || exists || emptySell || conflict;
+  order.title = exists ? "주문 카드를 눌러 주문 방식을 편집하세요."
+    : emptySell ? "매도 주문을 추가하려면 조건식이 하나 이상 필요합니다."
+      : conflict ? "AND 경로에 다른 주문이 있습니다. 공통 계층에 주문을 추가하세요."
+        : `${conditionScope ? "이 조건이" : "이 계층이"} 통과했을 때 실행할 ${orderLabel}`;
+  order.setAttribute("aria-label", `${order.textContent} · ${conditionScope ? "이 조건에 연결" : "이 계층에 연결"}`);
+  order.addEventListener("click", event => {
+    event.stopPropagation();
+    addBlockRuleAction(entry.ruleKind, entry.flowId, entry.ownerId);
+  });
+  options.append(order);
   menu.append(options);
+  menu.addEventListener("toggle", () => {
+    if (!menu.open) return;
+    menu.classList.remove("opens-up");
+    options.style.maxHeight = "";
+    const canvasBounds = canvas.getBoundingClientRect();
+    const triggerBounds = summary.getBoundingClientRect();
+    const optionsBounds = options.getBoundingClientRect();
+    const lowerSpace = Math.min(window.innerHeight, canvasBounds.bottom) - triggerBounds.bottom - 8;
+    const upperSpace = triggerBounds.top - Math.max(0, canvasBounds.top) - 8;
+    const opensUp = optionsBounds.height > lowerSpace && upperSpace > lowerSpace;
+    const scale = options.offsetHeight > 0 ? optionsBounds.height / options.offsetHeight : 1;
+    menu.classList.toggle("opens-up", opensUp);
+    options.style.maxHeight = `${Math.max(40, (opensUp ? upperSpace : lowerSpace) / Math.max(.2, scale))}px`;
+  });
+  menu.addEventListener("keydown", event => {
+    if (event.key !== "Escape" || !menu.open) return;
+    event.preventDefault();
+    event.stopPropagation();
+    menu.open = false;
+    summary.focus({ preventScroll: true });
+  });
+  toolbar.append(menu);
+  if (conditionScope) return toolbar;
   const settings = document.createElement("button");
   settings.type = "button";
   settings.className = "composer-rule-settings";
@@ -5303,7 +5401,7 @@ function createComposerRuleAddMenu(entry, running) {
     renderStrategyBlocks();
     focusComposerInspector();
   });
-  toolbar.append(menu, settings);
+  toolbar.append(settings);
   const dropEnd = document.createElement("div");
   dropEnd.className = "composer-rule-drop-end";
   dropEnd.textContent = entry.isRoot ? "이 흐름의 마지막 조건으로 이동" : "이 단계의 마지막 조건으로 이동";
@@ -5317,10 +5415,13 @@ function createComposerRuleAddMenu(entry, running) {
 
 function createComposerThenBranch(entry, definitions, running) {
   const branch = document.createElement("div");
-  branch.className = "composer-then-branch";
+  const conditionScope = entry.ownerKind === "condition";
+  branch.className = `composer-then-branch ${conditionScope ? "composer-condition-action" : "composer-group-action"}`;
+  branch.dataset.ruleActionOwner = entry.ownerId;
+  branch.setAttribute("aria-label", `${conditionScope ? "이 조건" : "이 계층"} 통과 시 주문`);
   const label = document.createElement("span");
   label.className = "composer-then-label";
-  label.textContent = "→ 실행";
+  label.textContent = conditionScope ? "통과하면" : "계층 통과 시";
   branch.append(label);
   const children = document.createElement("div");
   children.className = "composer-then-children";
@@ -5369,6 +5470,7 @@ function renderComposerTreeBranch(entry, definitions, running) {
   const branch = document.createElement(entry.kind === "section" ? "section" : "div");
   branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}${entry.kind === "rule-node" ? " composer-rule-branch" : ""}`;
   if (entry.kind === "rule-node") {
+    branch.dataset.ruleOwnerId = entry.ruleNodeId;
     branch.classList.add(entry.isRoot ? "composer-rule-root" : "composer-rule-nested");
     branch.classList.toggle("composer-rule-group", entry.isLogic);
     if (entry.isLogic) branch.setAttribute("aria-label", entry.isRoot ? "전체 조건" : "하위 계층 조건");
