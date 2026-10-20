@@ -401,6 +401,35 @@ class BlockBuyFlow(BaseModel):
         return self
 
 
+class BlockSellFlow(BaseModel):
+    """A timed exit branch; positions, orders, and close handling stay shared."""
+
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
+    name: str = Field(default="매도 흐름", min_length=1, max_length=80)
+    sell_scan_seconds: int = Field(default=30, ge=1, le=86_400)
+    sell_start_time: str = "09:00"
+    sell_end_time: str = "15:20"
+    sell_condition_groups: list[BlockConditionGroup] = Field(
+        min_length=1, max_length=8
+    )
+
+    _validate_times = field_validator("sell_start_time", "sell_end_time")(
+        _validate_clock
+    )
+
+    @model_validator(mode="after")
+    def validate_flow(self) -> "BlockSellFlow":
+        if time.fromisoformat(self.sell_start_time) >= time.fromisoformat(
+            self.sell_end_time
+        ):
+            raise ValueError("매도 흐름의 시작 시간은 종료 시간보다 빨라야 합니다.")
+        identifiers = [group.id for group in self.sell_condition_groups]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("같은 매도 흐름의 조건 블록 ID는 서로 달라야 합니다.")
+        return self
+
+
 class ConditionBollingerBlockSettings(BaseModel):
     """Editable values for the router-owned condition/Bollinger workflow."""
 
@@ -439,6 +468,7 @@ class ConditionBollingerBlockSettings(BaseModel):
     buy_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
     buy_flows: list[BlockBuyFlow] = Field(default_factory=list, max_length=8)
     sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, min_length=1, max_length=8)
+    sell_flows: list[BlockSellFlow] = Field(default_factory=list, max_length=8)
     buy_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     sell_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     buy_scan_seconds: int = Field(ge=1, le=86_400)
@@ -524,9 +554,17 @@ class ConditionBollingerBlockSettings(BaseModel):
         flow_identifiers = [flow.id for flow in self.buy_flows]
         if len(flow_identifiers) != len(set(flow_identifiers)):
             raise ValueError("매수 흐름 ID는 서로 달라야 합니다.")
+        sell_flow_identifiers = [flow.id for flow in self.sell_flows]
+        if len(sell_flow_identifiers) != len(set(sell_flow_identifiers)):
+            raise ValueError("매도 흐름 ID는 서로 달라야 합니다.")
         all_buy_groups = [*self.buy_condition_groups, *(
             group for flow in self.buy_flows for group in flow.buy_condition_groups
         )]
+        effective_sell_groups = (
+            [group for flow in self.sell_flows for group in flow.sell_condition_groups]
+            if self.sell_flows
+            else list(self.sell_condition_groups)
+        )
         for group in all_buy_groups:
             for condition in group.conditions:
                 if any(
@@ -539,7 +577,7 @@ class ConditionBollingerBlockSettings(BaseModel):
         identifiers = [group.id for group in (*self.buy_condition_groups, *self.sell_condition_groups)]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("매수·매도 조건 블록 ID는 서로 달라야 합니다.")
-        for group in (*all_buy_groups, *self.sell_condition_groups):
+        for group in (*all_buy_groups, *effective_sell_groups):
             for condition in group.conditions:
                 for source in _condition_metric_leaves(condition):
                     metric = source.metric
@@ -768,6 +806,7 @@ SELL_CONDITIONS_JSON = __SELL_CONDITIONS_JSON__
 BUY_CONDITION_GROUPS_JSON = __BUY_CONDITION_GROUPS_JSON__
 BUY_FLOWS_JSON = __BUY_FLOWS_JSON__
 SELL_CONDITION_GROUPS_JSON = __SELL_CONDITION_GROUPS_JSON__
+SELL_FLOWS_JSON = __SELL_FLOWS_JSON__
 BUY_ORDER_TYPE = __BUY_ORDER_TYPE__
 SELL_ORDER_TYPE = __SELL_ORDER_TYPE__
 BUY_SCAN_SECONDS = __BUY_SCAN_SECONDS__
@@ -804,6 +843,13 @@ BUY_FLOW_SCHEDULES = {
     (f"condition-scan-{flow['id']}" if CONFIGURED_BUY_FLOWS else "condition-scan"): flow
     for flow in BUY_FLOWS
 }
+CONFIGURED_SELL_FLOWS = tuple(json.loads(SELL_FLOWS_JSON))
+SELL_FLOWS = CONFIGURED_SELL_FLOWS or ({
+    "id": "default", "name": "매도 흐름",
+    "sell_scan_seconds": BUY_SCAN_SECONDS,
+    "sell_start_time": SELL_START_TIME, "sell_end_time": SELL_END_TIME,
+    "sell_condition_groups": SELL_CONDITION_GROUPS,
+},)
 BAR_METRICS = {
     "open", "high", "low", "close", "volume",
     "heikin_open", "heikin_high", "heikin_low", "heikin_close",
@@ -838,7 +884,10 @@ def _condition_metric_names(condition):
 
 NEEDS_BARS = any(
     metric in BAR_METRICS
-    for groups in (*[flow["buy_condition_groups"] for flow in BUY_FLOWS], SELL_CONDITION_GROUPS)
+    for groups in (
+        *[flow["buy_condition_groups"] for flow in BUY_FLOWS],
+        *[flow["sell_condition_groups"] for flow in SELL_FLOWS],
+    )
     for group in groups
     for condition in group["conditions"]
     for metric in _condition_metric_names(condition)
@@ -882,9 +931,31 @@ class ManagedBlockStrategy(Strategy):
         return stored
 
     @staticmethod
-    def _is_non_retryable_buy_rejection(message):
+    def _is_deterministic_aftermarket_rejection(message):
         text = str(message or "")
-        return "APBK1943" in text or "시장가호가불가" in text
+        compact = "".join(text.split())
+        return (
+            "APBK3061" in text
+            or "애프터지정가/최유리/최우선주문만가능" in compact
+        )
+
+    @classmethod
+    def _is_non_retryable_buy_rejection(cls, message):
+        text = str(message or "")
+        compact = "".join(text.split())
+        return (
+            "APBK1943" in text
+            or "시장가호가불가" in compact
+            or cls._is_deterministic_aftermarket_rejection(message)
+        )
+
+    @classmethod
+    def _is_non_retryable_sell_rejection(cls, message):
+        # APBK1943 is a transient/price-state market-order rejection for sells.
+        # The user's no-retry choice applies to rejected buys only.  A sell is
+        # suppressed only when the broker deterministically rejects the order
+        # type for the after-market session.
+        return cls._is_deterministic_aftermarket_rejection(message)
 
     @classmethod
     def _exclude_buy_for_day(cls, ctx, at, code, message):
@@ -894,6 +965,80 @@ class ManagedBlockStrategy(Strategy):
             "excluded_at": at.isoformat(),
         }
         ctx.state.set("daily_buy_exclusions", exclusions)
+
+    @staticmethod
+    def _order_session(at):
+        local_at = at.astimezone(SEOUL) if at.tzinfo is not None else at
+        local_time = local_at.time().replace(tzinfo=None)
+        if time(8, 0) <= local_time < time(8, 50):
+            return "NXT_PRE"
+        if time(9, 0) <= local_time < time(15, 30):
+            return "REGULAR"
+        if time(15, 30) <= local_time < time(20, 0):
+            return "NXT_AFTER"
+        return "CLOSED"
+
+    @classmethod
+    def _order_session_block_reason(cls, at, route, order_type):
+        if cls._order_session(at) != "NXT_AFTER":
+            return None
+        if route == "KRX":
+            if order_type == "MARKET":
+                return (
+                    "애프터마켓에서는 현재 결정된 KRX 경로와 시장가 주문을 사용할 수 없습니다. "
+                    "NXT 거래 가능 여부를 확인하고 NXT 또는 SOR 경로의 지정가로 설정해야 합니다."
+                )
+            return (
+                "애프터마켓에서는 현재 결정된 KRX 주문 경로를 사용할 수 없습니다. "
+                "NXT 거래 가능 여부를 확인하고 NXT 또는 SOR 경로로 설정해야 합니다."
+            )
+        if order_type == "MARKET":
+            return (
+                f"애프터마켓에서는 {route} 시장가 주문을 제출할 수 없습니다. "
+                "주문 방식을 지정가로 설정해야 합니다."
+            )
+        return None
+
+    @staticmethod
+    def _order_suppressions_for_day(ctx, at):
+        local_at = at.astimezone(SEOUL) if at.tzinfo is not None else at
+        business_date = local_at.date().isoformat()
+        stored = ctx.state.get("daily_order_suppressions", {})
+        if not isinstance(stored, dict) or stored.get("date") != business_date:
+            stored = {"date": business_date, "orders": {}}
+            ctx.state.set("daily_order_suppressions", stored)
+        else:
+            stored = {
+                "date": business_date,
+                "orders": dict(stored.get("orders", {})),
+            }
+        return stored
+
+    @classmethod
+    def _order_suppression_key(cls, at, code, side, order_type, purpose="CONDITION"):
+        return f"{cls._order_session(at)}:{purpose}:{side}:{order_type}:{code}"
+
+    @classmethod
+    def _order_attempt_is_suppressed(
+        cls, ctx, at, code, side, order_type, purpose="CONDITION"
+    ):
+        stored = cls._order_suppressions_for_day(ctx, at)
+        key = cls._order_suppression_key(at, code, side, order_type, purpose)
+        return key in stored["orders"]
+
+    @classmethod
+    def _suppress_order_for_day(
+        cls, ctx, at, code, side, order_type, message, purpose="CONDITION"
+    ):
+        stored = cls._order_suppressions_for_day(ctx, at)
+        key = cls._order_suppression_key(at, code, side, order_type, purpose)
+        is_new = key not in stored["orders"]
+        stored["orders"][key] = {
+            "reason": str(message or "주문을 다시 제출할 수 없는 상태"),
+            "suppressed_at": at.isoformat(),
+        }
+        ctx.state.set("daily_order_suppressions", stored)
+        return is_new
 
     @staticmethod
     def _order_routes_for_day(ctx, at):
@@ -911,11 +1056,19 @@ class ManagedBlockStrategy(Strategy):
         return stored
 
     @classmethod
+    def _order_route_cache_key(cls, code, at):
+        # NXT availability changes between the pre-market, regular market, and
+        # after-market sessions.  A KRX fallback observed in one session must
+        # not be reused for the rest of the day.
+        return f"{cls._order_session(at)}:{code}"
+
+    @classmethod
     async def _effective_order_route(cls, ctx, code, at, *, current_price=None):
         if ORDER_ROUTE != "SOR":
             return ORDER_ROUTE
         route_state = cls._order_routes_for_day(ctx, at)
-        cached = route_state["routes"].get(code)
+        cache_key = cls._order_route_cache_key(code, at)
+        cached = route_state["routes"].get(cache_key)
         if cached in {"SOR", "KRX"}:
             return cached
 
@@ -946,7 +1099,7 @@ class ManagedBlockStrategy(Strategy):
             if krx_usable:
                 effective = "KRX"
 
-        route_state["routes"][code] = effective
+        route_state["routes"][cache_key] = effective
         ctx.state.set("daily_order_routes", route_state)
         if effective == "KRX":
             ctx.log.info(
@@ -1540,8 +1693,8 @@ class ManagedBlockStrategy(Strategy):
             condition, {}, average_price, current_price=current_price,
         )
 
-    def _matched_live_profit_condition(self, current_price, average_price):
-        for group in SELL_CONDITION_GROUPS:
+    def _matched_live_profit_condition(self, groups, current_price, average_price):
+        for group in groups:
             for condition in group["conditions"]:
                 if self._is_live_profit_condition(condition) and self._live_profit_match(
                     condition, current_price, average_price
@@ -1614,9 +1767,31 @@ class ManagedBlockStrategy(Strategy):
         return tracked, positions, {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
 
     @staticmethod
-    def _sell_window_is_open(at):
+    def _sell_flow_is_active(flow, at):
         local_time = at.astimezone(SEOUL).time().replace(tzinfo=None)
-        return time.fromisoformat(SELL_START_TIME) <= local_time < time.fromisoformat(SELL_END_TIME)
+        return (
+            time.fromisoformat(flow["sell_start_time"])
+            <= local_time
+            < time.fromisoformat(flow["sell_end_time"])
+        )
+
+    @classmethod
+    def _active_sell_flows(cls, at):
+        return tuple(flow for flow in SELL_FLOWS if cls._sell_flow_is_active(flow, at))
+
+    @classmethod
+    def _sell_flow_event_is_active(cls, flow, scheduled_at, at=None):
+        now = at or datetime.now(SEOUL)
+        if now.tzinfo is None or scheduled_at.tzinfo is None:
+            return False
+        now = now.astimezone(SEOUL)
+        scheduled_at = scheduled_at.astimezone(SEOUL)
+        return (
+            now.date() == scheduled_at.date()
+            and now >= scheduled_at
+            and cls._sell_flow_is_active(flow, scheduled_at)
+            and cls._sell_flow_is_active(flow, now)
+        )
 
     @staticmethod
     def _buy_order_session_is_open(at):
@@ -1669,7 +1844,8 @@ class ManagedBlockStrategy(Strategy):
         ]
         sell_sources = [
             source
-            for group in SELL_CONDITION_GROUPS
+            for flow in SELL_FLOWS
+            for group in flow["sell_condition_groups"]
             for condition in group["conditions"]
             for source in self._condition_sources(condition)
         ]
@@ -1695,31 +1871,57 @@ class ManagedBlockStrategy(Strategy):
                 f"매수 흐름 {flow['name']}: {flow['buy_start_time']} 이상 · "
                 f"{flow['buy_end_time']} 미만 / {flow['buy_scan_seconds']}초마다 조회 · 예산·보유종목 공유"
             )
-        bar_sell_sources = [
-            item for item in sell_sources
-            if self._source_uses_bars(item)
-        ]
-        if not bar_sell_sources or any(item["bar_data_mode"] == "INCLUDE_CURRENT" for item in bar_sell_sources):
-            ctx.scheduler.every(
-                seconds=BUY_SCAN_SECONDS,
-                schedule_id="condition-sell-live",
-                between=(SELL_START_TIME, SELL_END_TIME),
-                aligned=True,
+        self._sell_flow_schedules = {}
+        for flow in SELL_FLOWS:
+            flow_sources = [
+                source
+                for group in flow["sell_condition_groups"]
+                for condition in group["conditions"]
+                for source in self._condition_sources(condition)
+            ]
+            bar_sell_sources = [
+                item for item in flow_sources if self._source_uses_bars(item)
+            ]
+            schedule_prefix = (
+                f"condition-sell-{flow['id']}"
+                if CONFIGURED_SELL_FLOWS
+                else "condition-sell"
             )
-        else:
-            intervals = list(dict.fromkeys(item["bar_interval"] for item in bar_sell_sources))
-            for index, interval in enumerate(intervals, start=1):
-                if interval == "1d":
-                    ctx.scheduler.daily_at(
-                        SELL_START_TIME,
-                        schedule_id=f"condition-sell-daily-{index}",
-                    )
-                else:
-                    ctx.scheduler.on_bar_close(
-                        interval,
-                        schedule_id=f"condition-sell-bars-{index}",
-                        between=(SELL_START_TIME, SELL_END_TIME),
-                    )
+            if not bar_sell_sources or any(
+                item["bar_data_mode"] == "INCLUDE_CURRENT"
+                for item in bar_sell_sources
+            ):
+                schedule_id = f"{schedule_prefix}-live"
+                self._sell_flow_schedules[schedule_id] = flow
+                ctx.scheduler.every(
+                    seconds=flow["sell_scan_seconds"],
+                    schedule_id=schedule_id,
+                    between=(flow["sell_start_time"], flow["sell_end_time"]),
+                    aligned=True,
+                )
+            else:
+                intervals = list(dict.fromkeys(
+                    item["bar_interval"] for item in bar_sell_sources
+                ))
+                for index, interval in enumerate(intervals, start=1):
+                    suffix = "daily" if interval == "1d" else "bars"
+                    schedule_id = f"{schedule_prefix}-{suffix}-{index}"
+                    self._sell_flow_schedules[schedule_id] = flow
+                    if interval == "1d":
+                        ctx.scheduler.daily_at(
+                            flow["sell_start_time"], schedule_id=schedule_id,
+                        )
+                    else:
+                        ctx.scheduler.on_bar_close(
+                            interval,
+                            schedule_id=schedule_id,
+                            between=(flow["sell_start_time"], flow["sell_end_time"]),
+                        )
+            ctx.log.info(
+                f"매도 흐름 {flow['name']}: {flow['sell_start_time']} 이상 · "
+                f"{flow['sell_end_time']} 미만 / 조건 블록 "
+                f"{len(flow['sell_condition_groups'])}개 · 보유종목·주문 공유"
+            )
         ctx.scheduler.daily_at(CLOSE_TIME, schedule_id="close-all")
         ctx.scheduler.every(
             seconds=30,
@@ -1731,7 +1933,8 @@ class ManagedBlockStrategy(Strategy):
 
         if any(
             self._is_live_profit_condition(condition)
-            for group in SELL_CONDITION_GROUPS
+            for flow in SELL_FLOWS
+            for group in flow["sell_condition_groups"]
             for condition in group["conditions"]
         ):
             ctx.log.info("익절·손절: 실시간 현재가 WebSocket 기준으로 감시합니다.")
@@ -1831,28 +2034,87 @@ class ManagedBlockStrategy(Strategy):
             quantity = min(tracked_quantity, position.available_quantity)
             if quantity <= 0:
                 continue
+            order_at = datetime.now(SEOUL)
+            if self._order_attempt_is_suppressed(
+                ctx, order_at, code, "SELL", SELL_ORDER_TYPE, purpose="CLOSE"
+            ):
+                continue
+            limit_price = None
             try:
+                if SELL_ORDER_TYPE == "LIMIT":
+                    limit_price = await self._current_price(ctx, code)
+                route_at = datetime.now(SEOUL)
                 order_route = await self._effective_order_route(
-                    ctx, code, scheduled_at
+                    ctx, code, route_at, current_price=limit_price
                 )
-                order = await ctx.orders.market_sell(
-                    code=code,
-                    quantity=quantity,
-                    route=order_route,
-                    client_order_id=f"close-{code}-{scheduled_at:%Y%m%d%H%M%S}-sell",
+                order_at = datetime.now(SEOUL)
+                if self._order_session(order_at) != self._order_session(route_at):
+                    order_route = await self._effective_order_route(
+                        ctx, code, order_at, current_price=limit_price
+                    )
+                blocked_reason = self._order_session_block_reason(
+                    order_at, order_route, SELL_ORDER_TYPE
                 )
+                if blocked_reason:
+                    if self._suppress_order_for_day(
+                        ctx, order_at, code, "SELL", SELL_ORDER_TYPE, blocked_reason,
+                        purpose="CLOSE",
+                    ):
+                        ctx.log.warning(
+                            f"{self._instrument_label(ctx, code)} {reason} 건너뜀: {blocked_reason}"
+                        )
+                    continue
+                order_id = f"close-{code}-{order_at:%Y%m%d%H%M%S}-sell"
+                if SELL_ORDER_TYPE == "LIMIT":
+                    order = await ctx.orders.limit_sell(
+                        code=code, quantity=quantity, price=limit_price,
+                        route=order_route, client_order_id=order_id,
+                    )
+                else:
+                    order = await ctx.orders.market_sell(
+                        code=code, quantity=quantity, route=order_route,
+                        client_order_id=order_id,
+                    )
             except RouterError as exc:
-                ctx.log.error(f"{self._instrument_label(ctx, code)} 청산 실패 [{exc.code.value}]: {exc.message}")
+                failure_at = datetime.now(SEOUL)
+                if self._is_non_retryable_sell_rejection(exc.message):
+                    if self._suppress_order_for_day(
+                        ctx, failure_at, code, "SELL", SELL_ORDER_TYPE, exc.message,
+                        purpose="CLOSE",
+                    ):
+                        ctx.log.error(
+                            f"{self._instrument_label(ctx, code)} 청산 중단 "
+                            f"[{exc.code.value}]: {exc.message} · 오늘 같은 주문은 다시 시도하지 않습니다."
+                        )
+                else:
+                    ctx.log.error(f"{self._instrument_label(ctx, code)} 청산 실패 [{exc.code.value}]: {exc.message}")
+                continue
+            if order.status is OrderStatus.REJECTED:
+                message = str(order.message or "")
+                if self._is_non_retryable_sell_rejection(message):
+                    if self._suppress_order_for_day(
+                        ctx, datetime.now(SEOUL), code, "SELL", SELL_ORDER_TYPE,
+                        message, purpose="CLOSE",
+                    ):
+                        ctx.log.error(
+                            f"{self._instrument_label(ctx, code)} 청산 중단: {message} · "
+                            "오늘 같은 주문은 다시 시도하지 않습니다."
+                        )
                 continue
             if order.status is not OrderStatus.REJECTED:
                 self._mark_live_sell_pending(code)
-            ctx.log.info(f"{self._instrument_label(ctx, code)} {reason} · 전략 소유 {quantity}주 시장가 매도 요청: {order.status.value}")
+            price_text = f" {limit_price}원" if limit_price is not None else ""
+            ctx.log.info(
+                f"{self._instrument_label(ctx, code)} {reason} · 전략 소유 {quantity}주 "
+                f"{SELL_ORDER_TYPE}{price_text} 매도 요청: {order.status.value}"
+            )
             if order.status is OrderStatus.FILLED:
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
 
     async def on_timer(self, ctx, event):
-        if event.schedule_id.startswith("condition-sell-"):
+        sell_flow = getattr(self, "_sell_flow_schedules", {}).get(event.schedule_id)
+        if sell_flow is not None:
             await self.on_bar(ctx, event)
             return
         if event.schedule_id in {"close-all", "close-retry", "close-confirm"}:
@@ -1939,11 +2201,23 @@ class ManagedBlockStrategy(Strategy):
                     return
                 if market_price <= 0:
                     raise RuntimeError(f"{MARKET_VENUE} 현재가가 0 이하입니다.")
+                order_at = datetime.now(SEOUL)
                 order_route = await self._effective_order_route(
-                    ctx, code, event.scheduled_at, current_price=market_price
+                    ctx, code, order_at, current_price=market_price
                 )
                 if not active():
                     return
+                blocked_reason = self._order_session_block_reason(
+                    order_at, order_route, BUY_ORDER_TYPE
+                )
+                if blocked_reason:
+                    self._exclude_buy_for_day(ctx, order_at, code, blocked_reason)
+                    excluded_codes.add(code)
+                    ctx.log.warning(
+                        f"{self._instrument_label(ctx, code)} 매수 건너뜀: "
+                        f"{blocked_reason} 오늘은 다시 시도하지 않습니다."
+                    )
+                    continue
                 if BUY_ORDER_TYPE == "LIMIT":
                     limit_price = market_price
                 buying_power = await ctx.account.buying_power(
@@ -2016,6 +2290,19 @@ class ManagedBlockStrategy(Strategy):
                 break
 
     async def on_bar(self, ctx, event):
+        flow = getattr(self, "_sell_flow_schedules", {}).get(
+            getattr(event, "schedule_id", "")
+        ) or SELL_FLOWS[0]
+        if not hasattr(self, "_sell_flow_lock"):
+            self._sell_flow_lock = asyncio.Lock()
+        async with self._sell_flow_lock:
+            await self._on_bar_locked(ctx, event, flow)
+
+    async def _on_bar_locked(self, ctx, event, flow):
+        if not self._sell_flow_event_is_active(
+            flow, event.scheduled_at, datetime.now(SEOUL)
+        ):
+            return
         try:
             balance = await ctx.account.balance()
             open_orders = await ctx.account.open_orders()
@@ -2039,9 +2326,9 @@ class ManagedBlockStrategy(Strategy):
             should_sell, matched_groups = await self._condition_groups_result(
                 ctx,
                 code,
-                SELL_CONDITION_GROUPS,
+                flow["sell_condition_groups"],
                 average_price=average_price,
-                side="매도",
+                side=f"{flow['name']} 매도",
             )
             if not should_sell:
                 continue
@@ -2055,12 +2342,49 @@ class ManagedBlockStrategy(Strategy):
                 continue
             limit_price = None
             try:
-                order_route = await self._effective_order_route(
-                    ctx, code, event.scheduled_at
-                )
-                order_id = f"exit-{code}-{event.scheduled_at:%Y%m%d%H%M%S}-sell"
                 if SELL_ORDER_TYPE == "LIMIT":
                     limit_price = await self._current_price(ctx, code)
+            except RouterError as exc:
+                ctx.log.error(
+                    f"{self._instrument_label(ctx, code)} 매도 주문 전 현재가 조회 실패 "
+                    f"[{exc.code.value}]: {exc.message}"
+                )
+                continue
+            order_at = datetime.now(SEOUL)
+            if not self._sell_flow_event_is_active(flow, event.scheduled_at, order_at):
+                return
+            if self._order_attempt_is_suppressed(
+                ctx, order_at, code, "SELL", SELL_ORDER_TYPE
+            ):
+                continue
+            try:
+                route_at = order_at
+                order_route = await self._effective_order_route(
+                    ctx, code, route_at, current_price=limit_price
+                )
+                order_at = datetime.now(SEOUL)
+                if not self._sell_flow_event_is_active(
+                    flow, event.scheduled_at, order_at
+                ):
+                    return
+                if self._order_session(order_at) != self._order_session(route_at):
+                    order_route = await self._effective_order_route(
+                        ctx, code, order_at, current_price=limit_price
+                    )
+                blocked_reason = self._order_session_block_reason(
+                    order_at, order_route, SELL_ORDER_TYPE
+                )
+                if blocked_reason:
+                    if self._suppress_order_for_day(
+                        ctx, order_at, code, "SELL", SELL_ORDER_TYPE,
+                        blocked_reason,
+                    ):
+                        ctx.log.warning(
+                            f"{self._instrument_label(ctx, code)} 매도 건너뜀: {blocked_reason}"
+                        )
+                    continue
+                order_id = f"exit-{code}-{order_at:%Y%m%d%H%M%S}-sell"
+                if SELL_ORDER_TYPE == "LIMIT":
                     order = await ctx.orders.limit_sell(
                         code=code, quantity=quantity, price=limit_price, route=order_route,
                         client_order_id=order_id,
@@ -2070,7 +2394,30 @@ class ManagedBlockStrategy(Strategy):
                         code=code, quantity=quantity, route=order_route, client_order_id=order_id,
                     )
             except RouterError as exc:
-                ctx.log.error(f"{self._instrument_label(ctx, code)} 매도 요청 실패 [{exc.code.value}]: {exc.message}")
+                failure_at = datetime.now(SEOUL)
+                if self._is_non_retryable_sell_rejection(exc.message):
+                    if self._suppress_order_for_day(
+                        ctx, failure_at, code, "SELL", SELL_ORDER_TYPE,
+                        exc.message,
+                    ):
+                        ctx.log.error(
+                            f"{self._instrument_label(ctx, code)} 매도 요청 중단 "
+                            f"[{exc.code.value}]: {exc.message} · 오늘 같은 주문은 다시 시도하지 않습니다."
+                        )
+                else:
+                    ctx.log.error(f"{self._instrument_label(ctx, code)} 매도 요청 실패 [{exc.code.value}]: {exc.message}")
+                continue
+            if order.status is OrderStatus.REJECTED:
+                message = str(order.message or "")
+                if self._is_non_retryable_sell_rejection(message):
+                    if self._suppress_order_for_day(
+                        ctx, datetime.now(SEOUL), code, "SELL", SELL_ORDER_TYPE,
+                        message,
+                    ):
+                        ctx.log.error(
+                            f"{self._instrument_label(ctx, code)} 매도 요청 중단: {message} · "
+                            "오늘 같은 주문은 다시 시도하지 않습니다."
+                        )
                 continue
             if order.status is not OrderStatus.REJECTED:
                 self._mark_live_sell_pending(code)
@@ -2081,7 +2428,8 @@ class ManagedBlockStrategy(Strategy):
                 else f"판단 시각 {event.scheduled_at:%H:%M:%S}"
             )
             ctx.log.info(
-                f"{self._instrument_label(ctx, code)} {decision_time} · {sell_reason} · "
+                f"{self._instrument_label(ctx, code)} {flow['name']} · "
+                f"{decision_time} · {sell_reason} · "
                 f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
             )
             if order.status is OrderStatus.FILLED:
@@ -2090,7 +2438,17 @@ class ManagedBlockStrategy(Strategy):
 
     async def on_quote(self, ctx, quote):
         self._ensure_live_state()
-        if quote.delayed or quote.stale or not self._sell_window_is_open(quote.received_at):
+        if not hasattr(self, "_sell_flow_lock"):
+            self._sell_flow_lock = asyncio.Lock()
+        async with self._sell_flow_lock:
+            await self._on_quote_locked(ctx, quote)
+
+    async def _on_quote_locked(self, ctx, quote):
+        self._ensure_live_state()
+        if quote.delayed or quote.stale:
+            return
+        active_flows = self._active_sell_flows(quote.received_at)
+        if not active_flows:
             return
         code = quote.instrument.code
         position = self._live_positions.get(code)
@@ -2098,10 +2456,14 @@ class ManagedBlockStrategy(Strategy):
             return
         if code in self._live_sell_pending and not self._live_sell_recheck_due(code):
             return
-        condition = self._matched_live_profit_condition(
-            quote.price, position.average_price
+        candidate_flows = tuple(
+            flow
+            for flow in active_flows
+            if self._matched_live_profit_condition(
+                flow["sell_condition_groups"], quote.price, position.average_price
+            ) is not None
         )
-        if condition is None:
+        if not candidate_flows:
             return
         try:
             balance = await ctx.account.balance()
@@ -2122,20 +2484,22 @@ class ManagedBlockStrategy(Strategy):
             or code not in tracked
         ):
             return
-        condition = self._matched_live_profit_condition(
-            quote.price, position.average_price
-        )
-        if condition is None:
-            return
-        should_sell, matched_groups = await self._condition_groups_result(
-            ctx,
-            code,
-            SELL_CONDITION_GROUPS,
-            average_price=position.average_price,
-            current_price=quote.price,
-            side="실시간 매도",
-        )
-        if not should_sell:
+        matched_flow = None
+        matched_groups = None
+        for flow in candidate_flows:
+            should_sell, flow_matches = await self._condition_groups_result(
+                ctx,
+                code,
+                flow["sell_condition_groups"],
+                average_price=position.average_price,
+                current_price=quote.price,
+                side=f"{flow['name']} 실시간 매도",
+            )
+            if should_sell:
+                matched_flow = flow
+                matched_groups = flow_matches
+                break
+        if matched_flow is None:
             return
         tracked_quantity = (
             position.strategy_quantity
@@ -2145,15 +2509,48 @@ class ManagedBlockStrategy(Strategy):
         quantity = min(tracked_quantity, position.available_quantity)
         if quantity <= 0:
             return
-        self._mark_live_sell_pending(code)
+        order_at = datetime.now(SEOUL)
+        if not self._sell_flow_event_is_active(
+            matched_flow, quote.received_at, order_at
+        ):
+            return
+        if self._order_attempt_is_suppressed(
+            ctx, order_at, code, "SELL", SELL_ORDER_TYPE
+        ):
+            return
         limit_price = None
         try:
-            order_route = await self._effective_order_route(
-                ctx, code, quote.received_at, current_price=quote.price
-            )
-            order_id = f"live-exit-{code}-{quote.received_at:%Y%m%d%H%M%S%f}-sell"
             if SELL_ORDER_TYPE == "LIMIT":
                 limit_price = quote.price
+            route_at = order_at
+            order_route = await self._effective_order_route(
+                ctx, code, route_at, current_price=quote.price
+            )
+            order_at = datetime.now(SEOUL)
+            if not self._sell_flow_event_is_active(
+                matched_flow, quote.received_at, order_at
+            ):
+                return
+            if self._order_session(order_at) != self._order_session(route_at):
+                order_route = await self._effective_order_route(
+                    ctx, code, order_at, current_price=quote.price
+                )
+            blocked_reason = self._order_session_block_reason(
+                order_at, order_route, SELL_ORDER_TYPE
+            )
+            if blocked_reason:
+                if self._suppress_order_for_day(
+                    ctx, order_at, code, "SELL", SELL_ORDER_TYPE,
+                    blocked_reason,
+                ):
+                    ctx.log.warning(
+                        f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 건너뜀: "
+                        f"{blocked_reason}"
+                    )
+                return
+            self._mark_live_sell_pending(code)
+            order_id = f"live-exit-{code}-{order_at:%Y%m%d%H%M%S%f}-sell"
+            if SELL_ORDER_TYPE == "LIMIT":
                 order = await ctx.orders.limit_sell(
                     code=code, quantity=quantity, price=limit_price,
                     route=order_route, client_order_id=order_id,
@@ -2165,17 +2562,40 @@ class ManagedBlockStrategy(Strategy):
                 )
         except RouterError as exc:
             self._clear_live_sell_pending(code)
-            ctx.log.error(f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 실패 [{exc.code.value}]: {exc.message}")
+            failure_at = datetime.now(SEOUL)
+            if self._is_non_retryable_sell_rejection(exc.message):
+                if self._suppress_order_for_day(
+                    ctx, failure_at, code, "SELL", SELL_ORDER_TYPE,
+                    exc.message,
+                ):
+                    ctx.log.error(
+                        f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 중단 "
+                        f"[{exc.code.value}]: {exc.message} · 오늘 같은 주문은 다시 시도하지 않습니다."
+                    )
+            else:
+                ctx.log.error(f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 실패 [{exc.code.value}]: {exc.message}")
             return
         if order.status is OrderStatus.REJECTED:
             self._clear_live_sell_pending(code)
+            message = str(order.message or "")
+            if self._is_non_retryable_sell_rejection(message):
+                if self._suppress_order_for_day(
+                    ctx, datetime.now(SEOUL), code, "SELL", SELL_ORDER_TYPE,
+                    message,
+                ):
+                    ctx.log.error(
+                        f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 중단: "
+                        f"{message} · 오늘 같은 주문은 다시 시도하지 않습니다."
+                    )
+            return
         reason = " 그리고 ".join(
             "(" + " 또는 ".join(self._condition_summary(item) for item in matched) + ")"
             for matched in matched_groups
         )
         price_text = f" {limit_price}원" if limit_price is not None else ""
         ctx.log.info(
-            f"{self._instrument_label(ctx, code)} 실시간 현재가 {quote.price}원 ({reason}) · "
+            f"{self._instrument_label(ctx, code)} {matched_flow['name']} · "
+            f"실시간 현재가 {quote.price}원 ({reason}) · "
             f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
         )
 
@@ -2249,6 +2669,7 @@ def _render_condition_bollinger(
         "__BUY_CONDITION_GROUPS_JSON__": _json_literal(settings.buy_condition_groups),
         "__BUY_FLOWS_JSON__": _json_literal(settings.buy_flows),
         "__SELL_CONDITION_GROUPS_JSON__": _json_literal(settings.sell_condition_groups),
+        "__SELL_FLOWS_JSON__": _json_literal(settings.sell_flows),
         "__BUY_ORDER_TYPE__": _literal(settings.buy_order_type),
         "__SELL_ORDER_TYPE__": _literal(settings.sell_order_type),
         "__BUY_SCAN_SECONDS__": str(settings.buy_scan_seconds),
@@ -2379,6 +2800,7 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
     buy_groups_json = constants.get("BUY_CONDITION_GROUPS_JSON")
     sell_groups_json = constants.get("SELL_CONDITION_GROUPS_JSON")
     buy_flows_json = constants.get("BUY_FLOWS_JSON")
+    sell_flows_json = constants.get("SELL_FLOWS_JSON")
     # Missing means a pre-flow strategy; malformed explicit flow data must not
     # silently fall back to the legacy discovery source and trade differently.
     if buy_flows_json is None:
@@ -2390,6 +2812,17 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
             required["buy_flows"] = json.loads(buy_flows_json)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("매수 흐름 설정을 읽을 수 없습니다.") from exc
+    # As with buy flows, absence means a legacy strategy and explicit malformed
+    # metadata must fail closed instead of silently changing live behavior.
+    if sell_flows_json is None:
+        required["sell_flows"] = []
+    else:
+        if not isinstance(sell_flows_json, str):
+            raise ValueError("매도 흐름 설정을 읽을 수 없습니다.")
+        try:
+            required["sell_flows"] = json.loads(sell_flows_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("매도 흐름 설정을 읽을 수 없습니다.") from exc
     try:
         required["buy_conditions"] = json.loads(buy_json) if isinstance(buy_json, str) else []
     except (TypeError, ValueError, json.JSONDecodeError):

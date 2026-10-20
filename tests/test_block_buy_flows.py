@@ -466,6 +466,33 @@ def test_rejected_submission_is_not_retried_by_an_overlapping_flow_in_same_tick(
     assert len(attempts) == 1
 
 
+def test_aftermarket_market_buy_is_skipped_and_excluded_before_submission():
+    harness = Harness(
+        settings_for(
+            [flow("after", buy_start_time="15:30", buy_end_time="19:00")],
+            route="SOR",
+            buy_order_type="MARKET",
+        ),
+        now="16:00:00",
+    )
+
+    async def exercise():
+        await harness.tick("after")
+        harness.now = at("16:00:30")
+        await harness.tick("after")
+
+    asyncio.run(exercise())
+
+    assert harness.order_calls == []
+    assert set(
+        harness.ctx.state.get("daily_buy_exclusions", {})["symbols"]
+    ) == {"000660"}
+    warnings = [message for message in harness.logs if "매수 건너뜀" in message]
+    assert len(warnings) == 1
+    assert "애프터마켓" in warnings[0]
+    assert "지정가로 설정" in warnings[0]
+
+
 def test_buy_flows_share_actual_central_exposure_reservations(tmp_path):
     """Use the real order service/SQLite limit, not a simulated risk counter."""
     harness = Harness(settings_for([flow(), flow("midday")]), pending=True)

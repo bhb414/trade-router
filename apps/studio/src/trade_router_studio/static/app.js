@@ -1125,6 +1125,7 @@ const BLOCK_CONSTANT_META = {
   USE_TAKE_PROFIT: ["risk", "익절"],
   USE_STOP_LOSS: ["risk", "손절"],
   BUY_SCAN_SECONDS: ["schedule", "조건검색 간격(초)"],
+  SELL_SCAN_SECONDS: ["schedule", "보완 판단 간격(초)"],
   BUY_START_TIME: ["schedule", "매수 시작 시각"],
   BUY_END_TIME: ["schedule", "매수 종료 시각"],
   SELL_START_TIME: ["schedule", "매도 판단 시작"],
@@ -1477,6 +1478,7 @@ const BLOCK_PACKAGE_FIELD_TYPES = {
   ranking_limit: "number",
   bollinger_period: "number",
   buy_scan_seconds: "number",
+  sell_scan_seconds: "number",
   buy_budget_per_symbol: "decimal",
   total_operating_budget: "decimal",
   bollinger_stddev: "decimal",
@@ -1502,7 +1504,7 @@ function blockPackageFields() {
   const custom = new Set([
     "buy_conditions", "sell_conditions", "buy_condition_groups", "sell_condition_groups",
     "buy_condition_logic", "sell_condition_logic", "bar_interval", "bar_data_mode",
-    "bollinger_period", "bollinger_stddev", "buy_flows",
+    "bollinger_period", "bollinger_stddev", "buy_flows", "sell_flows",
   ]);
   const legacy = new Set([
     "use_bollinger_exit", "use_take_profit", "use_stop_loss",
@@ -1531,7 +1533,11 @@ function currentBlockModel() {
   return {
     ...parsed,
     template: state.blockPackage.template,
-    fields: [...blockPackageFields(), ...blockBuyFlows().flatMap(blockBuyFlowFields)],
+    fields: [
+      ...blockPackageFields(),
+      ...blockBuyFlows().flatMap(blockBuyFlowFields),
+      ...blockSellFlows().flatMap(blockSellFlowFields),
+    ],
   };
 }
 
@@ -1539,6 +1545,10 @@ const BLOCK_BUY_FLOW_FIELDS = [
   "target_source", "hts_user_id", "condition_id", "expected_condition_name",
   "ranking_kind", "ranking_venue", "ranking_market", "ranking_limit", "symbols",
   "buy_scan_seconds", "buy_start_time", "buy_end_time", "buy_condition_groups",
+];
+
+const BLOCK_SELL_FLOW_FIELDS = [
+  "sell_scan_seconds", "sell_start_time", "sell_end_time", "sell_condition_groups",
 ];
 
 function blockBuyFlows() {
@@ -1557,11 +1567,42 @@ function blockBuyFlowFields(flow) {
       const sourceName = packageFieldSourceName(settingKey);
       const [category, label] = genericConstantMeta(sourceName);
       return {
-        id: `flow:${flow.id}:${settingKey}`, flowId: flow.id, settingKey, sourceName,
+        id: `flow:${flow.id}:${settingKey}`, flowKind: "buy", flowId: flow.id, settingKey, sourceName,
         label: settingKey === "name" ? "흐름 이름" : label, category,
         type: BLOCK_PACKAGE_FIELD_TYPES[settingKey] || "string", value: flow[settingKey],
       };
     });
+}
+
+function blockSellFlows() {
+  const flows = state.blockPackage?.settings?.sell_flows;
+  return Array.isArray(flows) ? flows : [];
+}
+
+function blockSellFlow(flowId) {
+  return blockSellFlows().find(flow => flow.id === flowId);
+}
+
+function blockSellFlowFields(flow) {
+  return ["name", ...BLOCK_SELL_FLOW_FIELDS]
+    .filter(key => key !== "sell_condition_groups")
+    .map(settingKey => {
+      const sourceName = packageFieldSourceName(settingKey);
+      const [category, label] = genericConstantMeta(sourceName);
+      return {
+        id: `sell-flow:${flow.id}:${settingKey}`, flowKind: "sell", flowId: flow.id,
+        settingKey, sourceName, label: settingKey === "name" ? "흐름 이름" : label,
+        category, type: BLOCK_PACKAGE_FIELD_TYPES[settingKey] || "string", value: flow[settingKey],
+      };
+    });
+}
+
+function blockFlow(kind, flowId) {
+  return kind === "sell" ? blockSellFlow(flowId) : blockBuyFlow(flowId);
+}
+
+function blockFlowNodePrefix(kind, flowId) {
+  return kind === "sell" ? `sell-flow-${flowId}` : `flow-${flowId}`;
 }
 
 function blockConditionScope(flow) {
@@ -1620,9 +1661,46 @@ function removeBlockBuyFlow(flowId) {
   renderStrategyBlocks();
 }
 
+function addBlockSellFlow() {
+  if (!flushBlockFieldEdits(false)) return;
+  const settings = state.blockPackage?.settings;
+  const flows = blockSellFlows();
+  if (!settings || flows.length >= 8 || selectedState()?.running) return;
+  const previous = flows[flows.length - 1];
+  const startValue = previous?.sell_end_time || settings.sell_start_time || "09:00";
+  const parts = String(startValue).split(":").map(Number);
+  const minutes = Math.min(23 * 60 + 58, (parts[0] || 0) * 60 + (parts[1] || 0));
+  const clock = value => `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+  const flow = {
+    id: `sell-flow-${Date.now().toString(36)}-${++state.conditionGroupSerial}`,
+    name: `매도 흐름 ${flows.length + 1}`,
+    sell_scan_seconds: previous?.sell_scan_seconds || settings.buy_scan_seconds || 30,
+    sell_start_time: clock(minutes),
+    sell_end_time: clock(Math.min(23 * 60 + 59, minutes + 60)),
+    sell_condition_groups: [newConditionGroup("sell")],
+  };
+  flows.push(flow);
+  setScheduleSectionExpanded(`sell-flow:${flow.id}`, true);
+  state.blockSelectedNode = `${blockFlowNodePrefix("sell", flow.id)}-schedule`;
+  setDirty(true);
+  renderStrategyBlocks();
+}
+
+function removeBlockSellFlow(flowId) {
+  const flows = blockSellFlows();
+  const index = flows.findIndex(flow => flow.id === flowId);
+  if (index < 0 || flows.length <= 1 || selectedState()?.running) return;
+  flows.splice(index, 1);
+  if (String(state.blockSelectedNode || "").startsWith(`${blockFlowNodePrefix("sell", flowId)}-`)) {
+    state.blockSelectedNode = "sellOrder";
+  }
+  setDirty(true);
+  renderStrategyBlocks();
+}
+
 function blockFieldOptions(field) {
   const settings = state.blockPackage?.settings || {};
-  const flow = field.flowId ? blockBuyFlow(field.flowId) : null;
+  const flow = field.flowId ? blockFlow(field.flowKind || "buy", field.flowId) : null;
   if (field.settingKey === "trading_account") {
     return state.accounts.map(account => ({
       value: account.alias,
@@ -1756,7 +1834,8 @@ function applyBlockFieldEdit(fieldId, value, { render = true } = {}) {
   if (field.settingKey && state.blockPackage) {
     const normalized = normalizeBlockPackageValue(field, value);
     const settings = state.blockPackage.settings;
-    const target = field.flowId ? blockBuyFlow(field.flowId) : settings;
+    const flowKind = field.flowKind || "buy";
+    const target = field.flowId ? blockFlow(flowKind, field.flowId) : settings;
     if (!target) return;
     const changed = JSON.stringify(target[field.settingKey]) !== JSON.stringify(normalized);
     if (changed) {
@@ -1775,12 +1854,16 @@ function applyBlockFieldEdit(fieldId, value, { render = true } = {}) {
       }
       setDirty(true);
       if (!render && field.flowId) {
+        const scheduleKey = flowKind === "sell" ? `sell-flow:${field.flowId}` : `flow:${field.flowId}`;
         const panel = [...elements.blockCanvas.querySelectorAll("[data-schedule-key]")]
-          .find(node => node.dataset.scheduleKey === `flow:${field.flowId}`);
+          .find(node => node.dataset.scheduleKey === scheduleKey);
         const heading = panel?.querySelector(".schedule-section-copy strong");
-        if (heading) heading.textContent = `${target.buy_start_time}–${target.buy_end_time}  ${target.name}`;
+        const start = flowKind === "sell" ? target.sell_start_time : target.buy_start_time;
+        const end = flowKind === "sell" ? target.sell_end_time : target.buy_end_time;
+        if (heading) heading.textContent = `${start}–${end}  ${target.name}`;
         const badge = panel?.querySelector(".schedule-section-badge");
-        if (badge) badge.textContent = `${target.buy_scan_seconds}초마다`;
+        const seconds = flowKind === "sell" ? target.sell_scan_seconds : target.buy_scan_seconds;
+        if (badge) badge.textContent = `${seconds}초마다`;
       }
     }
     if (render) {
@@ -1871,7 +1954,7 @@ function createBlockFieldControl(field, disabled) {
   } else {
     control = document.createElement("input");
     control.type = field.type === "date" ? "date"
-      : field.flowId && ["buy_start_time", "buy_end_time"].includes(field.settingKey) ? "time"
+      : field.flowId && ["buy_start_time", "buy_end_time", "sell_start_time", "sell_end_time"].includes(field.settingKey) ? "time"
         : ["number", "decimal"].includes(field.type) ? "number" : "text";
     if (control.type === "time") control.step = "1";
     if (["number", "decimal"].includes(field.type)) control.step = "any";
@@ -2038,7 +2121,7 @@ function closeComposerInspector(returnToNode = state.blockSelectedNode) {
   focusComposerNode(returnToNode);
 }
 
-function createComposerInspector(definition, running, flowCount) {
+function createComposerInspector(definition, running, flowCounts = {}) {
   if (!definition) return null;
   const inspector = document.createElement("aside");
   inspector.className = "composer-inspector";
@@ -2092,12 +2175,15 @@ function createComposerInspector(definition, running, flowCount) {
     body.append(actions);
   }
   if (definition.flowId) {
+    const flowKind = definition.flowKind || "buy";
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "button quiet compact danger-text composer-remove-flow";
-    remove.textContent = "이 매수 흐름 삭제";
-    remove.disabled = running || flowCount <= 1;
-    remove.addEventListener("click", () => removeBlockBuyFlow(definition.flowId));
+    remove.textContent = `이 ${flowKind === "sell" ? "매도" : "매수"} 흐름 삭제`;
+    remove.disabled = running || (flowKind === "sell" ? flowCounts.sell : flowCounts.buy) <= 1;
+    remove.addEventListener("click", () => (
+      flowKind === "sell" ? removeBlockSellFlow(definition.flowId) : removeBlockBuyFlow(definition.flowId)
+    ));
     body.append(remove);
   }
   inspector.append(body);
@@ -2523,7 +2609,7 @@ function conditionSelect(items, value, disabled, onChange) {
 }
 
 function blockConditionGroups(kind, flowId = null) {
-  const settings = kind === "buy" && flowId ? blockBuyFlow(flowId) : state.blockPackage?.settings;
+  const settings = flowId ? blockFlow(kind, flowId) : state.blockPackage?.settings;
   const groups = settings?.[`${kind}_condition_groups`];
   return Array.isArray(groups) ? groups : [];
 }
@@ -2638,8 +2724,8 @@ function addConditionGroup(kind, flowId = null) {
   const group = newConditionGroup(kind);
   groups.push(group);
   setScheduleSectionExpanded(`condition:${flowId || kind}:${group.id}`, true);
-  state.blockSelectedNode = kind === "buy" && flowId
-    ? `flow-${flowId}-group-${group.id}`
+  state.blockSelectedNode = flowId
+    ? `${blockFlowNodePrefix(kind, flowId)}-group-${group.id}`
     : `${kind}Group-${group.id}`;
   setDirty(true);
   renderStrategyBlocks();
@@ -2649,9 +2735,14 @@ function removeConditionGroup(kind, groupIndex, flowId = null) {
   const groups = blockConditionGroups(kind, flowId);
   if (!groups[groupIndex] || (kind === "sell" && groups.length <= 1)) return;
   const [removed] = groups.splice(groupIndex, 1);
-  const removedNode = removed?.id && (flowId ? `flow-${flowId}-group-${removed.id}` : `${kind}Group-${removed.id}`);
-  if (removedNode && state.blockSelectedNode === removedNode) state.blockSelectedNode = kind === "buy" && flowId
-    ? `flow-${flowId}-target` : "sellSchedule";
+  const removedNode = removed?.id && (
+    flowId ? `${blockFlowNodePrefix(kind, flowId)}-group-${removed.id}` : `${kind}Group-${removed.id}`
+  );
+  if (removedNode && state.blockSelectedNode === removedNode) {
+    state.blockSelectedNode = flowId
+      ? `${blockFlowNodePrefix(kind, flowId)}-${kind === "buy" ? "target" : "schedule"}`
+      : "sellSchedule";
+  }
   setDirty(true);
   renderStrategyBlocks();
 }
@@ -3515,10 +3606,62 @@ function normalizeManagedBlockSettings(settings) {
       }));
     });
   });
+  if (!Array.isArray(settings.sell_flows) || !settings.sell_flows.length) {
+    settings.sell_flows = [{
+      id: "sell-flow-1",
+      name: "매도 흐름 1",
+      sell_scan_seconds: settings.sell_scan_seconds || settings.buy_scan_seconds || 30,
+      sell_start_time: settings.sell_start_time || "09:00",
+      sell_end_time: settings.sell_end_time || "15:20",
+      sell_condition_groups: structuredClone(settings.sell_condition_groups || []),
+    }];
+  }
+  settings.sell_flows.forEach((flow, index) => {
+    flow.id ||= `sell-flow-${index + 1}`;
+    flow.name ||= `매도 흐름 ${index + 1}`;
+    const fallbacks = {
+      sell_scan_seconds: settings.sell_scan_seconds || settings.buy_scan_seconds || 30,
+      sell_start_time: settings.sell_start_time || "09:00",
+      sell_end_time: settings.sell_end_time || "15:20",
+      sell_condition_groups: settings.sell_condition_groups || [],
+    };
+    for (const key of BLOCK_SELL_FLOW_FIELDS) {
+      if (flow[key] == null) flow[key] = structuredClone(fallbacks[key]);
+    }
+    if (!Array.isArray(flow.sell_condition_groups) || !flow.sell_condition_groups.length) {
+      flow.sell_condition_groups = structuredClone(settings.sell_condition_groups || []);
+    }
+    flow.sell_condition_groups.forEach(group => {
+      const common = {
+        bar_interval: group.bar_interval || settings.bar_interval || "3m",
+        bar_data_mode: group.bar_data_mode || settings.bar_data_mode || "COMPLETE_ONLY",
+        bollinger_period: Number(group.bollinger_period || settings.bollinger_period || 55),
+        bollinger_stddev: String(group.bollinger_stddev || settings.bollinger_stddev || "1.04"),
+      };
+      group.conditions = (group.conditions || []).map(condition => ({
+        ...newBlockTradeCondition("sell"), ...condition,
+        left_bar_interval: condition.left_bar_interval || common.bar_interval,
+        right_bar_interval: condition.right_bar_interval || common.bar_interval,
+        left_bar_data_mode: condition.left_bar_data_mode || common.bar_data_mode,
+        right_bar_data_mode: condition.right_bar_data_mode || common.bar_data_mode,
+        left_bollinger_period: Number(condition.left_bollinger_period || common.bollinger_period),
+        right_bollinger_period: Number(condition.right_bollinger_period || common.bollinger_period),
+        left_bollinger_stddev: String(condition.left_bollinger_stddev || common.bollinger_stddev),
+        right_bollinger_stddev: String(condition.right_bollinger_stddev || common.bollinger_stddev),
+        left_atr_period: Number(condition.left_atr_period || 14),
+        right_atr_period: Number(condition.right_atr_period || 14),
+      }));
+      delete group.bar_interval;
+      delete group.bar_data_mode;
+      delete group.bollinger_period;
+      delete group.bollinger_stddev;
+    });
+  });
   [
     ...(settings.buy_condition_groups || []),
     ...(settings.sell_condition_groups || []),
     ...settings.buy_flows.flatMap(flow => flow.buy_condition_groups || []),
+    ...settings.sell_flows.flatMap(flow => flow.sell_condition_groups || []),
   ].forEach(group => (group.conditions || []).forEach(normalizeConditionAtrPeriods));
   settings.buy_order_type ||= "MARKET";
   settings.sell_order_type ||= "MARKET";
@@ -3557,7 +3700,7 @@ function conditionJoin(text = "또는 (OR)") {
 
 function buildComposerTreeModel(settings) {
   const flows = Array.isArray(settings?.buy_flows) ? settings.buy_flows : [];
-  const sellGroups = Array.isArray(settings?.sell_condition_groups) ? settings.sell_condition_groups : [];
+  const sellFlows = Array.isArray(settings?.sell_flows) ? settings.sell_flows : [];
   const flowBranches = flows.map((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
     const groups = flow.buy_condition_groups || [];
@@ -3578,6 +3721,29 @@ function buildComposerTreeModel(settings) {
           id: `${prefix}-add-condition`,
           label: "매수 조건 블록 추가",
           action: "add-buy-condition",
+          flowId: flow.id,
+          disabled: groups.length >= 8,
+        },
+      ],
+    };
+  });
+  const sellFlowBranches = sellFlows.map((flow, flowIndex) => {
+    const prefix = blockFlowNodePrefix("sell", flow.id);
+    const groups = flow.sell_condition_groups || [];
+    return {
+      kind: "branch",
+      id: prefix,
+      title: flow.name || `매도 흐름 ${flowIndex + 1}`,
+      badge: `${flow.sell_start_time}–${flow.sell_end_time}`,
+      tone: "sell",
+      nodeId: `${prefix}-schedule`,
+      children: [
+        ...groups.map(group => ({ kind: "node", nodeId: `${prefix}-group-${group.id}` })),
+        {
+          kind: "add",
+          id: `${prefix}-add-condition`,
+          label: "매도 조건 블록 추가",
+          action: "add-sell-condition",
           flowId: flow.id,
           disabled: groups.length >= 8,
         },
@@ -3620,23 +3786,23 @@ function buildComposerTreeModel(settings) {
       title: "매도 구성",
       badge: "SELL",
       tone: "sell",
-      description: "전략 보유종목을 공통 조건으로 판단하고 주문",
-      children: [{
-        kind: "branch",
-        id: "sell-decision",
-        nodeId: "sellSchedule",
-        children: [
-          ...sellGroups.map(group => ({ kind: "node", nodeId: `sellGroup-${group.id}` })),
-          {
-            kind: "add",
-            id: "add-sell-condition",
-            label: "매도 조건 블록 추가",
-            action: "add-sell-condition",
-            disabled: sellGroups.length >= 8,
-          },
-          { kind: "node", nodeId: "sellOrder" },
-        ],
-      }, {
+      description: "시간대별 매도 조건 · 보유종목과 주문 처리는 전략 전체 공유",
+      children: [
+        ...sellFlowBranches,
+        {
+          kind: "add",
+          id: "add-sell-flow",
+          label: "시간대별 매도 흐름 추가",
+          action: "add-sell-flow",
+          disabled: sellFlows.length >= 8,
+        }, {
+          kind: "branch",
+          id: "shared-sell-order",
+          title: "공통 주문 처리",
+          badge: "SHARED",
+          tone: "shared",
+          nodeId: "sellOrder",
+        }, {
         kind: "branch",
         id: "close-position",
         title: "장 마감",
@@ -3663,8 +3829,9 @@ function createComposerTreeAddRow(entry, running) {
   button.addEventListener("click", event => {
     event.stopPropagation();
     if (entry.action === "add-buy-flow") addBlockBuyFlow();
+    else if (entry.action === "add-sell-flow") addBlockSellFlow();
     else if (entry.action === "add-buy-condition") addConditionGroup("buy", entry.flowId);
-    else if (entry.action === "add-sell-condition") addConditionGroup("sell");
+    else if (entry.action === "add-sell-condition") addConditionGroup("sell", entry.flowId);
   });
   return button;
 }
@@ -4101,9 +4268,9 @@ function renderConditionSchedule(parsed, running, snapshot) {
   const intro = document.createElement("div");
   intro.className = "schedule-editor-intro";
   const title = document.createElement("strong");
-  title.textContent = "한 전략의 시간별 매수 일정";
+  title.textContent = "한 전략의 시간별 매수·매도 일정";
   const hint = document.createElement("p");
-  hint.textContent = "각 시간대의 종목 조회와 매수 조건을 따로 설정합니다. 계좌·예산·보유종목은 공유하고, 매도는 별도 일정으로 계속 확인합니다.";
+  hint.textContent = "각 시간대의 종목 조회·매수 조건과 매도 조건을 따로 설정합니다. 계좌·예산·보유종목은 전략 전체에서 공유합니다.";
   intro.append(title, hint);
   root.append(intro);
   const budget = Number(settings.total_operating_budget || 0).toLocaleString("ko-KR");
@@ -4185,16 +4352,46 @@ function renderConditionSchedule(parsed, running, snapshot) {
   parallelHint.textContent = "위 매수 일정의 종료와 관계없이 별도로 실행";
   parallel.append(parallelTitle, parallelHint);
   root.append(parallel);
-  const sellGroups = blockConditionGroups("sell");
-  const sells = createScheduleSection({ key: "sell", title: `${settings.sell_start_time}–${settings.sell_end_time}  매도 판단`,
-    summary: `모든 흐름에서 매수한 전략 보유종목 · 조건 ${sellGroups.length}개 블록`, badge: "별도 감시", tone: "sell" });
-  sells.content.append(createScheduleFields(take("sell_start_time", "sell_end_time"), running));
-  const sellHint = document.createElement("p");
-  sellHint.className = "schedule-explanation";
-  sellHint.textContent = "수익률 조건은 실시간 현재가, 차트 조건은 각 조건에 설정한 봉 주기와 완성 여부로 판단합니다.";
-  sells.content.append(sellHint);
-  appendScheduleConditions(sells.content, "sell", null, running);
-  root.append(sells.section);
+  const sellFlows = blockSellFlows();
+  const sellList = document.createElement("div");
+  sellList.className = "schedule-flow-list";
+  sellFlows.map((flow, index) => ({ flow, index }))
+    .sort((a, b) => String(a.flow.sell_start_time).localeCompare(String(b.flow.sell_start_time)) || a.index - b.index)
+    .forEach(({ flow, index }) => {
+      const flowFields = new Map(blockSellFlowFields(flow).map(field => [field.settingKey, field]));
+      const takeFlow = (...keys) => keys.map(key => flowFields.get(key)).filter(Boolean);
+      const groups = blockConditionGroups("sell", flow.id);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "button quiet compact schedule-flow-remove";
+      remove.textContent = "삭제";
+      remove.setAttribute("aria-label", `${flow.name} 매도 흐름 삭제`);
+      remove.disabled = running || sellFlows.length <= 1;
+      remove.addEventListener("click", () => removeBlockSellFlow(flow.id));
+      const panel = createScheduleSection({
+        key: `sell-flow:${flow.id}`,
+        title: `${flow.sell_start_time}–${flow.sell_end_time}  ${flow.name}`,
+        summary: `전략 보유종목 → 매도 조건 ${groups.length}개 블록 모두 통과 → 공통 주문`,
+        badge: `${flow.sell_scan_seconds}초 보완 판단`, tone: "sell", open: index === 0, action: remove,
+      });
+      panel.content.append(createScheduleFields(
+        takeFlow("name", "sell_start_time", "sell_end_time", "sell_scan_seconds"), running,
+      ));
+      const sellHint = document.createElement("p");
+      sellHint.className = "schedule-explanation";
+      sellHint.textContent = "수익률 조건은 실시간 현재가, 차트 조건은 각 조건에 설정한 봉 주기와 완성 여부로 판단합니다.";
+      panel.content.append(sellHint);
+      appendScheduleConditions(panel.content, "sell", flow.id, running);
+      sellList.append(panel.section);
+    });
+  root.append(sellList);
+  const addSell = document.createElement("button");
+  addSell.type = "button";
+  addSell.className = "button quiet schedule-add-flow";
+  addSell.textContent = "+ 매도 흐름 추가";
+  addSell.disabled = running || sellFlows.length >= 8;
+  addSell.addEventListener("click", addBlockSellFlow);
+  root.append(addSell);
   const closing = createScheduleSection({ key: "closing", title: `${settings.close_time}  장 마감 청산`,
     summary: "전략 보유종목 청산 → 미체결·보유 수량 재확인", badge: "정시 실행", tone: "closing" });
   closing.content.append(createScheduleFields(take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"), running));
@@ -4212,16 +4409,8 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
   const take = (...keys) => keys.map(key => fields.get(key)).filter(Boolean);
   const settings = state.blockPackage.settings;
   const flows = blockBuyFlows();
+  const sellFlows = blockSellFlows();
   const targetLabels = { HTS_CONDITION: "HTS 조건검색", RANKING: "시장 순위검색", SYMBOLS: "지정 종목" };
-  const sellGroups = blockConditionGroups("sell");
-  const sellConditions = sellGroups.flatMap(group => group.conditions || []);
-  const hasLiveSellConditions = sellConditions.some(isLiveProfitCondition);
-  const hasBarSellConditions = sellConditions.some(hasBarMetricCondition);
-  const sellScheduleMeta = hasLiveSellConditions && hasBarSellConditions ? "실시간 · 봉 시점" : hasLiveSellConditions ? "실시간" : "봉 시점";
-  const sellScheduleActions = [
-    ...(hasLiveSellConditions ? ["수익률 · 실시간 현재가"] : []),
-    ...(hasBarSellConditions ? ["차트 값 · 각 조건의 봉 설정"] : []),
-  ];
   const world = document.createElement("div");
   world.className = "block-canvas-world composer-tree-world";
   state.blockGraphPlan = null;
@@ -4241,9 +4430,6 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       fields: take("buy_order_type"), actions: ["시간 재확인", "멱등성 예약", "위험 검사", "주문 제출", "상태 조정"], vertical: true },
     { id: "sellOrder", title: "매도 주문", meta: "공통 보유종목", tone: "event", logic: "SELL", logicTone: "sell", width: 460,
       fields: take("sell_order_type"), actions: ["전략 소유 수량", "주문 제출", "상태 조정"], vertical: true },
-    { id: "sellSchedule", title: "매도 판단 일정", meta: sellScheduleMeta, tone: "schedule", logic: "감시", logicTone: "schedule", width: 460,
-      fields: take("sell_start_time", "sell_end_time"), summary: [`${valueOf("sell_start_time")}–${valueOf("sell_end_time")}`, sellScheduleMeta],
-      actions: sellScheduleActions, vertical: true },
     { id: "closeSchedule", title: "장 마감 청산", meta: "정시 · 재확인", tone: "schedule", logic: "마감", logicTone: "close", width: 460,
       fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"),
       summary: [`청산 ${valueOf("close_time")}`, `재확인 ${valueOf("close_retry_start")}–${valueOf("close_retry_end")}`] },
@@ -4264,7 +4450,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
         : (flow.symbols || []).join(", ") || "종목 미지정";
     nodes.push({
       id: `${prefix}-schedule`, title: flow.name || `매수 흐름 ${flowIndex + 1}`, meta: "한국 시각 · 종료 시각 제외", tone: "schedule", logic: "시간", logicTone: "schedule", width: 460,
-      fields: takeFlow("name", "buy_start_time", "buy_end_time", "buy_scan_seconds"), flowId: flow.id,
+      fields: takeFlow("name", "buy_start_time", "buy_end_time", "buy_scan_seconds"), flowKind: "buy", flowId: flow.id,
       summary: [`${flow.buy_start_time}–${flow.buy_end_time}`, `${flow.buy_scan_seconds}초마다`],
       description: "이 시간대의 종목 조회와 매수 조건은 다른 매수 흐름과 독립적으로 실행됩니다.",
     }, {
@@ -4285,12 +4471,38 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "buy", index, flowId: flow.id },
     }));
   });
-  sellGroups.forEach((group, index) => nodes.push({
-    id: `sellGroup-${group.id}`, title: `매도 조건 ${index + 1}`,
-    meta: `${group.conditions.length}개 · 내부 OR${index ? " · 이전 블록과 AND" : ""}`,
-    tone: "risk", logic: index ? "AND" : "ANY", logicTone: index ? "all" : "any", width: 460,
-    summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "sell", index },
-  }));
+  sellFlows.forEach((flow, flowIndex) => {
+    const prefix = blockFlowNodePrefix("sell", flow.id);
+    const flowFields = new Map(blockSellFlowFields(flow).map(field => [field.settingKey, field]));
+    const takeFlow = (...keys) => keys.map(key => flowFields.get(key)).filter(Boolean);
+    const groups = blockConditionGroups("sell", flow.id);
+    const conditions = groups.flatMap(group => group.conditions || []);
+    const hasLiveConditions = conditions.some(isLiveProfitCondition);
+    const hasBarConditions = conditions.some(hasBarMetricCondition);
+    const scheduleMeta = hasLiveConditions && hasBarConditions
+      ? "실시간 · 봉 시점"
+      : hasLiveConditions ? "실시간" : "봉 시점";
+    const scheduleActions = [
+      ...(hasLiveConditions ? ["수익률 · 실시간 현재가"] : []),
+      ...(hasBarConditions ? ["차트 값 · 각 조건의 봉 설정"] : []),
+      `${flow.sell_scan_seconds}초 보완 판단`,
+    ];
+    nodes.push({
+      id: `${prefix}-schedule`, title: flow.name || `매도 흐름 ${flowIndex + 1}`,
+      meta: "한국 시각 · 종료 시각 제외", tone: "schedule", logic: "시간", logicTone: "schedule", width: 460,
+      fields: takeFlow("name", "sell_start_time", "sell_end_time", "sell_scan_seconds"),
+      flowKind: "sell", flowId: flow.id,
+      summary: [`${flow.sell_start_time}–${flow.sell_end_time}`, scheduleMeta],
+      description: "이 시간대의 매도 조건은 다른 매도 흐름과 독립적으로 실행됩니다. 활성 흐름 중 하나가 통과하면 공통 매도 주문으로 이어집니다.",
+      actions: scheduleActions,
+    });
+    groups.forEach((group, index) => nodes.push({
+      id: `${prefix}-group-${group.id}`, title: `매도 조건 ${index + 1}`,
+      meta: `${group.conditions.length}개 · 내부 OR${index ? " · 이전 블록과 AND" : ""}`,
+      tone: "risk", logic: index ? "AND" : "ANY", logicTone: index ? "all" : "any", width: 460,
+      summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "sell", index, flowId: flow.id },
+    }));
+  });
   const nodeIds = new Set(nodes.map(node => node.id));
   if (state.blockSelectedNode == null || (state.blockSelectedNode && !nodeIds.has(state.blockSelectedNode))) {
     state.blockSelectedNode = false;
@@ -4311,7 +4523,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
     world.style.height = `${Math.max(1100, tree.scrollHeight + tree.offsetTop + 180)}px`;
   });
   const selected = nodes.find(node => node.id === state.blockSelectedNode);
-  const inspector = createComposerInspector(selected, running, flows.length);
+  const inspector = createComposerInspector(selected, running, { buy: flows.length, sell: sellFlows.length });
   if (inspector) {
     elements.blockCanvas.append(inspector);
     restoreComposerInspectorView(inspectorSnapshot);
@@ -4351,11 +4563,12 @@ function renderStrategyBlocks() {
 
   if (parsed.template === "condition-bollinger-v1" && state.blockPackage) {
     const flows = blockBuyFlows();
+    const sellFlows = blockSellFlows();
     const buyGroups = flows.flatMap(flow => blockConditionGroups("buy", flow.id));
-    const sellGroups = blockConditionGroups("sell");
+    const sellGroups = sellFlows.flatMap(flow => blockConditionGroups("sell", flow.id));
     const buyConditions = buyGroups.reduce((count, group) => count + group.conditions.length, 0);
     const sellConditions = sellGroups.reduce((count, group) => count + group.conditions.length, 0);
-    elements.blockSummary.textContent = `매수 흐름 ${flows.length}개 · 매수 조건 ${buyConditions}개 · 매도 조건 ${sellConditions}개 · 흐름별 조건 / 예산·보유 공유`;
+    elements.blockSummary.textContent = `매수 흐름 ${flows.length}개 · 매수 조건 ${buyConditions}개 · 매도 흐름 ${sellFlows.length}개 · 매도 조건 ${sellConditions}개 · 예산·보유 공유`;
   } else {
     elements.blockSummary.textContent = `${parsed.fields.length}개 설정 · ${parsed.schedules.length}개 일정 · ${parsed.handlers.length}개 실행 흐름`;
   }

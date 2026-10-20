@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 
 from trade_router import OrderStatus
 from trade_router_studio.block_packages import (
+    BlockConditionGroup,
+    BlockTradeCondition,
     DEFAULT_CONDITION_BOLLINGER_SETTINGS,
     render_block_strategy,
 )
@@ -33,9 +35,9 @@ class MemoryState:
 
 
 class LiveSellHarness:
-    def __init__(self) -> None:
+    def __init__(self, settings=None) -> None:
         namespace: dict[str, object] = {}
-        source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+        source = render_block_strategy(settings or DEFAULT_CONDITION_BOLLINGER_SETTINGS)
         exec(compile(source, "<managed-block>", "exec"), namespace)
         harness = self
 
@@ -59,6 +61,9 @@ class LiveSellHarness:
         self.submitted: list[dict[str, object]] = []
         self.subscribed: list[str] = []
         self.unsubscribed: list[str] = []
+        self.info_messages: list[str] = []
+        self.warning_messages: list[str] = []
+        self.error_messages: list[str] = []
         self.ctx = SimpleNamespace(
             state=MemoryState(),
             account=SimpleNamespace(
@@ -66,14 +71,18 @@ class LiveSellHarness:
                 open_orders=self.open_orders,
             ),
             market=SimpleNamespace(
+                quote=self.market_quote,
                 subscribe_quotes=self.subscribe_quotes,
                 unsubscribe=self.unsubscribe,
             ),
-            orders=SimpleNamespace(market_sell=self.market_sell),
+            orders=SimpleNamespace(
+                market_sell=self.market_sell,
+                limit_sell=self.limit_sell,
+            ),
             log=SimpleNamespace(
-                info=lambda message: None,
-                warning=lambda message: None,
-                error=lambda message: None,
+                info=self.info_messages.append,
+                warning=self.warning_messages.append,
+                error=self.error_messages.append,
             ),
         )
 
@@ -90,7 +99,18 @@ class LiveSellHarness:
     async def unsubscribe(self, subscription_id):
         self.unsubscribed.append(subscription_id)
 
+    async def market_quote(self, code, *, venue):
+        return SimpleNamespace(
+            price=Decimal("104"), delayed=False, stale=False,
+        )
+
     async def market_sell(self, **kwargs):
+        kwargs["order_type"] = "MARKET"
+        self.submitted.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED)
+
+    async def limit_sell(self, **kwargs):
+        kwargs["order_type"] = "LIMIT"
         self.submitted.append(kwargs)
         return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED)
 
@@ -226,4 +246,59 @@ def test_realtime_sell_reservation_blocks_liquidation_during_broker_lag() -> Non
     asyncio.run(exercise())
 
     assert len(harness.submitted) == 1
+
+
+def test_aftermarket_market_sell_is_skipped_once_without_broker_submission() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(update={
+        "sell_start_time": "09:00",
+        "sell_end_time": "19:59",
+        "route": "SOR",
+        "sell_condition_groups": [
+            BlockConditionGroup(
+                id="sell-profit",
+                conditions=[
+                    BlockTradeCondition(
+                        left="profit_rate", operator="GTE",
+                        right="value", value=Decimal("3"),
+                    )
+                ],
+            )
+        ],
+    })
+    harness = LiveSellHarness(settings)
+    harness.now = datetime(2026, 10, 20, 16, 0, tzinfo=SEOUL)
+
+    async def exercise() -> None:
+        await harness.strategy._refresh_live_positions(
+            harness.ctx, await harness.balance(), ()
+        )
+        await harness.strategy.on_quote(harness.ctx, harness.quote())
+        harness.now = datetime(2026, 10, 20, 16, 0, 1, tzinfo=SEOUL)
+        await harness.strategy.on_quote(harness.ctx, harness.quote())
+
+    asyncio.run(exercise())
+
+    assert harness.submitted == []
+    assert len(harness.warning_messages) == 1
+    assert "애프터마켓" in harness.warning_messages[0]
+    assert "지정가로 설정" in harness.warning_messages[0]
+
+
+def test_aftermarket_close_uses_configured_limit_sell() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(update={
+        "sell_order_type": "LIMIT",
+        "route": "NXT",
+    })
+    harness = LiveSellHarness(settings)
+    harness.now = datetime(2026, 10, 20, 19, 50, tzinfo=SEOUL)
+
+    asyncio.run(harness.strategy._liquidate_owned_positions(
+        harness.ctx,
+        harness.now,
+        reason="장 마감 정시 전량 청산",
+    ))
+
+    assert len(harness.submitted) == 1
+    assert harness.submitted[0]["order_type"] == "LIMIT"
+    assert harness.submitted[0]["price"] == Decimal("104")
 

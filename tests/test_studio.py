@@ -257,6 +257,9 @@ def test_managed_block_suppresses_market_quote_rejections_for_the_day() -> None:
     assert strategy._is_non_retryable_buy_rejection(
         "시장가호가불가로 주문이 불가합니다. [APBK1943]"
     )
+    assert strategy._is_non_retryable_buy_rejection(
+        "[애프터마켓] 애프터 지정가/최유리/최우선 주문만 가능합니다. [APBK3061]"
+    )
     strategy._exclude_buy_for_day(
         ctx,
         first_day,
@@ -323,7 +326,7 @@ def test_managed_block_routes_sor_orders_to_krx_when_nxt_is_unavailable() -> Non
 
     assert first == second == "KRX"
     assert market.calls == [Venue.NXT]
-    assert values["daily_order_routes"]["routes"] == {"393890": "KRX"}
+    assert values["daily_order_routes"]["routes"] == {"REGULAR:393890": "KRX"}
     assert messages == ["393890 주문 경로: NXT 거래 시세가 없어 KRX로 전송합니다."]
 
 
@@ -376,8 +379,91 @@ def test_managed_block_keeps_sor_when_nxt_is_available() -> None:
 
     assert first == second == "SOR"
     assert market.calls == [Venue.NXT]
-    assert values["daily_order_routes"]["routes"] == {"005930": "SOR"}
+    assert values["daily_order_routes"]["routes"] == {"REGULAR:005930": "SOR"}
     assert messages == []
+
+
+def test_managed_block_rechecks_sor_route_when_market_session_changes() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"route": "SOR"}
+    )
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    values: dict[str, object] = {}
+
+    class State:
+        def get(self, key: str, default=None):
+            return values.get(key, default)
+
+        def set(self, key: str, value) -> None:
+            values[key] = value
+
+    class Market:
+        def __init__(self) -> None:
+            self.price = Decimal("0")
+            self.calls: list[Venue] = []
+
+        async def quote(self, code, *, venue):
+            self.calls.append(venue)
+            return SimpleNamespace(
+                price=self.price, delayed=False, stale=False,
+            )
+
+    market = Market()
+    ctx = SimpleNamespace(
+        state=State(),
+        market=market,
+        log=SimpleNamespace(info=lambda message: None),
+    )
+    regular = datetime(2026, 10, 19, 10, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+    after = datetime(2026, 10, 19, 16, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    regular_route = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "393890", regular, current_price=Decimal("10020")
+        )
+    )
+    market.price = Decimal("10030")
+    after_route = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "393890", after, current_price=Decimal("10030")
+        )
+    )
+    cached_after_route = asyncio.run(
+        strategy._effective_order_route(
+            ctx, "393890", after, current_price=Decimal("10040")
+        )
+    )
+
+    assert regular_route == "KRX"
+    assert after_route == cached_after_route == "SOR"
+    assert market.calls == [Venue.NXT, Venue.NXT]
+    assert values["daily_order_routes"]["routes"] == {
+        "REGULAR:393890": "KRX",
+        "NXT_AFTER:393890": "SOR",
+    }
+
+
+def test_managed_block_blocks_market_orders_in_aftermarket_without_conversion() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    regular = datetime(2026, 10, 19, 15, 29, 59, tzinfo=ZoneInfo("Asia/Seoul"))
+    after = datetime(2026, 10, 19, 15, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    assert strategy._order_session_block_reason(regular, "SOR", "MARKET") is None
+    assert strategy._order_session_block_reason(after, "SOR", "LIMIT") is None
+    krx_reason = strategy._order_session_block_reason(after, "KRX", "LIMIT")
+    assert krx_reason is not None
+    assert "NXT 또는 SOR" in krx_reason
+    for route in ("NXT", "SOR"):
+        reason = strategy._order_session_block_reason(after, route, "MARKET")
+        assert reason is not None
+        assert route in reason
+        assert "지정가로 설정" in reason
 
 
 def test_managed_block_skips_nxt_market_buy_pauses() -> None:
@@ -1012,7 +1098,8 @@ def test_managed_block_supports_daily_bars_at_the_sell_start_time() -> None:
         source = render_block_strategy(normalized)
         assert normalized.sell_condition_groups[0].conditions[2].right_bar_interval == "1d"
         assert "ctx.scheduler.daily_at(" in source
-        assert 'schedule_id=f"condition-sell-daily-{index}"' in source
+        assert 'suffix = "daily" if interval == "1d" else "bars"' in source
+        assert 'schedule_id = f"{schedule_prefix}-{suffix}-{index}"' in source
         assert "await self.on_bar(ctx, event)" in source
 
 
@@ -1028,8 +1115,8 @@ def test_managed_block_can_include_the_current_forming_bar() -> None:
 
     round_trip = block_package_from_source("forming-bar", source)
     assert round_trip.settings.sell_condition_groups[0].conditions[2].right_bar_data_mode == "INCLUDE_CURRENT"
-    assert 'schedule_id="condition-sell-live"' in source
-    assert "seconds=BUY_SCAN_SECONDS" in source
+    assert 'schedule_id = f"{schedule_prefix}-live"' in source
+    assert 'seconds=flow["sell_scan_seconds"]' in source
     assert 'condition[f"{side}_bar_data_mode"]' in source
 
     package = block_package_from_source("live-daily", source)
@@ -1765,6 +1852,16 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
     source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
     namespace: dict[str, object] = {}
     exec(compile(source, "<managed-block>", "exec"), namespace)
+    fixed_now = datetime(
+        2026, 10, 16, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")
+    )
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now.astimezone(tz) if tz is not None else fixed_now
+
+    namespace["datetime"] = Clock
     assert namespace["ScheduleKind"] is ScheduleKind
     strategy = namespace["ManagedBlockStrategy"]()
 
@@ -1830,9 +1927,7 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
             price=Decimal("8000"),
             delayed=False,
             stale=False,
-            received_at=datetime(
-                2026, 10, 16, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")
-            ),
+            received_at=fixed_now,
         )
         await strategy.on_quote(ctx, quote)
         # KRX and NXT may publish the same threshold crossing. The reservation
