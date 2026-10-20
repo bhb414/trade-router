@@ -2265,7 +2265,7 @@ function createAttachedRuleActionEditor(kind, flowId, node, disabled) {
   const title = document.createElement("strong");
   title.textContent = "통과하면";
   const hint = document.createElement("span");
-  hint.textContent = node.action ? "이 노드에서 주문 실행" : "행동 없음 · 상위 묶음으로 계속";
+  hint.textContent = node.action ? "여기서 주문 실행" : "주문 없이 다음 판단으로";
   heading.append(title, hint);
   section.append(heading);
   if (node.action) {
@@ -2310,8 +2310,8 @@ function createBlockRuleNodeEditor(reference, disabled) {
     const help = document.createElement("p");
     help.className = "composer-inspector-hint";
     help.textContent = node.operator === "ANY"
-      ? "괄호 안의 조건 중 하나만 참이어도 통과하며, 위에서 먼저 참인 분기의 행동을 실행합니다."
-      : "괄호 안의 모든 조건이 참이어야 통과합니다. 행동은 한 자식 경로에 두거나, 묶음 자체에 공통 fallback으로 둘 수 있습니다.";
+      ? "하나라도 참이면 통과합니다. 여러 조건이 참이면 위쪽 조건을 먼저 실행합니다."
+      : "모든 조건이 참이면 통과합니다.";
     section.append(help);
     const adds = document.createElement("div");
     adds.className = "rule-node-add-actions";
@@ -2848,12 +2848,47 @@ function legacyGroupsRuleTree(kind, groups, withAction = true) {
   return newBlockRuleRoot(kind, children, withAction);
 }
 
+function compactBlockRuleGroups(node) {
+  if (!node || node.kind !== "logic" || !Array.isArray(node.children)) return node;
+  const compactedChildren = node.children.map(child => {
+    let compacted = compactBlockRuleGroups(child);
+    while (
+      compacted?.kind === "logic"
+      && !compacted.action
+      && !compacted._keepForEditing
+      && Array.isArray(compacted.children)
+      && compacted.children.length === 1
+    ) {
+      compacted = compactBlockRuleGroups(compacted.children[0]);
+    }
+    return compacted;
+  });
+  node.children = compactedChildren.flatMap(child => (
+    child?.kind === "logic"
+    && !child.action
+    && !child._keepForEditing
+    && child.operator === node.operator
+    && Array.isArray(child.children)
+      ? child.children
+      : [child]
+  ));
+  // The root carries the flow's common action and remains visible even with a
+  // single condition. Redundant inner parentheses and same-operator groups are
+  // removed while groups that own an action remain intact.
+  return node;
+}
+
 function ensureBlockRuleTree(kind, owner) {
   if (!owner || typeof owner !== "object") return null;
   const key = `${kind}_rule_tree`;
   const current = owner[key];
-  if (current && current.kind === "logic" && Array.isArray(current.children)) return current;
-  owner[key] = legacyGroupsRuleTree(kind, owner[`${kind}_condition_groups`] || [], true);
+  if (current && current.kind === "logic" && Array.isArray(current.children)) {
+    owner[key] = compactBlockRuleGroups(current);
+    return owner[key];
+  }
+  owner[key] = compactBlockRuleGroups(
+    legacyGroupsRuleTree(kind, owner[`${kind}_condition_groups`] || [], true),
+  );
   return owner[key];
 }
 
@@ -2958,6 +2993,15 @@ function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL") 
   const child = childKind === "logic"
     ? newBlockRuleLogic(kind, operator, [newBlockRuleCondition(kind)], false)
     : newBlockRuleCondition(kind);
+  if (childKind === "logic") {
+    // Keep a group that the user just created long enough to add another
+    // condition or attach an action. The flag is deliberately non-enumerable,
+    // so redundant one-child groups are compacted again after save/reload.
+    Object.defineProperty(child, "_keepForEditing", {
+      value: true,
+      configurable: true,
+    });
+  }
   parent.children.push(child);
   state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${child.id}`;
   commitBlockRuleMutation();
@@ -4647,24 +4691,16 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
       disabled: (node.children || []).length >= 20,
     });
   }
-  children.push({
-    kind: "then",
-    id: `${node.id}-then`,
-    ruleKind: kind,
-    flowId,
-    ownerId: node.id,
-    children: node.action
-      ? [{ kind: "node", nodeId: ruleComposerActionId(kind, flowId, node.action.id) }]
-      : [{
-        kind: "add",
-        id: `${node.id}-add-action`,
-        label: `${kind === "sell" ? "매도" : "매수"} 행동 추가`,
-        action: "add-rule-action",
-        ruleKind: kind,
-        flowId,
-        ownerId: node.id,
-      }],
-  });
+  if (node.action) {
+    children.push({
+      kind: "then",
+      id: `${node.id}-then`,
+      ruleKind: kind,
+      flowId,
+      ownerId: node.id,
+      children: [{ kind: "node", nodeId: ruleComposerActionId(kind, flowId, node.action.id) }],
+    });
+  }
   return {
     kind: "rule-node",
     id: ruleComposerNodeId(kind, flowId, node.id),
@@ -4806,8 +4842,14 @@ function createComposerLogicConnector(entry, running) {
 }
 
 function createComposerRuleAddMenu(entry, running) {
-  const menu = document.createElement("div");
+  const menu = document.createElement("details");
   menu.className = "composer-tree-rule-add";
+  const summary = document.createElement("summary");
+  summary.textContent = "+ 조건 또는 묶음";
+  summary.setAttribute("aria-label", "조건 또는 AND·OR 묶음 추가 메뉴");
+  menu.append(summary);
+  const options = document.createElement("div");
+  options.className = "composer-tree-rule-add-options";
   const make = (label, childKind, operator = "ALL") => {
     const button = document.createElement("button");
     button.type = "button";
@@ -4822,11 +4864,12 @@ function createComposerRuleAddMenu(entry, running) {
       event.stopPropagation();
       addBlockRuleChild(entry.ruleKind, entry.flowId, entry.parentId, childKind, operator);
     });
-    menu.append(button);
+    options.append(button);
   };
   make("+ 조건식", "condition");
-  make("+ AND 묶음", "logic", "ALL");
-  make("+ OR 묶음", "logic", "ANY");
+  make("+ AND", "logic", "ALL");
+  make("+ OR", "logic", "ANY");
+  menu.append(options);
   return menu;
 }
 
@@ -4835,7 +4878,7 @@ function createComposerThenBranch(entry, definitions, running) {
   branch.className = "composer-then-branch";
   const label = document.createElement("span");
   label.className = "composer-then-label";
-  label.textContent = "통과하면";
+  label.textContent = "→ 실행";
   branch.append(label);
   const children = document.createElement("div");
   children.className = "composer-then-children";
@@ -4883,6 +4926,9 @@ function renderComposerTreeBranch(entry, definitions, running) {
   if (entry.kind === "then") return createComposerThenBranch(entry, definitions, running);
   const branch = document.createElement(entry.kind === "section" ? "section" : "div");
   branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}${entry.kind === "rule-node" ? " composer-rule-branch" : ""}`;
+  if (entry.kind === "rule-node") {
+    branch.classList.add(entry.isRoot ? "composer-rule-root" : "composer-rule-nested");
+  }
   if (entry.tone) {
     branch.classList.add(entry.tone);
     branch.dataset.tone = entry.tone;
@@ -5448,15 +5494,17 @@ function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
         title: isRoot
           ? `${kind === "sell" ? "매도" : "매수"} 판단`
           : `${operator === "ANY" ? "OR" : "AND"} 조건 묶음`,
-        meta: `${conditionCount}개 조건식 · ${operator === "ANY" ? "위에서 먼저 참인 분기 우선" : "모두 충족"}`,
+        meta: isRoot
+          ? `${conditionCount}개 조건 · ${operator === "ANY" ? "먼저 참인 분기 실행" : "모두 충족"}`
+          : `${conditionCount}개 조건`,
         tone: operator === "ANY" ? "any" : "all",
         logic: operator === "ANY" ? "OR" : "AND",
         logicTone: operator === "ANY" ? "any" : "all",
         width: 560,
-        summary: [operator === "ANY" ? "하나 이상 충족 · 위에서 먼저 참인 분기의 행동 실행" : "괄호 안의 조건을 모두 만족하면 통과"],
+        summary: [],
         description: isRoot
-          ? `이 흐름 안의 조건 계층을 위에서부터 판단합니다. 각 괄호 묶음의 AND·OR을 눌러 바로 바꿀 수 있습니다.`
-          : "이 묶음은 하나의 괄호처럼 처리됩니다. 안쪽에 조건식이나 다른 묶음을 넣을 수 있습니다.",
+          ? "이 흐름의 조건과 주문을 설정합니다."
+          : "이 안의 조건은 한 묶음으로 판단합니다.",
         ruleNode: { kind, flowId, nodeId: node.id, isRoot },
       });
     } else {

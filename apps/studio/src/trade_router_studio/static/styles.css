@@ -2863,21 +2863,30 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-tree-branch[data-tone="condition"] > .composer-tree-children::before { background: #7991b4; }
 .composer-tree-branch[data-tone="sell"] > .composer-tree-children::before { background: #b47b84; }
 
-/* Rule groups read as nested parentheses. Connector pills sit between sibling
-   expressions and are the direct AND/OR switch for their parent group. */
+/* Rule groups use a light parenthesis rail. The condition and action cards carry
+   the content, so nested groups do not need another full box around them. */
 .composer-rule-branch {
-  padding: 7px 8px 8px;
-  border: 1px solid #d8dde5;
-  border-left-width: 3px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, .46);
+  padding: 2px 0 3px 12px;
+  border: 0;
+  border-left: 2px solid #d8dde5;
+  border-radius: 0;
+  background: transparent;
 }
 .composer-rule-branch[data-tone="all"] { border-left-color: #76509a; }
 .composer-rule-branch[data-tone="any"] { border-left-color: #3670c8; }
-.composer-rule-branch[data-tone="condition"] { border-left-color: #89a0bc; }
+.composer-rule-branch[data-tone="condition"] {
+  padding-left: 0;
+  border-left: 0;
+}
 .composer-rule-branch > .composer-tree-children {
-  margin-left: 7px;
-  padding-left: 25px;
+  margin-left: 3px;
+  padding: 5px 0 0 22px;
+}
+.composer-rule-nested[data-tone="all"] > .composer-tree-row,
+.composer-rule-nested[data-tone="any"] > .composer-tree-row {
+  border-color: #dbe1e8;
+  background: #fbfcfd;
+  box-shadow: none;
 }
 .composer-logic-connector-row {
   min-height: 28px;
@@ -2906,15 +2915,45 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-logic-connector:hover:not(:disabled) { box-shadow: 0 0 0 3px rgba(52, 105, 199, .11); }
 .composer-logic-connector:disabled { opacity: .56; cursor: default; }
 .composer-tree-rule-add {
+  width: max-content;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.composer-tree-rule-add > summary {
+  width: max-content;
+  min-height: 27px;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 9px;
+  border: 1px dashed #bcc6d3;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #5d6979;
+  font-size: 10px;
+  font-weight: 680;
+  cursor: pointer;
+  list-style: none;
+}
+.composer-tree-rule-add > summary::-webkit-details-marker { display: none; }
+.composer-tree-rule-add > summary:hover {
+  border-color: #8fa8d0;
+  background: #fff;
+  color: #315f9d;
+}
+.composer-tree-rule-add-options {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 6px 7px;
-  border: 1px dashed #cbd3de;
+  margin-top: 6px;
+  padding: 6px;
+  border: 1px solid #dce2e9;
   border-radius: 7px;
-  background: rgba(248, 250, 252, .82);
+  background: rgba(255, 255, 255, .94);
+  box-shadow: 0 4px 12px rgba(31, 41, 55, .08);
 }
-.composer-tree-rule-add button {
+.composer-tree-rule-add-options button {
   min-height: 29px;
   padding: 5px 9px;
   border: 1px solid #d2d9e3;
@@ -2925,7 +2964,7 @@ button.composer-tree-add-row { cursor: pointer; }
   font-weight: 650;
   cursor: pointer;
 }
-.composer-tree-rule-add button:hover:not(:disabled) { border-color: #8fa8d0; color: #315f9d; }
+.composer-tree-rule-add-options button:hover:not(:disabled) { border-color: #8fa8d0; color: #315f9d; }
 .composer-then-branch {
   position: relative;
   display: grid;
@@ -2936,13 +2975,13 @@ button.composer-tree-add-row { cursor: pointer; }
 }
 .composer-tree-children > .composer-then-branch::before { top: 17px; }
 .composer-then-label {
-  min-height: 27px;
+  min-height: 24px;
   display: inline-flex;
   align-items: center;
-  padding: 4px 9px;
-  border: 1px solid #b9d6d0;
-  border-radius: 999px;
-  background: #edf8f5;
+  padding: 2px 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
   color: #286c60;
   font-size: 9px;
   font-weight: 760;
