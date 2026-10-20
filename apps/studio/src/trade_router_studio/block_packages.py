@@ -1465,6 +1465,59 @@ class ManagedBlockStrategy(Strategy):
             self._live_quote_subscriptions = {}
             self._live_positions = {}
             self._live_sell_pending = set()
+        if not hasattr(self, "_live_sell_recheck_at"):
+            self._live_sell_recheck_at = {}
+
+    def _mark_live_sell_pending(self, code, *, at=None):
+        """Reserve a symbol while a submitted sell reaches the broker ledger."""
+        self._ensure_live_state()
+        now = at or datetime.now(SEOUL)
+        self._live_sell_pending.add(code)
+        # A newly acknowledged order can take a few seconds to appear in the
+        # broker's open-order snapshot.  Keep the local reservation long enough
+        # to cover that propagation window so a quote burst cannot duplicate it.
+        self._live_sell_recheck_at[code] = now + timedelta(seconds=15)
+
+    def _clear_live_sell_pending(self, code):
+        self._ensure_live_state()
+        self._live_sell_pending.discard(code)
+        self._live_sell_recheck_at.pop(code, None)
+
+    def _live_sell_recheck_due(self, code, *, at=None):
+        self._ensure_live_state()
+        if code not in self._live_sell_pending:
+            return False
+        now = at or datetime.now(SEOUL)
+        return now >= self._live_sell_recheck_at.get(code, now)
+
+    def _reconcile_live_sell_pending(self, open_orders, *, desired, at=None):
+        """Reconcile the local duplicate guard with the broker's open orders.
+
+        Broker-confirmed sells are checked again after a short interval.  A
+        newly submitted local sell gets a longer grace period because the
+        broker snapshot may briefly lag the acknowledgement.  Once an order is
+        absent after its grace period, an external cancel can no longer leave
+        the symbol blocked forever.
+        """
+        self._ensure_live_state()
+        now = at or datetime.now(SEOUL)
+        broker_pending = {
+            item.instrument.code
+            for item in open_orders
+            if item.remaining_quantity > 0 and item.side.value == "SELL"
+        }
+        reconciled = set(broker_pending)
+        for code in self._live_sell_pending - broker_pending:
+            if code in desired and now < self._live_sell_recheck_at.get(code, now):
+                reconciled.add(code)
+        self._live_sell_pending = reconciled
+        for code in broker_pending:
+            # Broker-confirmed orders need only a short polling interval.  If a
+            # user cancels one elsewhere, the next due quote refresh releases it.
+            self._live_sell_recheck_at[code] = now + timedelta(seconds=3)
+        for code in tuple(self._live_sell_recheck_at):
+            if code not in reconciled:
+                self._live_sell_recheck_at.pop(code, None)
 
     @staticmethod
     def _is_live_profit_condition(condition):
@@ -1491,31 +1544,51 @@ class ManagedBlockStrategy(Strategy):
                     return condition
         return None
 
+    @staticmethod
+    def _live_quote_venues():
+        configured = Venue(MARKET_VENUE)
+        if configured is Venue.INTEGRATED:
+            # KIS' integrated H0UNCNT0 stream may accept a subscription without
+            # publishing quotes.  Subscribe to the two underlying live feeds so
+            # realtime exits work during both the KRX and NXT sessions.
+            return (Venue.KRX, Venue.NXT)
+        return (configured,)
+
     async def _subscribe_live_quote(self, ctx, code):
         self._ensure_live_state()
-        if code in self._live_quote_subscriptions:
-            return
-        try:
-            subscriptions = await ctx.market.subscribe_quotes(
-                code, venue=Venue(MARKET_VENUE)
+        active = self._live_quote_subscriptions.setdefault(code, {})
+        for venue in self._live_quote_venues():
+            if venue.value in active:
+                continue
+            try:
+                subscriptions = await ctx.market.subscribe_quotes(code, venue=venue)
+            except RouterError as exc:
+                ctx.log.warning(
+                    f"{self._instrument_label(ctx, code)} {venue.value} 실시간 익절·손절 구독 보류 "
+                    f"[{exc.code.value}]: {exc.message}"
+                )
+                continue
+            subscription_ids = tuple(
+                str(item["id"])
+                for item in subscriptions
+                if item.get("id") is not None
             )
-        except RouterError as exc:
-            ctx.log.warning(
-                f"{self._instrument_label(ctx, code)} 실시간 익절·손절 구독 보류 [{exc.code.value}]: {exc.message}"
-            )
-            return
-        if subscriptions:
-            self._live_quote_subscriptions[code] = subscriptions[0]["id"]
+            if subscription_ids:
+                active[venue.value] = subscription_ids
+        if not active:
+            self._live_quote_subscriptions.pop(code, None)
 
     async def _unsubscribe_live_quote(self, ctx, code):
         self._ensure_live_state()
-        subscription_id = self._live_quote_subscriptions.pop(code, None)
-        if subscription_id is None:
+        subscriptions = self._live_quote_subscriptions.pop(code, None)
+        if not subscriptions:
             return
-        try:
-            await ctx.market.unsubscribe(subscription_id)
-        except RouterError:
-            pass
+        for subscription_ids in subscriptions.values():
+            for subscription_id in subscription_ids:
+                try:
+                    await ctx.market.unsubscribe(subscription_id)
+                except RouterError:
+                    pass
 
     async def _refresh_live_positions(self, ctx, balance, open_orders):
         self._ensure_live_state()
@@ -1527,12 +1600,7 @@ class ManagedBlockStrategy(Strategy):
             if code in positions and positions[code].quantity > 0
         }
         self._live_positions = {code: positions[code] for code in desired}
-        pending_sells = {
-            item.instrument.code
-            for item in open_orders
-            if item.remaining_quantity > 0 and item.side.value == "SELL"
-        }
-        self._live_sell_pending.update(pending_sells)
+        self._reconcile_live_sell_pending(open_orders, desired=desired)
         for code in sorted(desired):
             await self._subscribe_live_quote(ctx, code)
         for code in tuple(self._live_quote_subscriptions):
@@ -1992,7 +2060,7 @@ class ManagedBlockStrategy(Strategy):
                 ctx.log.error(f"{self._instrument_label(ctx, code)} 매도 요청 실패 [{exc.code.value}]: {exc.message}")
                 continue
             if order.status is not OrderStatus.REJECTED:
-                self._live_sell_pending.add(code)
+                self._mark_live_sell_pending(code)
             price_text = f" {limit_price}원" if limit_price is not None else ""
             decision_time = (
                 f"완성봉 마감 {event.scheduled_at:%H:%M:%S}"
@@ -2013,7 +2081,9 @@ class ManagedBlockStrategy(Strategy):
             return
         code = quote.instrument.code
         position = self._live_positions.get(code)
-        if position is None or code in self._live_sell_pending:
+        if position is None:
+            return
+        if code in self._live_sell_pending and not self._live_sell_recheck_due(code):
             return
         condition = self._matched_live_profit_condition(
             quote.price, position.average_price
@@ -2032,7 +2102,12 @@ class ManagedBlockStrategy(Strategy):
             )
             return
         position = positions.get(code)
-        if position is None or code in pending_codes or code not in tracked:
+        if (
+            position is None
+            or code in pending_codes
+            or code in self._live_sell_pending
+            or code not in tracked
+        ):
             return
         condition = self._matched_live_profit_condition(
             quote.price, position.average_price
@@ -2057,7 +2132,7 @@ class ManagedBlockStrategy(Strategy):
         quantity = min(tracked_quantity, position.available_quantity)
         if quantity <= 0:
             return
-        self._live_sell_pending.add(code)
+        self._mark_live_sell_pending(code)
         limit_price = None
         try:
             order_route = await self._effective_order_route(
@@ -2076,11 +2151,11 @@ class ManagedBlockStrategy(Strategy):
                     client_order_id=order_id,
                 )
         except RouterError as exc:
-            self._live_sell_pending.discard(code)
+            self._clear_live_sell_pending(code)
             ctx.log.error(f"{self._instrument_label(ctx, code)} 실시간 익절·손절 매도 실패 [{exc.code.value}]: {exc.message}")
             return
         if order.status is OrderStatus.REJECTED:
-            self._live_sell_pending.discard(code)
+            self._clear_live_sell_pending(code)
         reason = " 그리고 ".join(
             "(" + " 또는 ".join(self._condition_summary(item) for item in matched) + ")"
             for matched in matched_groups
@@ -2109,10 +2184,10 @@ class ManagedBlockStrategy(Strategy):
         if order.request.side.value != "SELL":
             return
         if order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED}:
-            self._live_sell_pending.discard(code)
+            self._clear_live_sell_pending(code)
             return
         if order.status is OrderStatus.FILLED:
-            self._live_sell_pending.discard(code)
+            self._clear_live_sell_pending(code)
             tracked = dict(ctx.state.get("strategy_positions", {}))
             tracked.pop(code, None)
             ctx.state.set("strategy_positions", tracked)

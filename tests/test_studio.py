@@ -1712,6 +1712,50 @@ def test_managed_block_strategy_recovers_a_late_filled_position() -> None:
     assert values["strategy_positions"] == {"079650": "5"}
 
 
+def test_managed_block_strategy_integrated_live_quotes_use_krx_and_nxt() -> None:
+    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(
+        update={"market_venue": "INTEGRATED"}
+    )
+    source = render_block_strategy(settings)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    subscribed: list[tuple[str, Venue]] = []
+    unsubscribed: list[str] = []
+
+    class Market:
+        async def subscribe_quotes(self, code, *, venue):
+            subscribed.append((code, venue))
+            return ({"id": f"quote-{venue.value}-{code}"},)
+
+        async def unsubscribe(self, subscription_id):
+            unsubscribed.append(subscription_id)
+
+    ctx = SimpleNamespace(
+        market=Market(),
+        log=SimpleNamespace(warning=lambda message: None),
+    )
+
+    async def exercise() -> None:
+        await strategy._subscribe_live_quote(ctx, "079650")
+        # Reconciliation can call this repeatedly. Existing leases must be reused.
+        await strategy._subscribe_live_quote(ctx, "079650")
+        await strategy._unsubscribe_live_quote(ctx, "079650")
+
+    asyncio.run(exercise())
+
+    assert subscribed == [
+        ("079650", Venue.KRX),
+        ("079650", Venue.NXT),
+    ]
+    assert unsubscribed == [
+        "quote-KRX-079650",
+        "quote-NXT-079650",
+    ]
+    assert strategy._live_quote_subscriptions == {}
+
+
 def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
     source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
     namespace: dict[str, object] = {}
@@ -1776,18 +1820,19 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
 
     async def exercise() -> None:
         await strategy._refresh_live_positions(ctx, balance, ())
-        await strategy.on_quote(
-            ctx,
-            SimpleNamespace(
-                instrument=SimpleNamespace(code="079650"),
-                price=Decimal("8000"),
-                delayed=False,
-                stale=False,
-                received_at=datetime(
-                    2026, 10, 16, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")
-                ),
+        quote = SimpleNamespace(
+            instrument=SimpleNamespace(code="079650"),
+            price=Decimal("8000"),
+            delayed=False,
+            stale=False,
+            received_at=datetime(
+                2026, 10, 16, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")
             ),
         )
+        await strategy.on_quote(ctx, quote)
+        # KRX and NXT may publish the same threshold crossing. The reservation
+        # made before order submission must suppress the second sell.
+        await strategy.on_quote(ctx, quote)
 
     asyncio.run(exercise())
 
