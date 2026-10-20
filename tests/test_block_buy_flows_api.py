@@ -90,6 +90,56 @@ def test_invalid_flow_window_does_not_replace_saved_strategy(tmp_path: Path) -> 
         assert source_path.read_text(encoding="utf-8") == original
 
 
+def test_stale_block_package_cannot_overwrite_newer_api_edit(tmp_path: Path) -> None:
+    """An open browser must not restore settings replaced through another client."""
+
+    with TestClient(create_app(_workspace(tmp_path / "workspace"))) as client:
+        endpoint = f"/api/strategies/{quote('블록 예제.py')}/block-package"
+        initial = client.get(endpoint).json()
+        initial["settings"]["buy_flows"] = _flows(initial["settings"])
+        prepared = client.put(endpoint, json=initial)
+        assert prepared.status_code == 200, prepared.text
+
+        first = client.get(endpoint).json()
+        stale = deepcopy(first)
+        assert first["revision"] == stale["revision"]
+
+        first_condition = first["settings"]["buy_flows"][0][
+            "buy_condition_groups"
+        ][0]["conditions"][0]
+        first_condition["operator"] = "LTE"
+        saved = client.put(endpoint, json=first)
+        assert saved.status_code == 200, saved.text
+
+        stale_condition = stale["settings"]["buy_flows"][0][
+            "buy_condition_groups"
+        ][0]["conditions"][0]
+        stale_condition["value"] = "1.00"
+        rejected = client.put(endpoint, json=stale)
+        assert rejected.status_code == 409
+        assert "다른 창이나 API" in rejected.json()["detail"]
+
+        restored = client.get(endpoint).json()
+        restored_condition = restored["settings"]["buy_flows"][0][
+            "buy_condition_groups"
+        ][0]["conditions"][0]
+        assert restored_condition["operator"] == "LTE"
+        assert restored["revision"] != stale["revision"]
+
+        # A page kept open across an application update has no token. Allowing
+        # that PUT would leave one final stale-overwrite path, so it must reload.
+        legacy = deepcopy(restored)
+        legacy.pop("revision")
+        legacy["settings"]["buy_scan_seconds"] = 45
+        rejected_legacy_put = client.put(endpoint, json=legacy)
+        assert rejected_legacy_put.status_code == 409
+
+        # Revision-free exports remain importable as a new strategy.
+        legacy["name"] = "구형 리비전 없는 내보내기"
+        imported = client.post("/api/strategies/import-block", json=legacy)
+        assert imported.status_code == 200, imported.text
+
+
 def test_legacy_freeform_layout_remains_importable_for_fixed_tree_ui(
     tmp_path: Path,
 ) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from datetime import time
 from decimal import Decimal
@@ -609,6 +610,10 @@ class BlockStrategyPackage(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     settings: BlockStrategySettings | ConditionBollingerBlockSettings
     layout: BlockEditorLayout = Field(default_factory=BlockEditorLayout)
+    # A settings-only optimistic concurrency token.  It intentionally excludes
+    # the generated Python source and visual layout: server runtime upgrades may
+    # recompile the same settings, while canvas position is local UI state.
+    revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_template_settings(self) -> "BlockStrategyPackage":
@@ -2463,7 +2468,21 @@ def block_package_from_source(name: str, source: str) -> BlockStrategyPackage:
     tree, constants = _constants_from_source(source)
     template = constants.get("BLOCK_TEMPLATE")
     if template == CONDITION_BOLLINGER_TEMPLATE:
-        return _condition_package(name, constants)
-    if template not in {None, BAR_OBSERVER_TEMPLATE}:
-        raise ValueError(f"Unsupported block template: {template}")
-    return _bar_observer_package(name, tree, constants)
+        package = _condition_package(name, constants)
+    else:
+        if template not in {None, BAR_OBSERVER_TEMPLATE}:
+            raise ValueError(f"Unsupported block template: {template}")
+        package = _bar_observer_package(name, tree, constants)
+    revision_payload = {
+        "template": package.template,
+        "settings": package.settings.model_dump(mode="json"),
+    }
+    revision = hashlib.sha256(
+        json.dumps(
+            revision_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return package.model_copy(update={"revision": revision})

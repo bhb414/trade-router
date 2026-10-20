@@ -3963,6 +3963,15 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                     detail="Only block strategies accept block definitions.",
                 )
             display_name = name[:-3] if name.lower().endswith(".py") else name
+            current = block_package_from_source(display_name, manager.read(name))
+            if package.revision is None or package.revision != current.revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "다른 창이나 API에서 블록 전략이 변경되었습니다. "
+                        "전략을 다시 열어 최신 설정을 불러온 뒤 변경해 주세요."
+                    ),
+                )
             normalized = package.model_copy(update={"name": display_name})
             source = compile_block_strategy(
                 normalized.settings,
