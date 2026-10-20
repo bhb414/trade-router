@@ -18,6 +18,7 @@ const state = {
   blockGraphRedraw: null,
   blockGraphPlan: null,
   blockSelectedNode: null,
+  blockExpressionSelections: new WeakMap(),
   blockRenderedRunning: null,
   conditionGroupSerial: 0,
   blockScheduleExpanded: new Map(),
@@ -2184,6 +2185,40 @@ function replaceExpressionNode(expression, path, replacement) {
   return expression;
 }
 
+function selectedExpressionPath(condition, side, expression) {
+  let selections = state.blockExpressionSelections.get(condition);
+  if (!selections) {
+    selections = { left: [], right: [] };
+    state.blockExpressionSelections.set(condition, selections);
+  }
+  const path = Array.isArray(selections[side]) ? selections[side] : [];
+  if (!expressionNodeAt(expression, path)) selections[side] = [];
+  return selections[side];
+}
+
+function setSelectedExpressionPath(condition, side, path) {
+  let selections = state.blockExpressionSelections.get(condition);
+  if (!selections) {
+    selections = { left: [], right: [] };
+    state.blockExpressionSelections.set(condition, selections);
+  }
+  selections[side] = [...path];
+}
+
+function expressionControlScope(kind, groupIndex, conditionIndex, side, flowId = null) {
+  return `${kind}:${flowId || "shared"}:${groupIndex}:${conditionIndex}:${side}`;
+}
+
+function expressionControlKey(scope, path, field) {
+  const node = Array.isArray(path) && path.length ? path.join(".") : "root";
+  return `${scope}:${node}:${field}`;
+}
+
+function markExpressionControl(control, key) {
+  control.dataset.expressionControl = key;
+  return control;
+}
+
 function expressionMetricLeaf(metric = "close", source = {}) {
   const barInterval = source.bar_interval || "3m";
   return {
@@ -2242,6 +2277,79 @@ function conditionExpressionSummary(expression) {
     return `${label}(${expression.bollinger_period || 55}, ${expression.bollinger_stddev || "1.04"}, ${interval}, ${position})`;
   }
   return `${label}(${interval}, ${position})`;
+}
+
+function atrVolatilityRateSource(expression) {
+  if (expression?.kind !== "binary" || expression.operator !== "MULTIPLY") return null;
+  const candidates = [[expression.left, expression.right], [expression.right, expression.left]];
+  for (const [ratio, scale] of candidates) {
+    if (scale?.kind !== "constant" || Number(scale.value) !== 100) continue;
+    if (ratio?.kind !== "binary" || ratio.operator !== "DIVIDE") continue;
+    if (ratio.left?.kind !== "metric" || ratio.left.metric !== "atr") continue;
+    if (ratio.right?.kind !== "metric" || ratio.right.metric !== "close") continue;
+    const sourceKey = node => [
+      node.bar_interval || "3m",
+      node.bar_data_mode || "COMPLETE_ONLY",
+      Math.max(0, Number.parseInt(node.offset, 10) || 0),
+    ].join(":");
+    if (sourceKey(ratio.left) !== sourceKey(ratio.right)) continue;
+    return ratio.left;
+  }
+  return null;
+}
+
+function conditionExpressionCompactSummary(expression, nested = false) {
+  const atrSource = atrVolatilityRateSource(expression);
+  if (atrSource) {
+    const interval = atrSource.bar_interval === "1d"
+      ? "일봉" : `${String(atrSource.bar_interval || "3m").replace("m", "")}분`;
+    return `ATR 변동성률(${atrSource.atr_period || 14}) · ${interval} · ${expressionBarPosition(atrSource)}`;
+  }
+  if (!expression || typeof expression !== "object") return "값 미설정";
+  if (expression.kind !== "binary") return conditionExpressionTokenLabel(expression);
+  const operator = conditionExpressionTokenLabel(expression);
+  const summary = `${conditionExpressionCompactSummary(expression.left, true)} ${operator} ${conditionExpressionCompactSummary(expression.right, true)}`;
+  return nested ? `(${summary})` : summary;
+}
+
+function conditionExpressionTokenLabel(expression) {
+  if (!expression || typeof expression !== "object") return "값 미설정";
+  if (expression.kind === "constant") return String(expression.value ?? "0");
+  if (expression.kind === "binary") {
+    return new Map(BLOCK_EXPRESSION_OPERATORS).get(expression.operator) || expression.operator || "+";
+  }
+  const label = new Map(BLOCK_CONDITION_METRICS).get(expression.metric) || expression.metric || "지표";
+  if (expression.metric === "atr") return `ATR(${expression.atr_period || 14})`;
+  if (String(expression.metric).startsWith("bollinger_")) {
+    return `${label}(${expression.bollinger_period || 55}, ${expression.bollinger_stddev || "1.04"})`;
+  }
+  return label;
+}
+
+function conditionExpressionMetricLeaves(expression) {
+  const leaves = [];
+  walkConditionExpression(expression, node => {
+    if (node.kind === "metric" && !["average_price", "profit_rate"].includes(node.metric)) leaves.push(node);
+  });
+  return leaves;
+}
+
+function conditionExpressionCommonBarContext(expression) {
+  const leaves = conditionExpressionMetricLeaves(expression);
+  if (leaves.length < 2) return null;
+  const first = leaves[0];
+  const signature = node => [
+    node.bar_interval || "3m",
+    node.bar_data_mode || "COMPLETE_ONLY",
+    Math.max(0, Number.parseInt(node.offset, 10) || 0),
+  ].join(":");
+  if (!leaves.every(node => signature(node) === signature(first))) return null;
+  return {
+    interval: first.bar_interval || "3m",
+    mode: first.bar_data_mode || "COMPLETE_ONLY",
+    offset: Math.max(0, Number.parseInt(first.offset, 10) || 0),
+    leaves,
+  };
 }
 
 function isLiveProfitCondition(condition) {
@@ -2576,12 +2684,126 @@ function expressionMetricOptions(kind, currentMetric = null) {
   return currentMetric === "obv" ? [...options, ["obv", "OBV"]] : options;
 }
 
-function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expression, path, disabled, flowId, rootExpression) {
-  const box = document.createElement("div");
-  box.style.cssText = "grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:7px;border:1px solid #d8dee8;border-radius:6px;background:#fff";
+function expressionPathsEqual(left, right) {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function appendConditionExpressionTokens(container, expression, path, selectedPath, onSelect, controlScope) {
+  if (expression.kind === "binary") {
+    const nested = path.length > 0;
+    if (nested) {
+      const open = document.createElement("span");
+      open.className = "block-expression-parenthesis";
+      open.textContent = "(";
+      container.append(open);
+    }
+    appendConditionExpressionTokens(container, expression.left, [...path, "left"], selectedPath, onSelect, controlScope);
+    const operator = document.createElement("button");
+    operator.type = "button";
+    operator.className = "block-expression-token operator";
+    operator.textContent = conditionExpressionTokenLabel(expression);
+    operator.title = `계산 선택 · ${conditionExpressionSummary(expression)}`;
+    operator.classList.toggle("selected", expressionPathsEqual(path, selectedPath));
+    operator.setAttribute("aria-pressed", expressionPathsEqual(path, selectedPath) ? "true" : "false");
+    markExpressionControl(operator, expressionControlKey(controlScope, path, "token"));
+    operator.addEventListener("click", () => onSelect(path));
+    container.append(operator);
+    appendConditionExpressionTokens(container, expression.right, [...path, "right"], selectedPath, onSelect, controlScope);
+    if (nested) {
+      const close = document.createElement("span");
+      close.className = "block-expression-parenthesis";
+      close.textContent = ")";
+      container.append(close);
+    }
+    return;
+  }
+  const token = document.createElement("button");
+  token.type = "button";
+  token.className = `block-expression-token ${expression.kind === "constant" ? "constant" : "metric"}`;
+  token.textContent = conditionExpressionTokenLabel(expression);
+  token.title = `값 선택 · ${conditionExpressionSummary(expression)}`;
+  token.classList.toggle("selected", expressionPathsEqual(path, selectedPath));
+  token.setAttribute("aria-pressed", expressionPathsEqual(path, selectedPath) ? "true" : "false");
+  markExpressionControl(token, expressionControlKey(controlScope, path, "token"));
+  token.addEventListener("click", () => onSelect(path));
+  container.append(token);
+}
+
+function createExpressionCommonBarContext(
+  kind, groupIndex, conditionIndex, side, rootExpression, disabled, flowId,
+) {
+  const context = conditionExpressionCommonBarContext(rootExpression);
+  if (!context) return null;
+  const controlScope = expressionControlScope(kind, groupIndex, conditionIndex, side, flowId);
+  const section = document.createElement("section");
+  section.className = "block-expression-common-context";
+  const heading = document.createElement("div");
+  heading.className = "block-expression-common-heading";
   const title = document.createElement("strong");
-  title.style.cssText = "grid-column:1/-1;color:#566377;font-size:9px";
-  title.textContent = expression.kind === "binary" ? "계산" : "값";
+  title.textContent = "공통 봉 기준";
+  const meta = document.createElement("span");
+  meta.textContent = `${context.leaves.length}개 지표에 함께 적용`;
+  heading.append(title, meta);
+  const fields = document.createElement("div");
+  fields.className = "block-expression-common-fields";
+  const mutateAll = (mutator, render = true) => mutateBlockExpression(
+    kind, groupIndex, conditionIndex, side, [], root => {
+      walkConditionExpression(root, node => {
+        if (node.kind === "metric" && !["average_price", "profit_rate"].includes(node.metric)) mutator(node);
+      });
+      return root;
+    }, flowId, render,
+  );
+  const interval = document.createElement("select");
+  BLOCK_BAR_INTERVALS.forEach(value => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value === "1d" ? "일봉" : value;
+    interval.append(option);
+  });
+  interval.value = context.interval;
+  interval.disabled = disabled;
+  markExpressionControl(interval, expressionControlKey(controlScope, ["common"], "interval"));
+  bindBlockConditionControl(interval, (value, render) => mutateAll(node => {
+    node.bar_interval = value;
+    if (node.metric === "atr") node.atr_period = clampBlockAtrPeriod(node.atr_period, value);
+  }, render));
+  const mode = document.createElement("select");
+  [["COMPLETE_ONLY", "완성봉만"], ["INCLUDE_CURRENT", "진행 중 봉 포함"]].forEach(([value, label]) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    mode.append(option);
+  });
+  mode.value = context.mode;
+  mode.disabled = disabled;
+  markExpressionControl(mode, expressionControlKey(controlScope, ["common"], "mode"));
+  bindBlockConditionControl(mode, (value, render) => mutateAll(node => { node.bar_data_mode = value; }, render));
+  const position = expressionInput({
+    value: displayedExpressionOffset({ offset: context.offset, bar_data_mode: context.mode }),
+    min: context.mode === "COMPLETE_ONLY" ? 1 : 0,
+    max: context.mode === "COMPLETE_ONLY" ? 201 : 200,
+    disabled,
+    onChange: (value, render) => mutateAll(node => {
+      node.offset = storedConditionOffset(value, node.bar_data_mode || "COMPLETE_ONLY");
+    }, render),
+  });
+  markExpressionControl(position, expressionControlKey(controlScope, ["common"], "offset"));
+  fields.append(expressionField("봉 주기", interval), expressionField("봉 상태", mode), expressionField("봉 위치", position));
+  section.append(heading, fields);
+  return section;
+}
+
+function createExpressionNodeEditor(
+  kind, groupIndex, conditionIndex, side, expression, path, disabled, flowId, rootExpression, sharedBarContext,
+) {
+  const box = document.createElement("div");
+  box.className = "block-expression-selected-editor";
+  const controlScope = expressionControlScope(kind, groupIndex, conditionIndex, side, flowId);
+  const controlKey = field => expressionControlKey(controlScope, path, field);
+  const title = document.createElement("strong");
+  title.className = "block-expression-selected-title";
+  title.textContent = expression.kind === "binary" ? "선택한 연산" : "선택한 값";
   box.append(title);
 
   const mutate = (mutator, render = true) => mutateBlockExpression(
@@ -2589,37 +2811,13 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
   );
 
   if (expression.kind === "binary") {
-    box.append(createExpressionNodeEditor(
-      kind, groupIndex, conditionIndex, side, expression.left, [...path, "left"], disabled, flowId, rootExpression,
-    ));
     const operator = conditionSelect(BLOCK_EXPRESSION_OPERATORS, expression.operator || "ADD", disabled, (value, render) => {
       mutate(node => { node.operator = value; }, render);
     });
+    markExpressionControl(operator, controlKey("operator"));
     const operatorField = expressionField("연산", operator);
-    operatorField.style.gridColumn = "1 / -1";
+    operatorField.classList.add("block-expression-primary-field");
     box.append(operatorField);
-    box.append(createExpressionNodeEditor(
-      kind, groupIndex, conditionIndex, side, expression.right, [...path, "right"], disabled, flowId, rootExpression,
-    ));
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "button quiet compact danger-text";
-    remove.style.gridColumn = "1 / -1";
-    remove.textContent = "이 계산 제거 · 왼쪽 값 유지";
-    remove.disabled = disabled;
-    remove.addEventListener("click", () => mutate(node => structuredClone(node.left)));
-    box.append(remove);
-    const extend = document.createElement("button");
-    extend.type = "button";
-    extend.className = "button quiet compact";
-    extend.style.gridColumn = "1 / -1";
-    extend.textContent = "+ 이 계산 전체에 연산 추가";
-    extend.disabled = disabled || expressionContainsMetric(rootExpression, "obv")
-      || expressionDepth(rootExpression) >= 4 || expressionNodeCount(rootExpression) >= 31;
-    extend.addEventListener("click", () => mutate(node => ({
-      kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
-    })));
-    box.append(extend);
     return box;
   }
 
@@ -2631,15 +2829,17 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
       : expressionMetricLeaf(value, node.kind === "metric" ? node : {}), render);
     },
   );
+  markExpressionControl(metric, controlKey("metric"));
   const metricField = expressionField("값 종류", metric);
-  metricField.style.gridColumn = "1 / -1";
+  metricField.classList.add("block-expression-primary-field");
   box.append(metricField);
 
   if (expression.kind === "constant") {
     const value = expressionInput({ value: expression.value ?? "0", step: "any", disabled,
       onChange: (next, render) => mutate(node => { node.value = String(next || "0"); }, render) });
+    markExpressionControl(value, controlKey("value"));
     const valueField = expressionField("숫자", value);
-    valueField.style.gridColumn = "1 / -1";
+    valueField.classList.add("block-expression-primary-field");
     box.append(valueField);
   } else if (["average_price", "profit_rate"].includes(expression.metric)) {
     const hint = document.createElement("span");
@@ -2658,6 +2858,7 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
     });
     interval.value = expression.bar_interval || "3m";
     interval.disabled = disabled;
+    markExpressionControl(interval, controlKey("interval"));
     bindBlockConditionControl(interval, (value, render) => mutate(node => {
       node.bar_interval = value;
       if (node.metric === "atr") node.atr_period = clampBlockAtrPeriod(node.atr_period, value);
@@ -2672,6 +2873,7 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
     });
     mode.value = expression.bar_data_mode || "COMPLETE_ONLY";
     mode.disabled = disabled;
+    markExpressionControl(mode, controlKey("mode"));
     bindBlockConditionControl(mode, (value, render) => mutate(node => { node.bar_data_mode = value; }, render));
 
     const barDataMode = expression.bar_data_mode || "COMPLETE_ONLY";
@@ -2682,7 +2884,20 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
       onChange: (value, render) => mutate(node => {
         node.offset = storedConditionOffset(value, node.bar_data_mode || "COMPLETE_ONLY");
       }, render) });
-    box.append(expressionField("봉 주기", interval), expressionField("봉 상태", mode), expressionField("봉 위치", offset));
+    markExpressionControl(offset, controlKey("offset"));
+    const barFields = document.createElement("div");
+    barFields.className = "block-expression-bar-fields";
+    barFields.append(expressionField("봉 주기", interval), expressionField("봉 상태", mode), expressionField("봉 위치", offset));
+    if (sharedBarContext) {
+      const individual = document.createElement("details");
+      individual.className = "block-expression-individual-context";
+      const summary = document.createElement("summary");
+      summary.textContent = "이 값만 봉 기준 다르게 설정";
+      individual.append(summary, barFields);
+      box.append(individual);
+    } else {
+      box.append(barFields);
+    }
 
     if (expression.metric === "atr") {
       const maximum = blockAtrMaxPeriod(expression.bar_interval);
@@ -2691,6 +2906,7 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
           node.atr_period = clampBlockAtrPeriod(value, node.bar_interval);
           period.value = String(node.atr_period);
         }, render) });
+      markExpressionControl(period, controlKey("atr-period"));
       box.append(expressionField("ATR 기간", period));
       const hint = document.createElement("span");
       hint.className = "block-condition-operand-hint";
@@ -2702,6 +2918,8 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
         onChange: (value, render) => mutate(node => { node.bollinger_period = Math.max(2, Number.parseInt(value, 10) || 55); }, render) });
       const deviation = expressionInput({ value: expression.bollinger_stddev ?? "1.04", min: .01, step: "any", disabled,
         onChange: (value, render) => mutate(node => { node.bollinger_stddev = String(value || "1.04"); }, render) });
+      markExpressionControl(period, controlKey("bollinger-period"));
+      markExpressionControl(deviation, controlKey("bollinger-stddev"));
       box.append(expressionField("볼린저 기간", period), expressionField("표준편차", deviation));
     }
     const offsetHint = document.createElement("span");
@@ -2712,29 +2930,125 @@ function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expr
     box.append(offsetHint);
   }
 
-  const add = document.createElement("button");
-  add.type = "button";
-  add.className = "button quiet compact";
-  add.style.gridColumn = "1 / -1";
-  add.textContent = "+ 이 값에 계산 추가";
-  add.disabled = disabled || expressionContainsMetric(rootExpression, "obv")
-    || expressionDepth(rootExpression) >= 4 || expressionNodeCount(rootExpression) >= 31;
-  add.addEventListener("click", () => mutate(node => ({
-    kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
-  })));
-  box.append(add);
   return box;
 }
 
-function appendExpressionModeAction(panel, { enabled, disabled, onClick }) {
+function createExpressionWorkbench(kind, groupIndex, conditionIndex, side, condition, disabled, flowId, expression) {
+  const workbench = document.createElement("div");
+  workbench.className = "block-expression-workbench";
+  const selectedPath = selectedExpressionPath(condition, side, expression);
+  const selectedNode = expressionNodeAt(expression, selectedPath) || expression;
+  const controlScope = expressionControlScope(kind, groupIndex, conditionIndex, side, flowId);
+  const formula = document.createElement("div");
+  formula.className = "block-expression-formula";
+  formula.setAttribute("aria-label", "수식 항목을 선택하여 편집");
+  appendConditionExpressionTokens(formula, expression, [], selectedPath, path => {
+    setSelectedExpressionPath(condition, side, path);
+    renderStrategyBlocks();
+  }, controlScope);
+  workbench.append(formula);
+
+  const commonContext = createExpressionCommonBarContext(
+    kind, groupIndex, conditionIndex, side, expression, disabled, flowId,
+  );
+  if (commonContext) workbench.append(commonContext);
+  workbench.append(createExpressionNodeEditor(
+    kind, groupIndex, conditionIndex, side, selectedNode, selectedPath, disabled, flowId, expression,
+    Boolean(commonContext),
+  ));
+
+  const actions = document.createElement("div");
+  actions.className = "block-expression-actions";
+  const extendDisabled = disabled || expressionContainsMetric(expression, "obv")
+    || expressionDepth(expression) >= 4 || expressionNodeCount(expression) >= 31;
+  const addCalculation = (label, path, selectRoot = false) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button quiet compact";
+    button.textContent = label;
+    button.disabled = extendDisabled;
+    markExpressionControl(button, expressionControlKey(
+      controlScope, path, selectRoot ? "add-root" : "add-selected",
+    ));
+    button.addEventListener("click", () => {
+      if (selectRoot) setSelectedExpressionPath(condition, side, []);
+      mutateBlockExpression(kind, groupIndex, conditionIndex, side, path, node => ({
+        kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
+      }), flowId);
+    });
+    actions.append(button);
+  };
+  addCalculation("+ 전체 식에 연산 추가", [], true);
+  if (selectedPath.length) addCalculation(
+    selectedNode.kind === "binary" ? "+ 선택 계산에 연산 추가" : "+ 선택 값에 연산 추가",
+    selectedPath,
+  );
+  if (selectedNode.kind === "binary") {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button quiet compact danger-text";
+    remove.textContent = selectedPath.length ? "선택 계산 제거 · 왼쪽 유지" : "전체 계산 제거 · 왼쪽 유지";
+    remove.disabled = disabled;
+    markExpressionControl(remove, expressionControlKey(controlScope, selectedPath, "remove"));
+    remove.addEventListener("click", () => mutateBlockExpression(
+      kind, groupIndex, conditionIndex, side, selectedPath,
+      node => structuredClone(node.left), flowId,
+    ));
+    actions.append(remove);
+  }
+  workbench.append(actions);
+  return workbench;
+}
+
+function appendExpressionModeAction(panel, { enabled, disabled, onClick, controlKey = null }) {
   const action = document.createElement("button");
   action.type = "button";
   action.className = "button quiet compact";
-  action.style.cssText = "grid-column:1/-1;justify-self:start";
   action.textContent = enabled ? "단순 값으로 되돌리기" : "+ 계산식 만들기";
   action.disabled = disabled;
+  if (controlKey) markExpressionControl(action, controlKey);
   action.addEventListener("click", onClick);
   panel.append(action);
+}
+
+function appendAdvancedExpressionAction(panel, { disabled, onClick, controlKey = null }) {
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "button quiet compact block-expression-advanced-action";
+  action.textContent = "+ 고급 계산식";
+  action.disabled = disabled;
+  if (controlKey) markExpressionControl(action, controlKey);
+  action.addEventListener("click", onClick);
+  panel.append(action);
+}
+
+function atrVolatilityRateExpression(condition, side) {
+  const source = {
+    offset: condition?.[`${side}_offset`],
+    bar_interval: condition?.[`${side}_bar_interval`] || "3m",
+    bar_data_mode: condition?.[`${side}_bar_data_mode`] || "COMPLETE_ONLY",
+    bollinger_period: condition?.[`${side}_bollinger_period`],
+    bollinger_stddev: condition?.[`${side}_bollinger_stddev`],
+    atr_period: condition?.[`${side}_atr_period`] || 14,
+  };
+  return {
+    kind: "binary",
+    operator: "MULTIPLY",
+    left: {
+      kind: "binary",
+      operator: "DIVIDE",
+      left: expressionMetricLeaf("atr", source),
+      right: expressionMetricLeaf("close", source),
+    },
+    right: { kind: "constant", value: "100" },
+  };
+}
+
+function applyAtrVolatilityRatePreset(kind, groupIndex, conditionIndex, side, condition, flowId = null) {
+  condition[`${side}_expression`] = atrVolatilityRateExpression(condition, side);
+  setSelectedExpressionPath(condition, side, ["left", "left"]);
+  setDirty(true);
+  renderStrategyBlocks();
 }
 
 function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, condition, disabled, flowId = null) {
@@ -2742,9 +3056,11 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
   panel.className = "block-condition-operand";
   const expression = conditionSideExpression(condition, side);
   const metric = condition[side];
+  const controlScope = expressionControlScope(kind, groupIndex, conditionIndex, side, flowId);
+  const setupControlKey = field => expressionControlKey(controlScope, [], field);
   const title = document.createElement("strong");
   title.textContent = expression
-    ? `${side === "left" ? "왼쪽" : "오른쪽"} 계산식`
+    ? "계산 값"
     : metric === "profit_rate"
     ? "실시간 계산"
     : metric === "obv"
@@ -2757,18 +3073,46 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
         ? "비교 기준"
         : side === "left" ? "왼쪽 값 설정" : "오른쪽 값 설정";
   panel.append(title);
-  appendExpressionModeAction(panel, {
-    enabled: Boolean(expression), disabled: disabled || (!expression && metric === "obv"),
-    onClick: () => expression
-      ? disableBlockExpression(kind, groupIndex, conditionIndex, side, flowId)
-      : enableBlockExpression(kind, groupIndex, conditionIndex, side, flowId),
-  });
+  const enableExpression = () => enableBlockExpression(kind, groupIndex, conditionIndex, side, flowId);
+  if (expression || side === "left") {
+    const setupActions = document.createElement("div");
+    setupActions.className = "block-expression-setup-actions";
+    appendExpressionModeAction(setupActions, {
+      enabled: Boolean(expression), disabled: disabled || (!expression && metric === "obv"),
+      controlKey: setupControlKey("expression-mode"),
+      onClick: () => expression
+        ? disableBlockExpression(kind, groupIndex, conditionIndex, side, flowId)
+        : enableExpression(),
+    });
+    if (!expression && side === "left" && metric !== "obv") {
+      const preset = document.createElement("button");
+      preset.type = "button";
+      preset.className = "button quiet compact block-expression-preset";
+      preset.textContent = "+ ATR 변동성률 수식";
+      preset.title = "((ATR(14) ÷ 종가) × 100) 수식을 만듭니다.";
+      preset.disabled = disabled;
+      markExpressionControl(preset, setupControlKey("atr-volatility-preset"));
+      preset.addEventListener("click", () => applyAtrVolatilityRatePreset(
+        kind, groupIndex, conditionIndex, side, condition, flowId,
+      ));
+      setupActions.append(preset);
+    }
+    panel.append(setupActions);
+  }
+  const appendRightAdvancedAction = () => {
+    if (side !== "right" || metric === "obv") return;
+    const actions = document.createElement("div");
+    actions.className = "block-expression-setup-actions advanced";
+    appendAdvancedExpressionAction(actions, {
+      disabled,
+      onClick: enableExpression,
+      controlKey: setupControlKey("advanced-expression"),
+    });
+    panel.append(actions);
+  };
   if (expression) {
-    const summary = document.createElement("span");
-    summary.className = "block-condition-operand-hint";
-    summary.textContent = conditionExpressionSummary(expression);
-    panel.append(summary, createExpressionNodeEditor(
-      kind, groupIndex, conditionIndex, side, expression, [], disabled, flowId, expression,
+    panel.append(createExpressionWorkbench(
+      kind, groupIndex, conditionIndex, side, condition, disabled, flowId, expression,
     ));
     return panel;
   }
@@ -2780,9 +3124,11 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     input.step = "any";
     input.value = condition.value ?? "0";
     input.disabled = disabled;
+    markExpressionControl(input, setupControlKey("direct-value"));
     bindBlockConditionControl(input, (value, render) => updateBlockCondition(kind, groupIndex, conditionIndex, "value", value, flowId, render));
     row.append(input);
     panel.append(row);
+    appendRightAdvancedAction();
     return panel;
   }
   if (metric === "average_price") {
@@ -2790,6 +3136,7 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     hint.className = "block-condition-operand-hint";
     hint.textContent = "계좌의 평균 매수가를 사용합니다.";
     panel.append(hint);
+    appendRightAdvancedAction();
     return panel;
   }
   if (metric === "profit_rate") {
@@ -2797,6 +3144,7 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     hint.className = "block-condition-operand-hint";
     hint.textContent = "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다. 수수료·세금은 포함하지 않습니다.";
     panel.append(hint);
+    appendRightAdvancedAction();
     return panel;
   }
   const intervalRow = document.createElement("label");
@@ -2896,6 +3244,7 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     deviationRow.append(deviation);
     panel.append(periodRow, deviationRow);
   }
+  appendRightAdvancedAction();
   return panel;
 }
 
@@ -2910,7 +3259,7 @@ function createConditionEditor(kind, groupIndex, disabled, flowId = null) {
   const rightMetrics = [...metrics, ["value", "직접 값"]];
   const evaluationHint = document.createElement("p");
   evaluationHint.className = "block-condition-evaluation-hint";
-  evaluationHint.textContent = "위에서부터 확인하며 하나가 충족되면 다음 AND 조건 블록으로 진행합니다. 계산식은 선택한 값과 +, −, ×, ÷만 안전하게 조합합니다. 예: ((ATR(14) ÷ 종가) × 100) ≤ 3.0. 0으로 나눈 결과는 조건 불충족입니다.";
+  evaluationHint.textContent = "토큰을 눌러 값을 편집하세요. 같은 블록 안은 OR, 다음 블록과는 AND입니다.";
   wrap.append(evaluationHint);
   rows.forEach((condition, index) => {
     const row = document.createElement("div");
@@ -2925,8 +3274,8 @@ function createConditionEditor(kind, groupIndex, disabled, flowId = null) {
       const summary = document.createElement("div");
       summary.className = "block-condition-control";
       summary.style.cssText = "height:auto;min-height:28px;display:flex;align-items:center;overflow-wrap:anywhere;line-height:1.35;background:#f4f7fb;color:#344054";
-      summary.textContent = conditionExpressionSummary(expression);
-      summary.title = summary.textContent;
+      summary.textContent = conditionExpressionCompactSummary(expression);
+      summary.title = conditionExpressionSummary(expression);
       return summary;
     };
     top.append(
@@ -3620,6 +3969,7 @@ function captureComposerInspectorView() {
     node: inspector.dataset.blockInspector,
     top: body.scrollTop,
     left: body.scrollLeft,
+    expressionControl: active?.dataset?.expressionControl || null,
     id: active?.id || null,
     controlIndex: active ? controls.indexOf(active) : -1,
     selection,
@@ -3632,7 +3982,9 @@ function restoreComposerInspectorView(snapshot) {
   const body = inspector?.querySelector(".composer-inspector-body");
   if (!inspector || !body || inspector.dataset.blockInspector !== snapshot.node) return;
   const controls = [...inspector.querySelectorAll("input, select, textarea, button")];
-  const control = snapshot.id ? inspector.querySelector(`#${CSS.escape(snapshot.id)}`) : controls[snapshot.controlIndex];
+  const control = snapshot.expressionControl
+    ? inspector.querySelector(`[data-expression-control="${CSS.escape(snapshot.expressionControl)}"]`)
+    : snapshot.id ? inspector.querySelector(`#${CSS.escape(snapshot.id)}`) : controls[snapshot.controlIndex];
   if (control && !control.disabled) {
     control.focus({ preventScroll: true });
     if (snapshot.selection) {
@@ -4238,6 +4590,7 @@ async function openStrategy(name) {
   if (state.dirty && !window.confirm("저장하지 않은 변경 사항이 있습니다. 저장하지 않고 다른 전략을 열까요?")) return;
   const openToken = ++state.strategyOpenToken;
   state.blockSelectedNode = null;
+  state.blockExpressionSelections = new WeakMap();
   state.openingStrategy = name;
   try {
     const payload = await api(`/api/strategies/${encodeURIComponent(name)}`);

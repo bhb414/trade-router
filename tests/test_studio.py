@@ -1406,6 +1406,11 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert "createComposerTreeRow" in static_script.text
         assert "renderComposerTreeBranch" in static_script.text
         assert "createComposerInspector" in static_script.text
+        assert "blockExpressionSelections" in static_script.text
+        assert "block-expression-formula" in static_script.text
+        assert "conditionExpressionCommonBarContext" in static_script.text
+        assert "ATR 변동성률" in static_script.text
+        assert "data-expression-control" in static_script.text
         assert "captureComposerInspectorView" in static_script.text
         assert "restoreComposerInspectorView" in static_script.text
         assert 'classList.add("graph-mode", "composer-mode")' in static_script.text
