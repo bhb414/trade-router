@@ -14,6 +14,7 @@ from trade_router_studio.event_bus import StrategyEventBus
 from trade_router_studio.realtime import (
     RealtimeHub,
     _handle_kis_control_message,
+    _is_nxt_ineligible_rejection,
     _parse_kis_market_message,
     _parse_kis_market_messages,
     _parse_namuh_market_message,
@@ -46,6 +47,20 @@ def test_kis_control_error_is_not_treated_as_a_subscription_success() -> None:
             raise AssertionError("KIS WebSocket rejection was ignored.")
 
     asyncio.run(run())
+
+
+def test_only_explicit_nxt_ineligible_errors_are_quarantinable() -> None:
+    unsupported = RouterError(
+        RouterErrorCode.INVALID_REQUEST,
+        "해당 종목은 NXT 거래 대상 종목이 아닙니다.",
+    )
+    temporary = RouterError(
+        RouterErrorCode.INVALID_REQUEST,
+        "temporary subscription error",
+    )
+    assert _is_nxt_ineligible_rejection("H0NXCNT0", unsupported) is True
+    assert _is_nxt_ineligible_rejection("H0STCNT0", unsupported) is False
+    assert _is_nxt_ineligible_rejection("H0NXCNT0", temporary) is False
 
 
 def test_kis_quote_and_orderbook_frames_are_normalized() -> None:
@@ -258,7 +273,22 @@ def test_realtime_hub_reconnects_resubscribes_and_fans_out() -> None:
                 self.delivered = True
                 return quote_frame
             if self.disconnect_after_quote:
-                raise ConnectionError("simulated disconnect")
+                # A KRX INVALID_REQUEST is not proof that the instrument is
+                # permanently unsupported. It must keep the normal reconnect
+                # and retry behavior instead of quarantining the stream.
+                return json.dumps(
+                    {
+                        "header": {
+                            "tr_id": "H0STCNT0",
+                            "tr_key": "005930",
+                        },
+                        "body": {
+                            "rt_cd": "1",
+                            "msg_cd": "OPSQ9999",
+                            "msg1": "temporary subscription error",
+                        },
+                    }
+                )
             await self.wait_forever.wait()
             raise AssertionError("unreachable")
 
@@ -334,6 +364,150 @@ def test_realtime_hub_reconnects_resubscribes_and_fans_out() -> None:
                     "tr_id": "H0STCNT0",
                     "tr_key": "005930",
                 }
+        finally:
+            await hub.close()
+
+    asyncio.run(run())
+
+
+def test_realtime_hub_quarantines_rejected_nxt_leg_and_keeps_krx() -> None:
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.consumers: dict[str, set[str]] = {}
+
+        def realtime_connection(self, _: str) -> dict[str, object]:
+            return {
+                "id": "connection-a",
+                "provider": "kis",
+                "rate_scope": "shared-key-live",
+                "url": "ws://fake",
+                "control_interval": 0.001,
+            }
+
+        async def realtime_approval_key(self, _: str) -> str:
+            return "approval"
+
+        async def reserve_realtime_subscription(
+            self, _: str, *, consumer_id: str, subscription_key: str
+        ) -> SubscriptionLease:
+            consumers = self.consumers.setdefault(subscription_key, set())
+            created = not consumers
+            consumers.add(consumer_id)
+            return SubscriptionLease(
+                "shared-key-live", "session-1", subscription_key, created
+            )
+
+        async def release_realtime_subscription(
+            self, lease: SubscriptionLease, *, consumer_id: str
+        ) -> bool:
+            consumers = self.consumers[lease.subscription_key]
+            consumers.remove(consumer_id)
+            return not consumers
+
+    quote_values = ["005930", "093001", "73000"] + ["0"] * 44
+    quote_frame = "0|H0STCNT0|1|" + "^".join(quote_values)
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.controls_changed = asyncio.Event()
+            self.responses = 0
+            self.wait_forever = asyncio.Event()
+
+        async def send(self, message: str) -> None:
+            self.sent.append(message)
+            self.controls_changed.set()
+
+        def subscribed_tr_ids(self) -> set[str]:
+            return {
+                str(item["body"]["input"]["tr_id"])
+                for raw in self.sent
+                for item in (json.loads(raw),)
+                if item["header"].get("tr_type") == "1"
+            }
+
+        async def recv(self) -> str:
+            while not {"H0STCNT0", "H0NXCNT0"} <= self.subscribed_tr_ids():
+                await self.controls_changed.wait()
+                self.controls_changed.clear()
+            if self.responses == 0:
+                self.responses += 1
+                return json.dumps(
+                    {
+                        "header": {
+                            "tr_id": "H0NXCNT0",
+                            "tr_key": "005930",
+                        },
+                        "body": {
+                            "rt_cd": "1",
+                            "msg_cd": "OPSQ9999",
+                            "msg1": "NXT unsupported instrument",
+                        },
+                    }
+                )
+            if self.responses == 1:
+                self.responses += 1
+                return quote_frame
+            await self.wait_forever.wait()
+            raise AssertionError("unreachable")
+
+    class FakeContext:
+        def __init__(self, socket: FakeSocket) -> None:
+            self.socket = socket
+
+        async def __aenter__(self) -> FakeSocket:
+            return self.socket
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class FakeConnector:
+        def __init__(self) -> None:
+            self.sockets: list[FakeSocket] = []
+
+        def __call__(self, *_: object, **__: object) -> FakeContext:
+            socket = FakeSocket()
+            self.sockets.append(socket)
+            return FakeContext(socket)
+
+    async def run() -> None:
+        runtime = FakeRuntime()
+        connector = FakeConnector()
+        bus = StrategyEventBus()
+        hub = RealtimeHub(runtime, bus, connector=connector)  # type: ignore[arg-type]
+        krx = await hub.subscribe(
+            strategy_name="strategy.py",
+            source="source-a",
+            source_alias="primary",
+            kind="QUOTE",
+            code="005930",
+            venue=Venue.KRX,
+        )
+        nxt = await hub.subscribe(
+            strategy_name="strategy.py",
+            source="source-a",
+            source_alias="primary",
+            kind="QUOTE",
+            code="005930",
+            venue=Venue.NXT,
+        )
+        try:
+            event = await bus.next_event("strategy.py", timeout=4)
+            assert event is not None
+            assert event["quote"]["venue"] == "KRX"
+            assert event["quote"]["price"] == "73000"
+            assert len(connector.sockets) == 1
+
+            snapshot = await hub.snapshot()
+            assert snapshot[0]["state"] == "connected"
+            assert snapshot[0]["subscriptions"] == 1
+            assert "해당 구독만 제외" in snapshot[0]["message"]
+            assert await hub.unsubscribe(
+                nxt["id"], strategy_name="strategy.py"
+            ) is False
+            assert await hub.unsubscribe(
+                krx["id"], strategy_name="strategy.py"
+            ) is True
         finally:
             await hub.close()
 

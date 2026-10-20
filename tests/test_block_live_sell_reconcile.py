@@ -180,3 +180,50 @@ def test_realtime_sell_guard_clears_after_external_fill_without_reselling() -> N
     assert "079650" not in harness.strategy._live_positions
     assert harness.unsubscribed == ["quote-KRX-079650"]
 
+
+def test_realtime_sell_reservation_blocks_same_bar_sell_during_broker_lag() -> None:
+    harness = LiveSellHarness()
+
+    async def exercise() -> None:
+        await harness.strategy._refresh_live_positions(
+            harness.ctx, await harness.balance(), ()
+        )
+        await harness.strategy.on_quote(harness.ctx, harness.quote())
+        assert len(harness.submitted) == 1
+
+        # The realtime order is acknowledged locally but is not visible in the
+        # broker's open-order snapshot yet when the scheduled bar event arrives.
+        harness.now = datetime(2026, 10, 20, 10, 0, 1, tzinfo=SEOUL)
+        await harness.strategy.on_bar(
+            harness.ctx,
+            SimpleNamespace(kind=None, scheduled_at=harness.now),
+        )
+
+    asyncio.run(exercise())
+
+    assert len(harness.submitted) == 1
+
+
+def test_realtime_sell_reservation_blocks_liquidation_during_broker_lag() -> None:
+    harness = LiveSellHarness()
+
+    async def exercise() -> None:
+        await harness.strategy._refresh_live_positions(
+            harness.ctx, await harness.balance(), ()
+        )
+        await harness.strategy.on_quote(harness.ctx, harness.quote())
+        assert len(harness.submitted) == 1
+
+        # A close/retry timer must honor the same local reservation even before
+        # the broker lists the realtime sell as an open order.
+        harness.now = datetime(2026, 10, 20, 10, 0, 1, tzinfo=SEOUL)
+        await harness.strategy._liquidate_owned_positions(
+            harness.ctx,
+            harness.now,
+            reason="장 마감 정시 전량 청산",
+        )
+
+    asyncio.run(exercise())
+
+    assert len(harness.submitted) == 1
+

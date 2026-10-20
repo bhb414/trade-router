@@ -345,6 +345,7 @@ class RealtimeHub:
                     generation += 1
                     delay = 1
                     active: set[tuple[str, str]] = set()
+                    pending_controls: list[tuple[str, str, bool]] = []
                     encryption: dict[str, tuple[str, str]] = {}
                     self._states[connection_id] = {
                         "connection_id": connection_id,
@@ -374,6 +375,7 @@ class RealtimeHub:
                                     subscribe=False,
                                 )
                             )
+                            pending_controls.append((tr_id, code, False))
                             active.discard((tr_id, code))
                             await asyncio.sleep(control_interval)
                         for tr_id, code in sorted(wanted - active):
@@ -386,6 +388,7 @@ class RealtimeHub:
                                     subscribe=True,
                                 )
                             )
+                            pending_controls.append((tr_id, code, True))
                             active.add((tr_id, code))
                             await asyncio.sleep(control_interval)
                         if not wanted:
@@ -404,10 +407,52 @@ class RealtimeHub:
                         message = receive_task.result()
                         if isinstance(message, bytes):
                             message = message.decode("utf-8", errors="replace")
-                        control = await _handle_control_message(
-                            provider, socket.send, message
+                        control_tr_id, control_code = _control_subscription_identity(
+                            provider, message
                         )
+                        try:
+                            control = await _handle_control_message(
+                                provider, socket.send, message
+                            )
+                        except RouterError as exc:
+                            pending_control = _pop_pending_control(
+                                pending_controls,
+                                tr_id=control_tr_id,
+                                code=control_code,
+                            )
+                            if pending_control is not None:
+                                rejected_tr_id, rejected_code, subscribing = pending_control
+                            else:
+                                rejected_tr_id = control_tr_id
+                                rejected_code = control_code
+                                subscribing = False
+                            quarantined = False
+                            if (
+                                subscribing
+                                and rejected_code
+                                and _is_nxt_ineligible_rejection(
+                                    rejected_tr_id, exc
+                                )
+                            ):
+                                quarantined = await self._quarantine_rejected_market_stream(
+                                    connection_id,
+                                    rejected_tr_id,
+                                    rejected_code,
+                                )
+                            if not quarantined:
+                                raise
+                            active.discard((rejected_tr_id, rejected_code))
+                            self._states[connection_id]["message"] = (
+                                f"{rejected_tr_id}:{rejected_code} 실시간 구독이 거부되어 "
+                                "해당 구독만 제외했습니다. 나머지 구독은 유지합니다."
+                            )
+                            continue
                         if control is not None:
+                            _pop_pending_control(
+                                pending_controls,
+                                tr_id=control_tr_id,
+                                code=control_code,
+                            )
                             tr_id = str(control.get("tr_id") or "")
                             key = str(control.get("key") or "")
                             iv = str(control.get("iv") or "")
@@ -444,6 +489,25 @@ class RealtimeHub:
                 }
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
+
+    async def _quarantine_rejected_market_stream(
+        self,
+        connection_id: str,
+        tr_id: str,
+        code: str,
+    ) -> bool:
+        key = (connection_id, tr_id, code)
+        async with self._lock:
+            desired = self._desired.get(key)
+            if desired is None or desired.kind not in {"QUOTE", "ORDERBOOK"}:
+                return False
+            consumers = tuple(desired.consumers.values())
+        for consumer in consumers:
+            await self.unsubscribe(
+                consumer.id,
+                strategy_name=consumer.strategy_name,
+            )
+        return bool(consumers)
 
     async def _desired_for(self, connection_id: str) -> list[_Desired]:
         async with self._lock:
@@ -524,6 +588,92 @@ def _control_frame(
     return _namuh_control_frame(
         credential, tr_id, code, subscribe=subscribe
     )
+
+
+def _control_subscription_identity(
+    provider: str,
+    message: str,
+) -> tuple[str, str]:
+    if not message.startswith("{"):
+        return "", ""
+    try:
+        payload = json.loads(message)
+    except ValueError:
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    header = payload.get("header")
+    body = payload.get("body")
+    header = header if isinstance(header, dict) else {}
+    body = body if isinstance(body, dict) else {}
+    body_input = body.get("input")
+    body_input = body_input if isinstance(body_input, dict) else {}
+    if provider == "kis":
+        return (
+            str(header.get("tr_id") or ""),
+            str(
+                header.get("tr_key")
+                or body_input.get("tr_key")
+                or ""
+            ),
+        )
+    return (
+        str(header.get("tr_cd") or ""),
+        str(
+            header.get("tr_key")
+            or body.get("tr_key")
+            or body_input.get("tr_key")
+            or ""
+        ),
+    )
+
+
+def _pop_pending_control(
+    pending: list[tuple[str, str, bool]],
+    *,
+    tr_id: str,
+    code: str,
+) -> tuple[str, str, bool] | None:
+    if not tr_id:
+        return None
+    for index, item in enumerate(pending):
+        if item[0] != tr_id:
+            continue
+        if code and item[1] != code:
+            continue
+        return pending.pop(index)
+    return None
+
+
+_NXT_MARKET_TR_IDS = frozenset({"H0NXCNT0", "H0NXASP0"})
+_NXT_INELIGIBLE_MESSAGE_MARKERS = (
+    "NXT거래대상이아닙니다",
+    "NXT거래대상종목이아닙니다",
+    "NXT거래종목이아닙니다",
+    "NXT대상종목이아닙니다",
+    "NXT미대상",
+    "NXT미지원종목",
+    "거래대상종목이아닙니다",
+    "지원하지않는종목",
+    "미지원종목",
+    "NXTNOTELIGIBLE",
+    "NOTELIGIBLEFORNXT",
+    "NXTUNSUPPORTEDINSTRUMENT",
+    "UNSUPPORTEDINSTRUMENT",
+    "INSTRUMENTNOTSUPPORTED",
+    "NOTSUPPORTEDONNXT",
+    "NON-NXT",
+)
+
+
+def _is_nxt_ineligible_rejection(tr_id: str, exc: RouterError) -> bool:
+    if (
+        exc.code is not RouterErrorCode.INVALID_REQUEST
+        or tr_id not in _NXT_MARKET_TR_IDS
+    ):
+        return False
+    normalized = "".join(str(exc.message or "").upper().split())
+    return any(marker in normalized for marker in _NXT_INELIGIBLE_MESSAGE_MARKERS)
 
 
 async def _handle_control_message(

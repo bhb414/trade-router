@@ -1800,6 +1800,12 @@ class ManagedBlockStrategy(Strategy):
         positions = {item.instrument.code: item for item in balance.positions}
         pending_codes = {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
         tracked = self._sync_tracked_positions(ctx, balance)
+        desired = {
+            code
+            for code in tracked
+            if code in positions and positions[code].quantity > 0
+        }
+        self._reconcile_live_sell_pending(open_orders, desired=desired)
         for code in list(tracked):
             position = positions.get(code)
             if position is None or position.quantity <= 0:
@@ -1810,7 +1816,7 @@ class ManagedBlockStrategy(Strategy):
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
                 continue
-            if code in pending_codes:
+            if code in pending_codes or code in self._live_sell_pending:
                 ctx.log.info(f"{self._instrument_label(ctx, code)} 청산 대기: 계좌에 미체결 주문이 있습니다.")
                 continue
             if not submit_orders:
@@ -1833,6 +1839,8 @@ class ManagedBlockStrategy(Strategy):
             except RouterError as exc:
                 ctx.log.error(f"{self._instrument_label(ctx, code)} 청산 실패 [{exc.code.value}]: {exc.message}")
                 continue
+            if order.status is not OrderStatus.REJECTED:
+                self._mark_live_sell_pending(code)
             ctx.log.info(f"{self._instrument_label(ctx, code)} {reason} · 전략 소유 {quantity}주 시장가 매도 요청: {order.status.value}")
             if order.status is OrderStatus.FILLED:
                 tracked.pop(code, None)
@@ -2020,7 +2028,7 @@ class ManagedBlockStrategy(Strategy):
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
                 continue
-            if code in pending_codes:
+            if code in pending_codes or code in self._live_sell_pending:
                 continue
             average_price = position.average_price
             should_sell, matched_groups = await self._condition_groups_result(
