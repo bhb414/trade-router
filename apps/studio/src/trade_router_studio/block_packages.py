@@ -310,7 +310,7 @@ class BlockOrderAction(BaseModel):
     kind: Literal["order"] = "order"
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
     side: Literal["BUY", "SELL"]
-    order_type: Literal["MARKET", "LIMIT"] = "MARKET"
+    order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"] = "MARKET"
 
 
 class BlockConditionNode(BaseModel):
@@ -479,7 +479,7 @@ def _legacy_rule_tree_payload(
     groups: object,
     *,
     side: Literal["BUY", "SELL"],
-    order_type: Literal["MARKET", "LIMIT"],
+    order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"],
 ) -> dict[str, object]:
     """Convert the former outer-AND/inner-OR representation to a rule tree."""
 
@@ -629,8 +629,8 @@ class ConditionBollingerBlockSettings(BaseModel):
     sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
     sell_rule_tree: BlockLogicNode | None = None
     sell_flows: list[BlockSellFlow] = Field(default_factory=list, max_length=8)
-    buy_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
-    sell_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
+    buy_order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"] = "MARKET"
+    sell_order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"] = "MARKET"
     buy_scan_seconds: int = Field(ge=1, le=86_400)
     buy_start_time: str
     buy_end_time: str
@@ -1286,6 +1286,24 @@ class ManagedBlockStrategy(Strategy):
             return "NXT_AFTER"
         return "CLOSED"
 
+    @staticmethod
+    def _order_type_session_is_open(at, route, order_type):
+        # BEST_LIMIT is a continuous-trading order. A temporary auction/pause
+        # must not create a daily rejection or suppress the next valid session.
+        if order_type != "BEST_LIMIT":
+            return True
+        local_at = at.astimezone(SEOUL) if at.tzinfo is not None else at
+        local_time = local_at.time().replace(tzinfo=None)
+        regular_open = time(9, 0, 30) if route == "NXT" else time(9, 0)
+        if regular_open <= local_time < time(15, 20):
+            return True
+        # AUTO is resolved to SOR by live KIS connections. Paper connections
+        # retain their broker capability restrictions when the order is sent.
+        return route in {"NXT", "SOR", "AUTO"} and (
+            time(8, 0) <= local_time < time(8, 50)
+            or time(15, 40) <= local_time < time(20, 0)
+        )
+
     @classmethod
     def _order_session_block_reason(cls, at, route, order_type):
         if cls._order_session(at) != "NXT_AFTER":
@@ -1303,7 +1321,7 @@ class ManagedBlockStrategy(Strategy):
         if order_type == "MARKET":
             return (
                 f"애프터마켓에서는 {route} 시장가 주문을 제출할 수 없습니다. "
-                "주문 방식을 지정가로 설정해야 합니다."
+                "주문 방식을 지정가로 설정하거나 최유리지정가를 선택해야 합니다."
             )
         return None
 
@@ -2303,9 +2321,11 @@ class ManagedBlockStrategy(Strategy):
             and cls._sell_flow_is_active(flow, now)
         )
 
-    @staticmethod
-    def _buy_order_session_is_open(at, order_type=None):
+    @classmethod
+    def _buy_order_session_is_open(cls, at, order_type=None):
         order_type = order_type or BUY_ORDER_TYPE
+        if not cls._order_type_session_is_open(at, ORDER_ROUTE, order_type):
+            return False
         if ORDER_ROUTE != "NXT":
             return True
         local_time = at.astimezone(SEOUL).time().replace(tzinfo=None)
@@ -2313,7 +2333,7 @@ class ManagedBlockStrategy(Strategy):
             return True
         if time(9, 0, 30) <= local_time < time(15, 20):
             return True
-        after_open = time(15, 40) if order_type == "MARKET" else time(15, 30)
+        after_open = time(15, 30) if order_type == "LIMIT" else time(15, 40)
         return after_open <= local_time < time(20, 0)
 
     @staticmethod
@@ -2505,8 +2525,8 @@ class ManagedBlockStrategy(Strategy):
     async def _scan_buy_flow(self, ctx, event, flow):
         def active():
             now = datetime.now(SEOUL)
-            # The branch action selects MARKET/LIMIT only after its conditions
-            # match.  Keep the scan alive for the union of both order windows,
+            # The branch action selects an order type after its conditions
+            # match. Keep the scan alive for the union of the order windows,
             # then apply the selected action's exact window below.  Using the
             # legacy global BUY_ORDER_TYPE here would incorrectly skip a LIMIT
             # branch during NXT's 15:30-15:40 limit-only window.
@@ -2587,6 +2607,9 @@ class ManagedBlockStrategy(Strategy):
                 )
                 if not active():
                     return
+                order_at = datetime.now(SEOUL)
+                if not self._order_type_session_is_open(order_at, order_route, order_type):
+                    continue
                 blocked_reason = self._order_session_block_reason(
                     order_at, order_route, order_type
                 )
@@ -2624,6 +2647,8 @@ class ManagedBlockStrategy(Strategy):
             if not active():
                 ctx.log.info(f"{flow['name']} 매수 보류: 적용 시간이 종료되었습니다.")
                 return
+            if not self._order_type_session_is_open(datetime.now(SEOUL), order_route, order_type):
+                continue
             # Reserve the symbol before awaiting submission. An ambiguous response
             # must never let another branch or later scan retry it while the
             # broker's balance/open-order snapshots are still catching up.
@@ -2641,6 +2666,10 @@ class ManagedBlockStrategy(Strategy):
                     order = await ctx.orders.limit_buy(
                         code=code, quantity=quantity, price=limit_price, route=order_route,
                         client_order_id=order_id,
+                    )
+                elif order_type == "BEST_LIMIT":
+                    order = await ctx.orders.best_limit_buy(
+                        code=code, quantity=quantity, route=order_route, client_order_id=order_id,
                     )
                 else:
                     order = await ctx.orders.market_buy(
@@ -2790,6 +2819,8 @@ class ManagedBlockStrategy(Strategy):
                     order_route = await self._effective_order_route(
                         ctx, code, order_at, current_price=limit_price
                     )
+                if not self._order_type_session_is_open(order_at, order_route, order_type):
+                    continue
                 blocked_reason = self._order_session_block_reason(
                     order_at, order_route, order_type
                 )
@@ -2807,6 +2838,10 @@ class ManagedBlockStrategy(Strategy):
                     order = await ctx.orders.limit_sell(
                         code=code, quantity=quantity, price=limit_price, route=order_route,
                         client_order_id=order_id,
+                    )
+                elif order_type == "BEST_LIMIT":
+                    order = await ctx.orders.best_limit_sell(
+                        code=code, quantity=quantity, route=order_route, client_order_id=order_id,
                     )
                 else:
                     order = await ctx.orders.market_sell(
@@ -2960,6 +2995,8 @@ class ManagedBlockStrategy(Strategy):
                 order_route = await self._effective_order_route(
                     ctx, code, order_at, current_price=quote.price
                 )
+            if not self._order_type_session_is_open(order_at, order_route, order_type):
+                return
             blocked_reason = self._order_session_block_reason(
                 order_at, order_route, order_type
             )
@@ -2979,6 +3016,11 @@ class ManagedBlockStrategy(Strategy):
                 order = await ctx.orders.limit_sell(
                     code=code, quantity=quantity, price=limit_price,
                     route=order_route, client_order_id=order_id,
+                )
+            elif order_type == "BEST_LIMIT":
+                order = await ctx.orders.best_limit_sell(
+                    code=code, quantity=quantity, route=order_route,
+                    client_order_id=order_id,
                 )
             else:
                 order = await ctx.orders.market_sell(

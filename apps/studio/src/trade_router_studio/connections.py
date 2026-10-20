@@ -76,6 +76,11 @@ KIS_ORDER_ROUTE_CODES = {
     OrderRoute.NXT: "NXT",
     OrderRoute.SOR: "SOR",
 }
+KIS_ORDER_TYPE_CODES = {
+    OrderType.LIMIT: "00",
+    OrderType.MARKET: "01",
+    OrderType.BEST_LIMIT: "03",
+}
 KIS_RANKING_MARKETS = {
     "ALL": "0000",
     "KOSPI": "0001",
@@ -1159,7 +1164,12 @@ class ConnectionRuntime:
                 RouterErrorCode.INVALID_REQUEST,
                 "지정가 주문 가능 수량을 조회하려면 가격이 필요합니다.",
             )
-        requested_price = price or Decimal("0")
+        # Best-limit prices are determined by the opposite best quote at the
+        # broker. Query the same division with zero price; use the returned
+        # calculation price (not zero) for quantity and risk calculations.
+        requested_price = (
+            Decimal("0") if order_type is OrderType.BEST_LIMIT else price or Decimal("0")
+        )
         account_number = self._settings.get_account_number(account["id"])
         tr_id = "VTTC8908R" if target is ConnectionTarget.PAPER else "TTTC8908R"
         payload, _ = await self._kis_get(
@@ -1171,7 +1181,7 @@ class ConnectionRuntime:
                 "ACNT_PRDT_CD": account["product_code"],
                 "PDNO": instrument.code,
                 "ORD_UNPR": str(requested_price),
-                "ORD_DVSN": "01" if order_type is OrderType.MARKET else "00",
+                "ORD_DVSN": KIS_ORDER_TYPE_CODES[order_type],
                 "CMA_EVLU_AMT_ICLD_YN": "N",
                 "OVRS_ICLD_YN": "N",
             },
@@ -1271,9 +1281,11 @@ class ConnectionRuntime:
                 "CANO": account_number,
                 "ACNT_PRDT_CD": account["product_code"],
                 "PDNO": request.instrument.code,
-                "ORD_DVSN": "01" if request.order_type is OrderType.MARKET else "00",
+                "ORD_DVSN": KIS_ORDER_TYPE_CODES[request.order_type],
                 "ORD_QTY": str(request.quantity.to_integral_value()),
-                "ORD_UNPR": "0" if request.order_type is OrderType.MARKET else str(request.price),
+                "ORD_UNPR": (
+                    str(request.price) if request.order_type is OrderType.LIMIT else "0"
+                ),
                 "EXCG_ID_DVSN_CD": KIS_ORDER_ROUTE_CODES[route],
                 "SLL_TYPE": (
                     str(request.provider_options.get("sell_type", "01"))
@@ -1429,12 +1441,15 @@ class ConnectionRuntime:
                     or ""
                 ),
                 "ORGN_ODNO": provider_order_id,
-                "ORD_DVSN": "01" if order_type is OrderType.MARKET else "00",
+                "ORD_DVSN": (
+                    str(possible.get("ord_dvsn_cd") or possible.get("ord_dvsn") or "00")
+                    if cancel else KIS_ORDER_TYPE_CODES[order_type]
+                ),
                 "RVSE_CNCL_DVSN_CD": "02" if cancel else "01",
                 "ORD_QTY": str(requested_quantity.to_integral_value()),
                 "ORD_UNPR": (
                     "0"
-                    if cancel or order_type is OrderType.MARKET
+                    if cancel or order_type is not OrderType.LIMIT
                     else str(price or "0")
                 ),
                 "QTY_ALL_ORD_YN": "Y" if quantity is None else "N",
@@ -2139,6 +2154,7 @@ class ConnectionRuntime:
         price: Decimal | None,
         route: OrderRoute,
     ) -> BuyingPower:
+        _require_namuh_order_type(order_type)
         instrument = InstrumentId(code)
         if order_type is OrderType.LIMIT and (price is None or price <= 0):
             raise RouterError(
@@ -2208,6 +2224,7 @@ class ConnectionRuntime:
         connection: dict[str, Any],
         request: OrderRequest,
     ) -> ProviderOrderAck:
+        _require_namuh_order_type(request.order_type)
         route = request.route if request.route is not OrderRoute.AUTO else OrderRoute.SOR
         if route not in self.capabilities(account["alias"]).order_routes:
             raise RouterError(
@@ -2280,6 +2297,8 @@ class ConnectionRuntime:
         route: OrderRoute,
         cancel: bool,
     ) -> ProviderOrderAck:
+        if not cancel:
+            _require_namuh_order_type(order_type)
         orders = await self._namuh_account_orders(
             account,
             connection,
@@ -2853,7 +2872,13 @@ def _parse_kis_account_order(
     side = OrderSide.SELL if side_code == "01" or "매도" in side_name else OrderSide.BUY
 
     order_name = str(row.get("ord_dvsn_name") or "")
-    order_type = OrderType.MARKET if "시장" in order_name else OrderType.LIMIT
+    order_code = str(row.get("ord_dvsn_cd") or row.get("ord_dvsn") or "").strip()
+    if order_code in {"03", "28", "44"} or "최유리" in order_name:
+        order_type = OrderType.BEST_LIMIT
+    elif order_code == "01" or "시장" in order_name:
+        order_type = OrderType.MARKET
+    else:
+        order_type = OrderType.LIMIT
     rejected = _decimal(row.get("rjct_qty"), default=Decimal("0"))
     cancelled = (
         str(row.get("cncl_yn") or "").strip().upper() == "Y"
@@ -3025,6 +3050,14 @@ def _normalize_namuh_order_id(value: object) -> str:
     return text
 
 
+def _require_namuh_order_type(order_type: OrderType) -> None:
+    if order_type is OrderType.BEST_LIMIT:
+        raise RouterError(
+            RouterErrorCode.UNSUPPORTED_CAPABILITY,
+            "NAMUH 연결의 최유리지정가 주문은 아직 지원하지 않습니다. KIS 연결을 사용하세요.",
+        )
+
+
 def _require_namuh_integer_price(price: Decimal) -> None:
     if price <= 0 or price != price.to_integral_value():
         raise RouterError(
@@ -3062,7 +3095,10 @@ def _parse_namuh_account_order(
     side_name = str(row.get("sby_dit_cd_nm") or "")
     side = OrderSide.SELL if "매도" in side_name else OrderSide.BUY
     order_name = str(row.get("nmn_pr_tp_cd_nm") or "")
-    order_type = OrderType.MARKET if "시장" in order_name else OrderType.LIMIT
+    order_type = (
+        OrderType.BEST_LIMIT if "최유리" in order_name
+        else OrderType.MARKET if "시장" in order_name else OrderType.LIMIT
+    )
     route_text = str(row.get("rmt_mkt_cd") or "AUTO").strip().upper()
     try:
         route = OrderRoute(route_text)

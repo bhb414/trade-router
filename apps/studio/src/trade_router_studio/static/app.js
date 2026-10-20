@@ -777,7 +777,7 @@ function tradeHistoryTable(rows, emptyMessage) {
     { label: "종목", render: row => instrumentLabel(row) },
     { label: "구분", render: row => row.side === "SELL" ? "매도" : "매수" },
     { label: "시각", render: row => formatTimestamp(row.updated_at || row.created_at) },
-    { label: "주문", render: row => `${row.order_type === "LIMIT" ? "지정가" : "시장가"} ${formatNumber(row.quantity)}주` },
+    { label: "주문", render: row => `${orderTypeLabel(row.order_type)} ${formatNumber(row.quantity)}주` },
     { label: "체결", render: row => row.filled_quantity && Number(row.filled_quantity) > 0 ? `${formatNumber(row.filled_quantity)}주 · ${formatNumber(row.average_fill_price)}원` : "—" },
     {
       label: "매매손익",
@@ -1421,8 +1421,10 @@ function parseStrategyBlocks(source) {
     [/ctx\.account\.buying_power\s*\(/g, "주문 가능 수량 계산"],
     [/ctx\.orders\.market_buy\s*\(/g, "시장가 매수"],
     [/ctx\.orders\.limit_buy\s*\(/g, "지정가 매수"],
+    [/ctx\.orders\.best_limit_buy\s*\(/g, "최유리지정가 매수"],
     [/ctx\.orders\.market_sell\s*\(/g, "시장가 매도"],
     [/ctx\.orders\.limit_sell\s*\(/g, "지정가 매도"],
+    [/ctx\.orders\.best_limit_sell\s*\(/g, "최유리지정가 매도"],
     [/_liquidate_owned_positions\s*\(/g, "전략 보유 수량 청산"],
   ];
   handlerMatches.forEach(match => {
@@ -1763,6 +1765,23 @@ function removeBlockSellFlow(flowId) {
   renderStrategyBlocks();
 }
 
+function orderTypeLabel(orderType, limitLabel = "지정가") {
+  if (orderType === "MARKET") return "시장가";
+  if (orderType === "LIMIT") return limitLabel;
+  if (orderType === "BEST_LIMIT") return "최유리지정가";
+  return orderType || "주문 방식 미확인";
+}
+
+function blockOrderTypeOptions() {
+  return [["MARKET", "시장가"], ["LIMIT", "현재가 지정가"], ["BEST_LIMIT", "최유리지정가"]];
+}
+
+function blockOrderTypeHint(orderType) {
+  return orderType === "BEST_LIMIT"
+    ? "주문 접수 시 매수는 최저 매도호가, 매도는 최고 매수호가로 지정됩니다. 일부만 체결되거나 미체결 수량이 남을 수 있으며 호가를 자동으로 따라가지 않습니다. NXT 프리·메인·애프터마켓에서 사용할 수 있습니다. 15:30~15:40에는 사용할 수 없습니다."
+    : "";
+}
+
 function blockFieldOptions(field) {
   const settings = state.blockPackage?.settings || {};
   const flow = field.flowId ? blockFlow(field.flowKind || "buy", field.flowId) : null;
@@ -1847,10 +1866,7 @@ function blockFieldOptions(field) {
     ];
   }
   if (["buy_order_type", "sell_order_type"].includes(field.settingKey)) {
-    return [
-      { value: "MARKET", label: "시장가" },
-      { value: "LIMIT", label: "현재가 지정가" },
-    ];
+    return blockOrderTypeOptions().map(([value, label]) => ({ value, label }));
   }
   if (["buy_condition_logic", "sell_condition_logic"].includes(field.settingKey)) {
     return [
@@ -2593,10 +2609,20 @@ function createBlockRuleActionEditor(reference, disabled) {
   if (node.kind === "logic") {
     hint.textContent += " 통과한 하위 조건에서 선택된 주문이 없을 때 실행하는 기본 주문입니다.";
   }
+  const executionHint = document.createElement("p");
+  executionHint.className = "composer-inspector-hint";
+  const updateHint = value => {
+    executionHint.textContent = blockOrderTypeHint(value);
+    executionHint.hidden = !executionHint.textContent;
+  };
+  updateHint(node.action.order_type);
   const order = conditionSelect(
-    [["MARKET", "시장가"], ["LIMIT", "현재가 지정가"]],
+    blockOrderTypeOptions(),
     node.action.order_type || "MARKET", disabled,
-    (value, render) => updateBlockRuleAction(reference.kind, reference.flowId, node.id, value, render),
+    (value, render) => {
+      updateBlockRuleAction(reference.kind, reference.flowId, node.id, value, render);
+      updateHint(value);
+    },
   );
   const field = formulaControl("주문 방식", order, true);
   const remove = document.createElement("button");
@@ -2605,7 +2631,7 @@ function createBlockRuleActionEditor(reference, disabled) {
   remove.textContent = "이 행동 삭제";
   remove.disabled = disabled;
   remove.addEventListener("click", () => removeBlockRuleAction(reference.kind, reference.flowId, node.id));
-  wrap.append(hint, field, remove);
+  wrap.append(hint, field, executionHint, remove);
   return wrap;
 }
 
@@ -3503,8 +3529,8 @@ function removeBlockRuleAction(kind, flowId, nodeId) {
 
 function updateBlockRuleAction(kind, flowId, nodeId, orderType, render = true) {
   const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
-  if (!node?.action) return;
-  node.action.order_type = orderType === "LIMIT" ? "LIMIT" : "MARKET";
+  if (!node?.action || !blockOrderTypeOptions().some(([value]) => value === orderType)) return;
+  node.action.order_type = orderType;
   commitBlockRuleMutation(render);
 }
 
@@ -5973,7 +5999,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
     const order = document.createElement("div");
     order.className = "schedule-order-summary";
     const orderTitle = document.createElement("strong");
-    orderTitle.textContent = `${settings.buy_order_type === "LIMIT" ? "현재가 지정가" : "시장가"} 매수 · 공통 주문 처리`;
+    orderTitle.textContent = `${orderTypeLabel(settings.buy_order_type, "현재가 지정가")} 매수 · 공통 주문 처리`;
     const orderHint = document.createElement("span");
     orderHint.textContent = "적용 시간 · 미보유 · 미체결 · 가능 수량 · 전략 전체 운용 예산을 확인한 뒤 주문합니다.";
     order.append(orderTitle, orderHint);
@@ -6097,12 +6123,12 @@ function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
       nodes.push({
         id: ruleComposerActionId(kind, flowId, node.action.id),
         title: kind === "sell" ? "매도 주문" : "매수 주문",
-        meta: node.action.order_type === "LIMIT" ? "현재가 지정가" : "시장가",
+        meta: orderTypeLabel(node.action.order_type, "현재가 지정가"),
         tone: "event",
         logic: node.action.side || (kind === "sell" ? "SELL" : "BUY"),
         logicTone: kind === "sell" ? "sell" : "buy",
         width: 420,
-        summary: [node.action.order_type === "LIMIT" ? "현재가 지정가 주문" : "시장가 주문"],
+        summary: [`${orderTypeLabel(node.action.order_type, "현재가 지정가")} 주문`],
         actions: kind === "sell"
           ? ["전략 소유 수량", "주문 제출", "상태 조정"]
           : ["공통 예산", "멱등성 예약", "위험 검사", "주문 제출"],
@@ -6737,7 +6763,7 @@ function renderOrders(rows) {
 
     const meta = document.createElement("div");
     meta.className = "order-meta";
-    const orderType = request.order_type === "LIMIT" ? `지정가 ${request.price || "-"}원` : "시장가";
+    const orderType = orderTypeLabel(request.order_type, `지정가 ${request.price || "-"}원`);
     const created = row.created_at ? new Date(row.created_at).toLocaleTimeString("ko-KR", {
       hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
     }) : "";

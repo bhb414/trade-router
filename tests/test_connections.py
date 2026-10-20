@@ -27,9 +27,159 @@ from trade_router_studio.connections import (
     _aggregate_minute_bars,
     _is_market_minute,
     _parse_period_row,
+    _parse_kis_account_order,
 )
 from trade_router_studio.paths import WorkspacePaths
 from trade_router_studio.settings import SettingsStore
+
+
+def test_kis_best_limit_order_contract_and_changes(tmp_path: Path) -> None:
+    """All requests use mock transport, including the LIVE-target contract."""
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "best-limit"))
+        connection = settings.add_connection(
+            provider="kis", target="LIVE", label="mock-only",
+            app_key="test-key", app_secret="test-secret",
+        )
+        settings.add_account(
+            alias="best-account", connection_id=connection["id"],
+            account_number="12345678", product_code="01",
+        )
+        submissions: list[dict] = []
+        changes: list[dict] = []
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/tokenP":
+                return httpx.Response(200, json={
+                    "access_token": "mock-token", "token_type": "Bearer",
+                    "access_token_token_expired": (
+                        datetime.now().astimezone() + timedelta(hours=24)
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            if request.url.path.endswith("/inquire-psbl-order"):
+                assert request.url.params["ORD_DVSN"] == "03"
+                assert request.url.params["ORD_UNPR"] == "0"
+                return httpx.Response(200, json={"rt_cd": "0", "output": {
+                    "ord_psbl_cash": "150000", "psbl_qty_calc_unpr": "95000",
+                    "nrcvb_buy_qty": "1",
+                }})
+            if request.url.path.endswith("/order-cash"):
+                body = json.loads(request.content)
+                assert body["ORD_DVSN"] == "03"
+                assert body["ORD_UNPR"] == "0"
+                assert body["EXCG_ID_DVSN_CD"] in {"NXT", "SOR"}
+                assert request.headers["tr_id"] in {"TTTC0011U", "TTTC0012U"}
+                submissions.append(body)
+                return httpx.Response(200, json={"rt_cd": "0", "output": {"ODNO": "000123"}})
+            if request.url.path.endswith("/inquire-psbl-rvsecncl"):
+                return httpx.Response(200, json={"rt_cd": "0", "output": [{
+                    "odno": "000123", "ord_gno_brno": "91252", "psbl_qty": "2",
+                    "ord_dvsn_cd": "03",
+                }]})
+            if request.url.path.endswith("/order-rvsecncl"):
+                body = json.loads(request.content)
+                assert body["ORD_DVSN"] == "03"
+                assert body["ORD_UNPR"] == "0"
+                assert body["EXCG_ID_DVSN_CD"] == "NXT"
+                changes.append(body)
+                return httpx.Response(200, json={"rt_cd": "0", "output": {"ODNO": "000124"}})
+            raise AssertionError(f"unexpected mock request: {request.url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            runtime = ConnectionRuntime(settings, http_client=client)
+            try:
+                power = await runtime.buying_power(
+                    "best-account", "005930", order_type=OrderType.BEST_LIMIT,
+                    price=Decimal("73000"), route=OrderRoute.NXT,
+                )
+                assert power.order_type is OrderType.BEST_LIMIT
+                assert power.requested_price == 0
+                assert power.calculation_price == 95000
+                assert power.maximum_quantity == 1
+                for side in (OrderSide.BUY, OrderSide.SELL):
+                    for route in (OrderRoute.NXT, OrderRoute.AUTO):
+                        result = await runtime.submit_order("best-account", OrderRequest(
+                            instrument=InstrumentId("005930"), side=side,
+                            order_type=OrderType.BEST_LIMIT, quantity=Decimal("2"),
+                            price=Decimal("73000"), route=route,
+                            client_order_id=f"mock-{side}-{route}",
+                        ))
+                        assert result.provider_order_id == "000123"
+                await runtime.amend_order(
+                    "best-account", "000123", quantity=Decimal("1"),
+                    order_type=OrderType.BEST_LIMIT, price=None, route=OrderRoute.NXT,
+                )
+                await runtime.cancel_order(
+                    "best-account", "000123", quantity=None, route=OrderRoute.NXT,
+                )
+                assert len(submissions) == 4
+                assert [item["RVSE_CNCL_DVSN_CD"] for item in changes] == ["01", "02"]
+            finally:
+                await runtime.close()
+    asyncio.run(run())
+
+
+def test_kis_best_limit_history_keeps_type_with_zero_or_assigned_price() -> None:
+    for division, name, price in (
+        ("03", "", "0"), ("", "최유리지정가", "73000"),
+        ("28", "취소", "0"), ("44", "", "73000"),
+    ):
+        order = _parse_kis_account_order({
+            "odno": "000123", "pdno": "005930", "sll_buy_dvsn_cd": "01",
+            "ord_dvsn_cd": division, "ord_dvsn_name": name,
+            "ord_qty": "3", "tot_ccld_qty": "1", "rmn_qty": "2",
+            "ord_unpr": price, "avg_prvs": "73000",
+            "ord_dt": "20261021", "ord_tmd": "081500",
+            "excg_id_dvsn_cd": "NXT",
+        }, "best-account", datetime(2026, 10, 21).date())
+        assert order is not None
+        assert order.order_type is OrderType.BEST_LIMIT
+        assert order.status is OrderStatus.PARTIALLY_FILLED
+        assert order.remaining_quantity == 2
+        assert order.route is OrderRoute.NXT
+
+
+def test_namuh_best_limit_rejected_before_any_broker_request(tmp_path: Path) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "namuh-best-limit"))
+        connection = settings.add_connection(
+            provider="namuh", target="PAPER", label="nh-mock",
+            app_key="test-key", app_secret="test-secret",
+        )
+        settings.add_account(
+            alias="nh-account", connection_id=connection["id"],
+            account_number="12345012345", product_code="",
+        )
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("unsupported order must not call broker")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            runtime = ConnectionRuntime(settings, http_client=client)
+            try:
+                calls = [
+                    lambda: runtime.buying_power(
+                        "nh-account", "005930", order_type=OrderType.BEST_LIMIT,
+                    ),
+                    lambda: runtime.submit_order("nh-account", OrderRequest(
+                        instrument=InstrumentId("005930"), side=OrderSide.SELL,
+                        order_type=OrderType.BEST_LIMIT, quantity=Decimal("1"),
+                        client_order_id="unsupported-nh",
+                    )),
+                    lambda: runtime.amend_order(
+                        "nh-account", "123", quantity=Decimal("1"),
+                        order_type=OrderType.BEST_LIMIT, price=None, route=OrderRoute.AUTO,
+                    ),
+                ]
+                for call in calls:
+                    try:
+                        await call()
+                    except RouterError as exc:
+                        assert exc.code is RouterErrorCode.UNSUPPORTED_CAPABILITY
+                        assert "최유리" in exc.message
+                    else:
+                        raise AssertionError("unsupported order unexpectedly accepted")
+            finally:
+                await runtime.close()
+    asyncio.run(run())
+
 
 
 def workspace(root: Path) -> WorkspacePaths:

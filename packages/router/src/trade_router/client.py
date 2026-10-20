@@ -466,6 +466,16 @@ class SyncOrderClient:
             self._router._async.orders.market_sell(*args, **kwargs)
         )
 
+    def best_limit_buy(self, *args: object, **kwargs: object) -> Any:
+        return self._router._call(
+            self._router._async.orders.best_limit_buy(*args, **kwargs)
+        )
+
+    def best_limit_sell(self, *args: object, **kwargs: object) -> Any:
+        return self._router._call(
+            self._router._async.orders.best_limit_sell(*args, **kwargs)
+        )
+
     def limit_buy(self, *args: object, **kwargs: object) -> Any:
         return self._router._call(
             self._router._async.orders.limit_buy(*args, **kwargs)
@@ -1034,6 +1044,46 @@ class OrderClient:
             quantity,
             side=OrderSide.SELL,
             order_type=OrderType.MARKET,
+            client_order_id=client_order_id,
+            route=route,
+            provider_options=provider_options,
+        )
+
+    async def best_limit_buy(
+        self,
+        code: str,
+        quantity: Decimal | int | str,
+        *,
+        client_order_id: str,
+        route: OrderRoute | str = OrderRoute.AUTO,
+        provider_options: dict[str, Any] | None = None,
+    ) -> Order:
+        """Buy at the best ask on receipt; any remainder rests at that price."""
+        return await self._submit(
+            code,
+            quantity,
+            side=OrderSide.BUY,
+            order_type=OrderType.BEST_LIMIT,
+            client_order_id=client_order_id,
+            route=route,
+            provider_options=provider_options,
+        )
+
+    async def best_limit_sell(
+        self,
+        code: str,
+        quantity: Decimal | int | str,
+        *,
+        client_order_id: str,
+        route: OrderRoute | str = OrderRoute.AUTO,
+        provider_options: dict[str, Any] | None = None,
+    ) -> Order:
+        """Sell at the best bid on receipt; any remainder rests at that price."""
+        return await self._submit(
+            code,
+            quantity,
+            side=OrderSide.SELL,
+            order_type=OrderType.BEST_LIMIT,
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,

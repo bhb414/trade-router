@@ -1275,7 +1275,7 @@ def _reconciled_provider_metadata(
             "order_type": broker_order_type.value,
             "price": (
                 None
-                if broker_order_type is OrderType.MARKET
+                if broker_order_type in {OrderType.MARKET, OrderType.BEST_LIMIT}
                 else (
                     str(broker_price)
                     if broker_price is not None and Decimal(str(broker_price)) > 0

@@ -39,6 +39,7 @@ class OrderSide(StrEnum):
 class OrderType(StrEnum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+    BEST_LIMIT = "BEST_LIMIT"
 
 
 class OrderStatus(StrEnum):

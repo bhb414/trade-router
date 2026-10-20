@@ -30,6 +30,70 @@ from trade_router_studio.sessions import StrategyManifest
 SEOUL = ZoneInfo("Asia/Seoul")
 
 
+def test_best_limit_risk_partial_fill_reconcile_and_cancel(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "best-limit.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            request = OrderRequest(
+                instrument=InstrumentId("005930"), side=OrderSide.BUY,
+                order_type=OrderType.BEST_LIMIT, quantity=Decimal("3"),
+                client_order_id="best-limit", route=OrderRoute.AUTO,
+            )
+            try:
+                await service.submit(
+                    strategy_name="strategy.py", manifest=manifest(max_order_amount="250000"),
+                    request=request,
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.RISK_LIMIT_EXCEEDED
+            else:
+                raise AssertionError("zero wire price must not bypass order amount limits")
+            assert gateway.submissions == 0
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="500000"),
+                request=OrderRequest(
+                    instrument=request.instrument, side=request.side,
+                    order_type=request.order_type, quantity=request.quantity,
+                    client_order_id="best-limit-allowed", route=request.route,
+                ),
+            )
+            assert submitted.request.order_type is OrderType.BEST_LIMIT
+            assert store.order(submitted.id)["request"]["reserved_amount"] == "300000"
+            # One fill and an external cancellation of one share reduce the
+            # broker's effective total to two. Assigned quote must not turn
+            # the remaining best-limit order into a user-priced limit order.
+            gateway.orders = (AccountOrder(
+                provider_order_id=submitted.provider_order_id or "",
+                account_alias="broker-account", instrument=request.instrument,
+                side=OrderSide.BUY, order_type=OrderType.BEST_LIMIT,
+                status=OrderStatus.PARTIALLY_FILLED,
+                requested_quantity=Decimal("3"), filled_quantity=Decimal("1"),
+                remaining_quantity=Decimal("1"), ordered_at=datetime.now(SEOUL),
+                provider=gateway.provider, price=Decimal("73000"),
+                average_fill_price=Decimal("73000"),
+            ),)
+            partial = await service.refresh_unresolved_orders("broker-account")
+            assert partial[0]["status"] == OrderStatus.PARTIALLY_FILLED.value
+            cancelled = await service.cancel(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="500000"),
+                order_id=submitted.id, quantity=None, route=None,
+            )
+            assert cancelled.status is OrderStatus.CANCEL_PENDING
+            assert cancelled.request.order_type is OrderType.BEST_LIMIT
+            assert cancelled.request.price is None
+            assert cancelled.request.quantity == 2
+            assert cancelled.filled_quantity == 1
+            assert gateway.submissions == 1
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+
 class SimulationGateway:
     def __init__(self, provider: str = "contract-simulation") -> None:
         self.provider = provider
