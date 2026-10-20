@@ -472,8 +472,10 @@ def test_block_ui_uses_rule_tree_markers_and_removes_the_fixed_close_ui() -> Non
         "ruleActionOwner",
         "조건식",
         "데이터 추가",
-        "AND 묶음",
-        "OR 묶음",
+        "setBlockRuleConnection",
+        "boundaryIndex",
+        "( ) 괄호 묶음",
+        "전체 조건 설정",
         "통과하면",
         "order_type",
     ):

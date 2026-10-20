@@ -2338,20 +2338,35 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   line-height: 1.5;
 }
 .condition-formula-strip {
-  min-height: 54px;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 5px;
-  padding: 9px;
+  min-height: 78px;
+  display: block;
+  padding: 12px 14px;
   border: 1px solid #ccd5e1;
   border-radius: 8px;
   background: #fff;
+  color: #263b56;
+  font-size: 15px;
+  line-height: 2.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  caret-color: #245fca;
+  cursor: text;
+  outline: none;
   box-shadow: inset 0 1px 2px rgba(31, 41, 55, .035);
 }
+.condition-formula-strip:focus {
+  border-color: #3974ce;
+  box-shadow: 0 0 0 3px rgba(57, 116, 206, .12);
+}
+.condition-formula-strip[aria-invalid="true"] { border-color: #d19b57; }
+.condition-formula-strip:empty::before { content: attr(data-placeholder); color: #99a4b3; pointer-events: none; }
+.condition-formula-status { margin: 0; color: #9b692c; font-size: 11px; line-height: 1.5; }
 .condition-formula-token {
+  display: inline-block;
+  vertical-align: middle;
   max-width: 100%;
   min-height: 30px;
+  margin: 0 3px;
   padding: 5px 9px;
   overflow: hidden;
   border: 1px solid #cbd5e1;
@@ -2359,11 +2374,11 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   background: #f8fafc;
   color: #40516a;
   font: inherit;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 650;
   line-height: 1.25;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
   cursor: pointer;
 }
 .condition-formula-token.metric { border-color: #c6d4e8; background: #f2f6fc; color: #365b8e; }
@@ -2377,10 +2392,10 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
-  padding: 8px;
-  border: 1px solid #e0e5ec;
+  padding: 0;
+  border: 0;
   border-radius: 8px;
-  background: #f8fafc;
+  background: transparent;
 }
 .condition-formula-key {
   min-width: 34px;
@@ -2863,40 +2878,56 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-tree-branch[data-tone="condition"] > .composer-tree-children::before { background: #7991b4; }
 .composer-tree-branch[data-tone="sell"] > .composer-tree-children::before { background: #b47b84; }
 
-/* Rule groups use a light parenthesis rail. The condition and action cards carry
-   the content, so nested groups do not need another full box around them. */
+/* Conditions read vertically like an expression. Only explicit nested groups
+   get parentheses; the editable join sits on the line between its operands. */
 .composer-rule-branch {
-  padding: 2px 0 3px 12px;
+  gap: 0;
+  padding: 0;
   border: 0;
-  border-left: 2px solid #d8dde5;
   border-radius: 0;
   background: transparent;
 }
-.composer-rule-branch[data-tone="all"] { border-left-color: #76509a; }
-.composer-rule-branch[data-tone="any"] { border-left-color: #3670c8; }
-.composer-rule-branch[data-tone="condition"] {
-  padding-left: 0;
-  border-left: 0;
+.composer-rule-group.composer-rule-nested {
+  padding: 12px 16px;
+  border-left: 2px solid #a4b2c5;
+  border-right: 2px solid #a4b2c5;
+  border-radius: 16px;
+  background: rgba(244, 247, 251, .42);
 }
 .composer-rule-branch > .composer-tree-children {
-  margin-left: 3px;
-  padding: 5px 0 0 22px;
+  gap: 0;
+  margin: 0;
+  padding: 0;
 }
-.composer-rule-nested[data-tone="all"] > .composer-tree-row,
-.composer-rule-nested[data-tone="any"] > .composer-tree-row {
-  border-color: #dbe1e8;
-  background: #fbfcfd;
-  box-shadow: none;
+.composer-rule-branch > .composer-tree-children::before,
+.composer-rule-branch > .composer-tree-children > *::before {
+  display: none;
+}
+.composer-rule-branch[data-tone="condition"] > .composer-tree-children {
+  margin: 8px 0 0 22px;
 }
 .composer-logic-connector-row {
-  min-height: 28px;
+  min-height: 46px;
+  position: relative;
   display: flex;
   align-items: center;
+  justify-content: center;
 }
-.composer-tree-children > .composer-logic-connector-row::before { top: 14px; }
+.composer-logic-connector-row::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: #a8b4c5;
+  content: "";
+  pointer-events: none;
+}
 .composer-logic-connector {
   min-width: 52px;
   min-height: 25px;
+  position: relative;
+  z-index: 1;
   padding: 4px 11px;
   border: 1px solid #b89bcf;
   border-radius: 999px;
@@ -2914,6 +2945,36 @@ button.composer-tree-add-row { cursor: pointer; }
 }
 .composer-logic-connector:hover:not(:disabled) { box-shadow: 0 0 0 3px rgba(52, 105, 199, .11); }
 .composer-logic-connector:disabled { opacity: .56; cursor: default; }
+.composer-rule-toolbar {
+  min-width: 0;
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 1px 4px;
+}
+.composer-rule-settings {
+  min-height: 27px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: #737f91;
+  font-size: 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.composer-rule-settings:hover,
+.composer-rule-settings.selected {
+  border-color: #bdccdf;
+  background: #f7faff;
+  color: #315f9d;
+}
+.composer-rule-settings:focus-visible,
+.composer-logic-connector:focus-visible {
+  outline: 2px solid #4f80cc;
+  outline-offset: 2px;
+}
 .composer-tree-rule-add {
   width: max-content;
   max-width: 100%;
@@ -2971,7 +3032,7 @@ button.composer-tree-add-row { cursor: pointer; }
   grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
   gap: 9px;
-  padding-top: 3px;
+  padding-top: 8px;
 }
 .composer-tree-children > .composer-then-branch::before { top: 17px; }
 .composer-then-label {

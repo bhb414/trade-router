@@ -20,6 +20,14 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Test condition editor
+        run: node --test tests/test_condition_formula.cjs tests/test_rule_connections.cjs
+
       - name: Install and test
         shell: pwsh
         run: |

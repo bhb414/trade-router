@@ -1957,7 +1957,7 @@ function flushBlockFieldEdits(strict = true) {
       return false;
     }
   }
-  return true;
+  return flushConditionFormulaDrafts(strict);
 }
 
 function settleBlockFieldEditsForRerender() {
@@ -2300,18 +2300,20 @@ function createBlockRuleNodeEditor(reference, disabled) {
     section.className = "rule-editor-section";
     const title = document.createElement("strong");
     title.className = "rule-editor-section-title";
-    title.textContent = "묶음 조건";
-    const logic = conditionSelect(
-      [["ALL", "모두 충족 (AND)"], ["ANY", "하나 이상 충족 (OR)"]],
-      node.operator || "ALL", disabled,
-      value => setBlockRuleOperator(reference.kind, reference.flowId, node.id, value),
-    );
-    section.append(title, formulaControl("묶음 방식", logic, true));
+    title.textContent = "조건 연결";
+    section.append(title);
+    (node.children || []).slice(1).forEach((child, offset) => {
+      const boundaryIndex = offset + 1;
+      const logic = conditionSelect(
+        [["ALL", "AND · 모두 충족"], ["ANY", "OR · 하나 이상 충족"]],
+        node.operator || "ALL", disabled,
+        value => setBlockRuleConnection(reference.kind, reference.flowId, node.id, boundaryIndex, value),
+      );
+      section.append(formulaControl(`${boundaryIndex}번과 ${boundaryIndex + 1}번 사이`, logic, true));
+    });
     const help = document.createElement("p");
     help.className = "composer-inspector-hint";
-    help.textContent = node.operator === "ANY"
-      ? "하나라도 참이면 통과합니다. 여러 조건이 참이면 위쪽 조건을 먼저 실행합니다."
-      : "모든 조건이 참이면 통과합니다.";
+    help.textContent = "조건 사이의 AND·OR를 눌러 그 연결만 바꿉니다. 괄호 안을 먼저 판단하며, OR에서는 먼저 참인 경로의 주문을 실행합니다.";
     section.append(help);
     const adds = document.createElement("div");
     adds.className = "rule-node-add-actions";
@@ -2332,8 +2334,7 @@ function createBlockRuleNodeEditor(reference, disabled) {
       adds.append(button);
     };
     addControl("+ 조건식", "condition");
-    addControl("+ AND 묶음", "logic", "ALL");
-    addControl("+ OR 묶음", "logic", "ANY");
+    addControl("+ 괄호 묶음", "logic", "ALL");
     section.append(adds);
     wrap.append(section);
   } else {
@@ -2341,6 +2342,13 @@ function createBlockRuleNodeEditor(reference, disabled) {
   }
   wrap.append(createAttachedRuleActionEditor(reference.kind, reference.flowId, node, disabled));
   if (!reference.isRoot) {
+    const group = document.createElement("button");
+    group.type = "button";
+    group.className = "button quiet compact";
+    group.textContent = "( ) 이 조건을 괄호로 묶기";
+    group.disabled = disabled;
+    group.addEventListener("click", () => wrapBlockRuleNode(reference.kind, reference.flowId, node.id));
+    wrap.append(group);
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "button quiet compact danger-text rule-remove-node";
@@ -2848,47 +2856,16 @@ function legacyGroupsRuleTree(kind, groups, withAction = true) {
   return newBlockRuleRoot(kind, children, withAction);
 }
 
-function compactBlockRuleGroups(node) {
-  if (!node || node.kind !== "logic" || !Array.isArray(node.children)) return node;
-  const compactedChildren = node.children.map(child => {
-    let compacted = compactBlockRuleGroups(child);
-    while (
-      compacted?.kind === "logic"
-      && !compacted.action
-      && !compacted._keepForEditing
-      && Array.isArray(compacted.children)
-      && compacted.children.length === 1
-    ) {
-      compacted = compactBlockRuleGroups(compacted.children[0]);
-    }
-    return compacted;
-  });
-  node.children = compactedChildren.flatMap(child => (
-    child?.kind === "logic"
-    && !child.action
-    && !child._keepForEditing
-    && child.operator === node.operator
-    && Array.isArray(child.children)
-      ? child.children
-      : [child]
-  ));
-  // The root carries the flow's common action and remains visible even with a
-  // single condition. Redundant inner parentheses and same-operator groups are
-  // removed while groups that own an action remain intact.
-  return node;
-}
-
 function ensureBlockRuleTree(kind, owner) {
   if (!owner || typeof owner !== "object") return null;
   const key = `${kind}_rule_tree`;
   const current = owner[key];
   if (current && current.kind === "logic" && Array.isArray(current.children)) {
-    owner[key] = compactBlockRuleGroups(current);
-    return owner[key];
+    // Reading a strategy must preserve explicit parentheses, action scopes,
+    // node IDs and the user's edit intent.
+    return current;
   }
-  owner[key] = compactBlockRuleGroups(
-    legacyGroupsRuleTree(kind, owner[`${kind}_condition_groups`] || [], true),
-  );
+  owner[key] = legacyGroupsRuleTree(kind, owner[`${kind}_condition_groups`] || [], true);
   return owner[key];
 }
 
@@ -2971,6 +2948,124 @@ function setBlockRuleOperator(kind, flowId, nodeId, operator) {
   commitBlockRuleMutation();
 }
 
+function rewriteBlockRuleConnection(root, nodeId, boundaryIndex, operator, createId) {
+  const changed = structuredClone(root);
+  let target = null;
+  walkBlockRule(changed, node => { if (node.id === nodeId) target = node; });
+  const normalized = operator === "ANY" ? "ANY" : "ALL";
+  if (
+    target?.kind !== "logic"
+    || !Number.isInteger(boundaryIndex)
+    || boundaryIndex < 1
+    || boundaryIndex >= target.children.length
+    || normalized === target.operator
+  ) return null;
+  const group = children => children.length === 1 ? children[0] : {
+    kind: "logic",
+    id: createId(),
+    operator: "ALL",
+    children,
+    action: null,
+  };
+  if (target.children.length === 2) {
+    target.operator = normalized;
+  } else if (normalized === "ALL") {
+    // A OR B OR C -> A OR (B AND C) when only the second join changes.
+    // Existing child groups and their actions remain indivisible operands.
+    target.children.splice(
+      boundaryIndex - 1, 2,
+      group(target.children.slice(boundaryIndex - 1, boundaryIndex + 1)),
+    );
+  } else {
+    // A AND B AND C -> (A AND B) OR C. The explicit parentheses make
+    // the unchanged connections visible instead of changing every sibling.
+    target.children = [
+      group(target.children.slice(0, boundaryIndex)),
+      group(target.children.slice(boundaryIndex)),
+    ];
+    target.operator = "ANY";
+  }
+  return changed;
+}
+
+function blockRuleTreeEditError(root) {
+  let count = 0;
+  let deepest = 0;
+  let error = "";
+  walkBlockRule(root, (node, parent, index, depth) => {
+    count += 1;
+    deepest = Math.max(deepest, depth);
+    if (
+      node.kind === "logic"
+      && node.operator === "ALL"
+      && (node.children || []).filter(blockRuleContainsAction).length > 1
+    ) error = "AND로 연결할 두 경로에 각각 주문이 있습니다. 주문을 공통 행동으로 옮긴 뒤 연결하세요.";
+    if (node.kind === "logic" && (node.children || []).length > 20) {
+      error = "한 조건 묶음에는 자식을 20개까지 넣을 수 있습니다.";
+    }
+  });
+  if (count > 100) return "한 흐름의 조건 계층은 노드 100개까지 만들 수 있습니다.";
+  if (deepest > 8) return "조건 괄호는 8단계까지 중첩할 수 있습니다.";
+  return error;
+}
+
+function retainBlockRuleConditionReferences(original, changed) {
+  // Formula input can contain an unfinished local draft keyed to the condition
+  // object. Structural edits preserve those objects after validation succeeds.
+  const conditions = new Map();
+  walkBlockRule(original, node => {
+    if (node.kind === "condition") conditions.set(node.id, node.condition);
+  });
+  walkBlockRule(changed, node => {
+    if (node.kind === "condition" && conditions.has(node.id)) {
+      node.condition = conditions.get(node.id);
+    }
+  });
+}
+
+function setBlockRuleConnection(kind, flowId, nodeId, boundaryIndex, operator) {
+  if (selectedState()?.running) return;
+  const owner = flowId ? blockFlow(kind, flowId) : state.blockPackage?.settings;
+  const original = blockRuleTree(kind, flowId);
+  const changed = rewriteBlockRuleConnection(
+    original, nodeId, boundaryIndex, operator,
+    () => nextBlockRuleId(`${kind}-logic`),
+  );
+  if (!changed || !owner) return;
+  const error = blockRuleTreeEditError(changed);
+  if (error) {
+    notify(error, true);
+    return;
+  }
+  retainBlockRuleConditionReferences(original, changed);
+  owner[`${kind}_rule_tree`] = changed;
+  commitBlockRuleMutation();
+}
+
+function wrapBlockRuleNode(kind, flowId, nodeId) {
+  if (selectedState()?.running) return;
+  const owner = flowId ? blockFlow(kind, flowId) : state.blockPackage?.settings;
+  const original = blockRuleTree(kind, flowId);
+  const root = structuredClone(original);
+  let wrapper = null;
+  walkBlockRule(root, (node, parent, index) => {
+    if (!wrapper && node.id === nodeId && parent) {
+      wrapper = newBlockRuleLogic(kind, "ALL", [node], false);
+      parent.children[index] = wrapper;
+    }
+  });
+  if (!wrapper || !owner) return;
+  const error = blockRuleTreeEditError(root);
+  if (error) {
+    notify(error, true);
+    return;
+  }
+  retainBlockRuleConditionReferences(original, root);
+  owner[`${kind}_rule_tree`] = root;
+  state.blockSelectedNode = ruleComposerNodeId(kind, flowId, wrapper.id);
+  commitBlockRuleMutation();
+}
+
 function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL") {
   const parentFound = findBlockRuleNode(kind, flowId, parentId);
   const parent = parentFound?.node;
@@ -2993,15 +3088,6 @@ function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL") 
   const child = childKind === "logic"
     ? newBlockRuleLogic(kind, operator, [newBlockRuleCondition(kind)], false)
     : newBlockRuleCondition(kind);
-  if (childKind === "logic") {
-    // Keep a group that the user just created long enough to add another
-    // condition or attach an action. The flag is deliberately non-enumerable,
-    // so redundant one-child groups are compacted again after save/reload.
-    Object.defineProperty(child, "_keepForEditing", {
-      value: true,
-      configurable: true,
-    });
-  }
   parent.children.push(child);
   state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${child.id}`;
   commitBlockRuleMutation();
@@ -3032,6 +3118,14 @@ function removeBlockRuleNode(kind, flowId, nodeId) {
     }
   } else {
     found.parent.children.splice(found.index, 1);
+  }
+  // Explicit parentheses can nest several one-child groups. Prune all empty
+  // ancestors after deletion so a saved tree never contains an empty group.
+  while (selectedParent.kind === "logic" && !selectedParent.children.length) {
+    const emptyParent = findBlockRuleNode(kind, flowId, selectedParent.id);
+    if (!emptyParent?.parent) break;
+    emptyParent.parent.children.splice(emptyParent.index, 1);
+    selectedParent = emptyParent.parent;
   }
   let clearedUnsafeSellAction = false;
   if (kind === "sell") {
@@ -3585,23 +3679,6 @@ function createExpressionWorkbench(kind, groupIndex, conditionIndex, side, condi
   return workbench;
 }
 
-function formulaSelectionState(condition) {
-  let selection = state.blockExpressionSelections.get(condition);
-  if (!selection) {
-    selection = { left: [], right: [], activeSide: null, showData: false, expectOperand: false };
-    state.blockExpressionSelections.set(condition, selection);
-  }
-  return selection;
-}
-
-function selectFormulaToken(condition, side, path = []) {
-  const selection = formulaSelectionState(condition);
-  selection.activeSide = side;
-  selection[side] = [...path];
-  selection.showData = false;
-  selection.expectOperand = false;
-}
-
 function formulaMetricTokenLabel(expression) {
   if (!expression || expression.kind !== "metric") return conditionExpressionTokenLabel(expression);
   const label = new Map(BLOCK_CONDITION_METRICS).get(expression.metric) || expression.metric || "지표";
@@ -3627,90 +3704,6 @@ function effectiveFormulaExpression(condition, side) {
   return conditionSideExpression(condition, side) || legacyOperandExpression(condition, side);
 }
 
-function isDirectObvFormula(condition) {
-  const left = effectiveFormulaExpression(condition, "left");
-  const right = effectiveFormulaExpression(condition, "right");
-  return left?.kind === "metric" && left.metric === "obv"
-    && right?.kind === "metric" && right.metric === "obv";
-}
-
-function mutateConditionFormulaExpression(condition, side, path, mutator, render = true) {
-  const key = `${side}_expression`;
-  const root = structuredClone(effectiveFormulaExpression(condition, side));
-  const node = expressionNodeAt(root, path);
-  if (!node) return;
-  const replacement = mutator(node, root);
-  const candidate = replacement && replacement !== node ? replaceExpressionNode(root, path, replacement) : root;
-  if (expressionDepth(candidate) > 4 || expressionNodeCount(candidate) > 31) {
-    notify("계산식은 깊이 4단계, 구성 요소 31개까지 만들 수 있습니다.", true);
-    return false;
-  }
-  const wasObv = isDirectObvFormula(condition);
-  condition[key] = candidate;
-  if (wasObv && candidate?.kind === "metric" && candidate.metric === "obv") {
-    const otherSide = side === "left" ? "right" : "left";
-    const other = structuredClone(effectiveFormulaExpression(condition, otherSide));
-    if (other?.kind === "metric" && other.metric === "obv") {
-      other.bar_interval = candidate.bar_interval;
-      other.bar_data_mode = candidate.bar_data_mode;
-      condition[`${otherSide}_expression`] = other;
-    }
-  }
-  normalizeConditionAtrPeriods(condition);
-  commitBlockRuleMutation(render);
-  return true;
-}
-
-function canWrapConditionFormula(condition, side, path) {
-  const root = structuredClone(effectiveFormulaExpression(condition, side));
-  const node = expressionNodeAt(root, path);
-  if (!node || expressionContainsMetric(root, "obv")) return false;
-  const candidate = replaceExpressionNode(root, path, {
-    kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
-  });
-  return expressionDepth(candidate) <= 4 && expressionNodeCount(candidate) <= 31;
-}
-
-function appendFormulaExpressionTokens(container, condition, side, expression, path = []) {
-  const selection = formulaSelectionState(condition);
-  const selected = selection.activeSide === side && expressionPathsEqual(path, selection[side] || []);
-  if (expression.kind === "binary") {
-    const open = document.createElement("span");
-    open.className = "condition-formula-parenthesis";
-    open.textContent = "(";
-    container.append(open);
-    appendFormulaExpressionTokens(container, condition, side, expression.left, [...path, "left"]);
-    const operator = document.createElement("button");
-    operator.type = "button";
-    operator.className = `condition-formula-token operator${selected ? " selected" : ""}`;
-    operator.textContent = new Map(BLOCK_EXPRESSION_OPERATORS).get(expression.operator) || "+";
-    operator.title = "이 계산 연산 편집";
-    operator.addEventListener("click", event => {
-      event.stopPropagation();
-      selectFormulaToken(condition, side, path);
-      renderStrategyBlocks();
-    });
-    container.append(operator);
-    appendFormulaExpressionTokens(container, condition, side, expression.right, [...path, "right"]);
-    const close = document.createElement("span");
-    close.className = "condition-formula-parenthesis";
-    close.textContent = ")";
-    container.append(close);
-    return;
-  }
-  const token = document.createElement("button");
-  token.type = "button";
-  token.className = `condition-formula-token ${expression.kind === "constant" ? "constant" : "metric"}${selected ? " selected" : ""}`;
-  token.textContent = expression.kind === "metric" ? formulaMetricTokenLabel(expression) : String(expression.value ?? "0");
-  token.title = expression.kind === "metric" ? `${formulaMetricTokenLabel(expression)} 편집` : "숫자 편집";
-  token.addEventListener("click", event => {
-    event.stopPropagation();
-    selectFormulaToken(condition, side, path);
-    renderStrategyBlocks();
-  });
-  container.append(token);
-}
-
 function formulaControl(labelText, control, wide = false) {
   const label = document.createElement("label");
   if (wide) label.className = "wide";
@@ -3720,9 +3713,7 @@ function formulaControl(labelText, control, wide = false) {
   return label;
 }
 
-function createCompactFormulaTokenEditor(kind, condition, side, path, disabled) {
-  const root = effectiveFormulaExpression(condition, side);
-  const expression = expressionNodeAt(root, path);
+function createCompactFormulaTokenEditor(kind, expression, disabled, updateToken) {
   if (!expression) return null;
   const panel = document.createElement("div");
   panel.className = "condition-token-editor";
@@ -3736,16 +3727,16 @@ function createCompactFormulaTokenEditor(kind, condition, side, path, disabled) 
   panel.append(heading);
   const grid = document.createElement("div");
   grid.className = "condition-token-editor-grid";
-  const mutate = (mutator, render = true) => mutateConditionFormulaExpression(condition, side, path, mutator, render);
+  const mutate = (mutator, render = true) => updateToken(mutator(structuredClone(expression)), render);
   if (expression.kind === "binary") {
     const operator = conditionSelect(BLOCK_EXPRESSION_OPERATORS, expression.operator || "ADD", disabled, (value, render) => {
       mutate(node => { node.operator = value; return node; }, render);
     });
     grid.append(formulaControl("연산", operator, true));
   } else {
-    const metricOptions = expressionMetricOptions(kind, expression.metric);
+    const metricOptions = BLOCK_CONDITION_METRICS.filter(([key]) => kind !== "buy" || !["average_price", "profit_rate"].includes(key));
     const current = expression.kind === "constant" ? "constant" : expression.metric;
-    const metric = conditionSelect(metricOptions, current, disabled || expression.metric === "obv", (value, render) => {
+    const metric = conditionSelect(metricOptions, current, disabled, (value, render) => {
       mutate(node => value === "constant"
         ? { kind: "constant", value: "0" }
         : expressionMetricLeaf(value, node.kind === "metric" ? node : {}), render);
@@ -3820,225 +3811,360 @@ function createCompactFormulaTokenEditor(kind, condition, side, path, disabled) 
   return panel;
 }
 
-function insertConditionFormulaOperand(condition, kind, metric) {
-  const selection = formulaSelectionState(condition);
-  const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
-  const path = selection[side] || [];
-  const source = expressionNodeAt(effectiveFormulaExpression(condition, side), path) || {};
-  const operand = metric === "constant" ? { kind: "constant", value: "0" } : expressionMetricLeaf(metric, source);
-  if (selection.expectOperand) {
-    if (mutateConditionFormulaExpression(condition, side, path, () => operand, false) === false) return;
-    selection.expectOperand = false;
-  } else {
-    if (mutateConditionFormulaExpression(condition, side, path, node => ({
-      kind: "binary", operator: "ADD", left: structuredClone(node), right: operand,
-    }), false) === false) return;
-    selection[side] = [...path, "right"];
+let conditionFormulaDrafts = new WeakMap();
+
+function resetConditionFormulaDrafts() {
+  conditionFormulaDrafts = new WeakMap();
+}
+
+function getConditionFormulaDraft(condition) {
+  let draft = conditionFormulaDrafts.get(condition);
+  if (!draft) {
+    const units = ConditionFormula.fromCondition({
+      operator: condition.operator,
+      left_expression: effectiveFormulaExpression(condition, "left"),
+      right_expression: effectiveFormulaExpression(condition, "right"),
+    });
+    draft = { units, anchor: units.length, focus: units.length, metricIndex: null, error: "", undo: [], redo: [] };
+    conditionFormulaDrafts.set(condition, draft);
   }
-  selection.activeSide = side;
-  selection.showData = false;
-  renderStrategyBlocks();
+  return draft;
 }
 
-function applyConditionObvComparison(condition) {
-  const selected = formulaSelectionState(condition);
-  const selectedSide = ["left", "right"].includes(selected.activeSide) ? selected.activeSide : "left";
-  const selectedSource = expressionNodeAt(
-    effectiveFormulaExpression(condition, selectedSide), selected[selectedSide] || [],
-  );
-  const source = selectedSource?.kind === "metric" ? selectedSource : {
-    bar_interval: condition.left_bar_interval || "3m",
-    bar_data_mode: condition.left_bar_data_mode || "COMPLETE_ONLY",
+function flushConditionFormulaDrafts(strict = true) {
+  if (!strict) return true; // An unfinished expression must remain editable across inspector renders.
+  const visit = value => {
+    if (!value || typeof value !== "object") return;
+    const draft = conditionFormulaDrafts.get(value);
+    if (draft) {
+      try { ConditionFormula.parse(draft.units); }
+      catch (error) { throw new Error(`미완성 조건식을 먼저 수정해 주세요. IF 조건식을 열어 확인하세요. ${error.message}`); }
+    }
+    Object.values(value).forEach(visit);
   };
-  condition.left = "obv";
-  condition.right = "obv";
-  condition.left_expression = expressionMetricLeaf("obv", { ...source, offset: 0 });
-  condition.right_expression = expressionMetricLeaf("obv", { ...source, offset: 10 });
-  condition.operator = "GT";
-  selected.activeSide = "left";
-  selected.left = [];
-  selected.right = [];
-  selected.showData = false;
-  selected.expectOperand = false;
-  commitBlockRuleMutation();
+  visit(state.blockPackage);
+  return true;
 }
 
-function releaseConditionObvComparison(condition) {
-  const selected = formulaSelectionState(condition);
-  const source = effectiveFormulaExpression(condition, "left");
-  condition.left = "close";
-  condition.right = "value";
-  condition.value = "0";
-  condition.left_expression = expressionMetricLeaf("close", source?.kind === "metric" ? source : {});
-  condition.right_expression = { kind: "constant", value: "0" };
-  condition.operator = "GT";
-  selected.activeSide = "left";
-  selected.left = [];
-  selected.right = [];
-  selected.showData = false;
-  selected.expectOperand = false;
-  commitBlockRuleMutation();
+function formulaDomLength(node) {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent.length;
+  if (node.dataset?.formulaMetric != null) return 1;
+  return [...node.childNodes].reduce((total, child) => total + formulaDomLength(child), 0);
+}
+
+function formulaDomOffset(strip, node, offset) {
+  if (!node || !strip.contains(node)) return null;
+  let position = node.nodeType === Node.TEXT_NODE ? offset
+    : [...node.childNodes].slice(0, offset).reduce((total, child) => total + formulaDomLength(child), 0);
+  while (node !== strip) {
+    if (node.parentNode?.dataset?.formulaMetric != null) { position = 1; node = node.parentNode; }
+    for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) position += formulaDomLength(sibling);
+    node = node.parentNode;
+  }
+  return position;
+}
+
+function formulaDomPoint(strip, offset) {
+  let remaining = Math.max(0, offset);
+  for (let index = 0; index < strip.childNodes.length; index += 1) {
+    const node = strip.childNodes[index];
+    const length = formulaDomLength(node);
+    if (node.nodeType === Node.TEXT_NODE && remaining <= length) return [node, remaining];
+    if (remaining === 0) return [strip, index];
+    remaining -= length;
+  }
+  return [strip, strip.childNodes.length];
+}
+
+function captureConditionFormulaFocus(inspector) {
+  const editor = inspector?.querySelector(".condition-formula-strip");
+  if (!editor || document.activeElement !== editor) return null;
+  editor._captureFormulaSelection();
+  return { condition: editor._formulaCondition, anchor: editor._formulaDraft.anchor, focus: editor._formulaDraft.focus };
+}
+
+function restoreConditionFormulaFocus(snapshot, inspector) {
+  if (!snapshot) return;
+  const editor = inspector?.querySelector(".condition-formula-strip");
+  if (editor?._formulaCondition !== snapshot.condition) return;
+  editor._formulaDraft.anchor = snapshot.anchor;
+  editor._formulaDraft.focus = snapshot.focus;
+  editor._restoreFormulaSelection();
 }
 
 function createConditionFormulaEditor(kind, ruleNode, disabled) {
   const condition = ruleNode.condition;
-  const obvMode = isDirectObvFormula(condition);
+  const draft = getConditionFormulaDraft(condition);
   const panel = document.createElement("section");
   panel.className = "condition-formula-editor";
   const hint = document.createElement("p");
   hint.className = "condition-formula-hint";
-  hint.textContent = "조건식을 토큰으로 만듭니다. 데이터 토큰을 누르면 봉 주기와 지표 값을 바로 편집할 수 있습니다.";
+  hint.textContent = "원하는 위치를 클릭하고 숫자·연산자를 입력하세요. 데이터는 클릭해서 설정합니다.";
   const strip = document.createElement("div");
   strip.className = "condition-formula-strip";
-  strip.setAttribute("aria-label", "조건식");
-  appendFormulaExpressionTokens(strip, condition, "left", effectiveFormulaExpression(condition, "left"));
-  const selection = formulaSelectionState(condition);
-  const compare = document.createElement("button");
-  compare.type = "button";
-  compare.className = `condition-formula-token comparison${selection.activeSide === "operator" ? " selected" : ""}`;
-  compare.textContent = new Map(BLOCK_CONDITION_OPERATORS).get(condition.operator) || condition.operator;
-  compare.title = "비교 연산 편집";
-  compare.addEventListener("click", () => {
-    selection.activeSide = "operator";
-    selection.showData = false;
-    renderStrategyBlocks();
-  });
-  strip.append(compare);
-  appendFormulaExpressionTokens(strip, condition, "right", effectiveFormulaExpression(condition, "right"));
+  strip.contentEditable = String(!disabled);
+  strip.spellcheck = false;
+  strip.setAttribute("role", "textbox");
+  strip.setAttribute("aria-label", "조건식 입력");
+  strip.setAttribute("aria-multiline", "false");
+  strip.setAttribute("aria-readonly", String(disabled));
+  strip.dataset.placeholder = "데이터를 추가하고 조건식을 입력하세요";
+  strip._formulaCondition = condition;
+  strip._formulaDraft = draft;
+  const status = document.createElement("p");
+  status.className = "condition-formula-status";
+  status.setAttribute("aria-live", "polite");
   const timing = document.createElement("span");
-  timing.className = `block-condition-timing${isLiveProfitCondition(condition) ? " live" : ""}`;
-  timing.textContent = `판단 기준 · ${blockConditionTiming(condition)}`;
-  panel.append(hint, strip, timing);
-
+  timing.className = "block-condition-timing";
   const keypad = document.createElement("div");
   keypad.className = "condition-formula-keypad";
-  const key = (label, title, onClick, className = "") => {
+  const palette = document.createElement("div");
+  palette.className = "condition-data-palette";
+  palette.hidden = true;
+  const details = document.createElement("div");
+  details.className = "condition-formula-data-settings";
+  panel.append(hint, strip, status, timing, keypad, palette, details);
+
+  const capture = () => {
+    const selection = window.getSelection();
+    const anchor = formulaDomOffset(strip, selection?.anchorNode, selection?.anchorOffset);
+    const focus = formulaDomOffset(strip, selection?.focusNode, selection?.focusOffset);
+    if (anchor != null && focus != null) {
+      draft.anchor = Math.min(anchor, draft.units.length);
+      draft.focus = Math.min(focus, draft.units.length);
+    }
+  };
+  const restore = () => {
+    if (disabled || !strip.isConnected) return;
+    strip.focus({ preventScroll: true });
+    const anchor = formulaDomPoint(strip, draft.anchor);
+    const focus = formulaDomPoint(strip, draft.focus);
+    window.getSelection()?.setBaseAndExtent(anchor[0], anchor[1], focus[0], focus[1]);
+  };
+  strip._captureFormulaSelection = capture;
+  strip._restoreFormulaSelection = restore;
+  const renderText = () => {
+    strip.replaceChildren();
+    let text = "";
+    const flushText = () => { if (text) strip.append(document.createTextNode(text)); text = ""; };
+    draft.units.forEach((unit, index) => {
+      if (typeof unit === "string") { text += unit; return; }
+      flushText();
+      const chip = document.createElement("span");
+      chip.className = `condition-formula-token metric${draft.metricIndex === index ? " selected" : ""}`;
+      chip.contentEditable = "false";
+      chip.dataset.formulaMetric = String(index);
+      chip.setAttribute("role", "button");
+      chip.setAttribute("aria-label", `${formulaMetricTokenLabel(unit)} 데이터 설정`);
+      chip.textContent = formulaMetricTokenLabel(unit);
+      chip.title = "클릭하여 지표와 봉 기준 변경";
+      strip.append(chip);
+    });
+    flushText();
+    if (!strip.lastChild || strip.lastChild.nodeType !== Node.TEXT_NODE) strip.append(document.createTextNode(""));
+  };
+  const validate = (commit = true) => {
+    try {
+      const parsed = ConditionFormula.parse(draft.units);
+      if (commit) {
+        Object.assign(condition, parsed);
+        normalizeConditionAtrPeriods(condition);
+        commitBlockRuleMutation(false);
+      }
+      draft.error = "";
+    } catch (error) {
+      draft.error = error.message;
+      if (commit) setDirty(true);
+    }
+    strip.setAttribute("aria-invalid", String(Boolean(draft.error)));
+    status.hidden = !draft.error;
+    status.textContent = draft.error;
+    timing.hidden = Boolean(draft.error);
+    timing.textContent = `판단 기준 · ${blockConditionTiming(condition)}`;
+    timing.classList.toggle("live", isLiveProfitCondition(condition));
+  };
+  const checkpoint = () => {
+    draft.undo.push({ units: structuredClone(draft.units), anchor: draft.anchor, focus: draft.focus });
+    if (draft.undo.length > 100) draft.undo.shift();
+    draft.redo = [];
+  };
+  const showDetails = () => {
+    details.replaceChildren();
+    const unit = draft.units[draft.metricIndex];
+    if (!unit || typeof unit === "string") return;
+    const editor = createCompactFormulaTokenEditor(kind, unit, disabled, (next, rerender) => {
+      checkpoint();
+      draft.units[draft.metricIndex] = next;
+      validate();
+      renderText();
+      if (rerender) showDetails();
+      else {
+        const summary = details.querySelector(".condition-token-editor-heading > span");
+        if (summary) summary.textContent = formulaMetricTokenLabel(next);
+      }
+      return true;
+    });
+    if (editor) details.append(editor);
+  };
+  const insert = (replacement, { preserveSelection = false, selectMetric = false } = {}) => {
+    if (disabled) return;
+    capture();
+    const start = Math.min(draft.anchor, draft.focus);
+    const result = ConditionFormula.replaceRange(draft.units, draft.anchor, draft.focus, replacement);
+    if (result.units.length > 512) { notify("조건식은 512자 이내로 입력해 주세요.", true); return; }
+    checkpoint();
+    draft.units = result.units;
+    draft.anchor = preserveSelection ? start : result.caret;
+    draft.focus = result.caret;
+    draft.metricIndex = selectMetric ? start : null;
+    palette.hidden = true;
+    validate();
+    renderText();
+    showDetails();
+    restore();
+  };
+  const erase = backwards => {
+    capture();
+    if (draft.anchor === draft.focus) {
+      if (backwards) draft.anchor = Math.max(0, draft.anchor - 1);
+      else draft.focus = Math.min(draft.units.length, draft.focus + 1);
+    }
+    // The adjusted range is model state; do not overwrite it from the old DOM selection.
+    const result = ConditionFormula.replaceRange(draft.units, draft.anchor, draft.focus, []);
+    checkpoint();
+    draft.units = result.units;
+    draft.anchor = draft.focus = result.caret;
+    draft.metricIndex = null;
+    validate();
+    renderText();
+    showDetails();
+    restore();
+  };
+  const undo = redo => {
+    const source = redo ? draft.redo : draft.undo;
+    const target = redo ? draft.undo : draft.redo;
+    if (!source.length) return;
+    target.push({ units: structuredClone(draft.units), anchor: draft.anchor, focus: draft.focus });
+    Object.assign(draft, source.pop());
+    draft.metricIndex = null;
+    validate();
+    renderText();
+    showDetails();
+    restore();
+  };
+  strip.addEventListener("beforeinput", event => {
+    if (disabled) { event.preventDefault(); return; }
+    if (event.isComposing) return;
+    if (["insertText", "insertReplacementText"].includes(event.inputType)) {
+      event.preventDefault();
+      insert(event.data || "");
+    } else if (event.inputType.startsWith("delete")) {
+      event.preventDefault();
+      erase(event.inputType.endsWith("Backward"));
+    } else if (event.inputType === "historyUndo" || event.inputType === "historyRedo") {
+      event.preventDefault();
+      undo(event.inputType === "historyRedo");
+    } else if (["insertParagraph", "insertLineBreak"].includes(event.inputType)) event.preventDefault();
+  });
+  strip.addEventListener("input", event => {
+    if (event.isComposing || disabled) return;
+    // Browser/IME edits are converted back to text and atomic data only.
+    const units = [];
+    const read = node => {
+      if (node.nodeType === Node.TEXT_NODE) units.push(...Array.from(node.textContent));
+      else if (node.dataset?.formulaMetric != null) {
+        const metric = draft.units[Number(node.dataset.formulaMetric)];
+        if (metric && typeof metric === "object") units.push(structuredClone(metric));
+      } else [...node.childNodes].forEach(read);
+    };
+    [...strip.childNodes].forEach(read);
+    capture();
+    checkpoint();
+    draft.units = units;
+    draft.metricIndex = null;
+    validate();
+    renderText();
+    showDetails();
+    restore();
+  });
+  strip.addEventListener("paste", event => {
+    event.preventDefault();
+    insert((event.clipboardData?.getData("text/plain") || "").replace(/[\r\n]+/g, " "));
+  });
+  strip.addEventListener("drop", event => event.preventDefault());
+  strip.addEventListener("keydown", event => {
+    if (disabled || event.isComposing) return;
+    if ((event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase())) {
+      event.preventDefault();
+      undo(event.key.toLowerCase() === "y" || event.shiftKey);
+      return;
+    }
+    if (event.key === "Backspace" || event.key === "Delete") {
+      event.preventDefault();
+      erase(event.key === "Backspace");
+    } else if (["ArrowLeft", "ArrowRight"].includes(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      capture();
+      const left = event.key === "ArrowLeft";
+      const position = !event.shiftKey && draft.anchor !== draft.focus
+        ? (left ? Math.min(draft.anchor, draft.focus) : Math.max(draft.anchor, draft.focus))
+        : Math.max(0, Math.min(draft.units.length, draft.focus + (left ? -1 : 1)));
+      draft.focus = position;
+      if (!event.shiftKey) draft.anchor = position;
+      draft.metricIndex = null;
+      strip.querySelectorAll(".selected").forEach(chip => chip.classList.remove("selected"));
+      showDetails();
+      restore();
+    } else if (event.key === "Enter") event.preventDefault();
+  });
+  strip.addEventListener("pointerdown", event => {
+    const chip = event.target.closest("[data-formula-metric]");
+    if (!chip || disabled) return;
+    event.preventDefault();
+    draft.metricIndex = Number(chip.dataset.formulaMetric);
+    draft.anchor = draft.metricIndex;
+    draft.focus = draft.metricIndex + 1;
+    palette.hidden = true;
+    strip.querySelectorAll(".selected").forEach(item => item.classList.remove("selected"));
+    chip.classList.add("selected");
+    showDetails();
+    restore();
+  });
+  strip.addEventListener("click", event => {
+    if (event.target.closest("[data-formula-metric]")) return;
+    capture();
+    draft.metricIndex = null;
+    strip.querySelectorAll(".selected").forEach(chip => chip.classList.remove("selected"));
+    showDetails();
+  });
+  strip.addEventListener("keyup", capture);
+  strip.addEventListener("mouseup", capture);
+  const key = (label, callback, className = "") => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `condition-formula-key ${className}`.trim();
     button.textContent = label;
-    button.title = title;
     button.disabled = disabled;
-    button.addEventListener("click", onClick);
+    button.addEventListener("pointerdown", event => { capture(); event.preventDefault(); });
+    button.addEventListener("click", callback);
     keypad.append(button);
-    return button;
   };
-  const dataKey = key("+ 데이터 추가", "지표 데이터를 조건식에 추가", () => {
-    if (!["left", "right"].includes(selection.activeSide)) {
-      selection.activeSide = "left";
-      selection.left = [];
-    }
-    selection.showData = !selection.showData;
-    renderStrategyBlocks();
-  }, "data");
-  dataKey.disabled = disabled || obvMode;
-  const numberKey = key("숫자", "숫자 값을 조건식에 추가", () => insertConditionFormulaOperand(condition, kind, "constant"));
-  numberKey.disabled = disabled || obvMode;
-  key(obvMode ? "OBV 비교 해제" : "OBV 비교", obvMode
-    ? "양쪽 OBV를 함께 일반 종가 비교식으로 바꿉니다"
-    : "같은 봉 기준의 1봉 전 OBV와 11봉 전 OBV 비교식을 만듭니다", () => {
-    if (obvMode) releaseConditionObvComparison(condition);
-    else applyConditionObvComparison(condition);
-  }, "data");
-  BLOCK_EXPRESSION_OPERATORS.forEach(([operator, label]) => {
-    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
-    const path = selection[side] || [];
-    const button = key(label, `${label} 계산 추가`, () => {
-      if (mutateConditionFormulaExpression(condition, side, path, node => ({
-        kind: "binary", operator, left: structuredClone(node), right: { kind: "constant", value: "0" },
-      }), false) === false) return;
-      selection.activeSide = side;
-      selection[side] = [...path, "right"];
-      selection.expectOperand = true;
-      renderStrategyBlocks();
-    }, "arithmetic");
-    button.disabled = disabled || obvMode || !canWrapConditionFormula(condition, side, path);
-  });
-  conditionOperatorOptions(condition).forEach(([operator, label, optionDisabled]) => {
-    const button = key(label, `${label} 비교`, () => {
-      condition.operator = operator;
-      selection.activeSide = "operator";
-      commitBlockRuleMutation();
-    }, "compare");
-    button.disabled = disabled || optionDisabled;
-  });
-  const openKey = key("(", "선택한 값을 새 괄호 계산으로 확장", () => {
-    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
-    const path = selection[side] || [];
-    if (mutateConditionFormulaExpression(condition, side, path, node => ({
-      kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
-    }), false) === false) return;
-    selection.activeSide = side;
-    selection[side] = [...path, "right"];
-    selection.expectOperand = true;
-    renderStrategyBlocks();
-  }, "parenthesis");
-  {
-    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
-    const path = selection[side] || [];
-    openKey.disabled = disabled || obvMode || !canWrapConditionFormula(condition, side, path);
-  }
-  const closeKey = key(")", "현재 괄호의 바깥 계산 선택", () => {
-    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
-    const path = selection[side] || [];
-    selection[side] = path.length > 1 ? path.slice(0, -2) : [];
-    selection.expectOperand = false;
-    renderStrategyBlocks();
-  }, "parenthesis");
-  closeKey.disabled = disabled || obvMode;
-  const deleteKey = key("삭제", "선택한 계산 항목 제거", () => {
-    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : null;
-    if (!side) return;
-    const path = selection[side] || [];
-    if (!path.length) {
-      mutateConditionFormulaExpression(condition, side, [], () => side === "right"
-        ? { kind: "constant", value: "0" } : expressionMetricLeaf("close"), false);
-      selection[side] = [];
-    } else {
-      const parentPath = path.slice(0, -1);
-      const branch = path.at(-1);
-      mutateConditionFormulaExpression(condition, side, parentPath, parent => structuredClone(
-        branch === "left" ? parent.right : parent.left,
-      ), false);
-      selection[side] = parentPath;
-    }
-    selection.expectOperand = false;
-    renderStrategyBlocks();
-  }, "remove");
-  deleteKey.disabled = disabled || obvMode;
-  panel.append(keypad);
-
-  if (selection.showData && !obvMode) {
-    const palette = document.createElement("div");
-    palette.className = "condition-data-palette";
-    const options = expressionMetricOptions(kind);
-    options.filter(([metric]) => metric !== "constant").forEach(([metric, label]) => {
+  key("+ 데이터 추가", () => { palette.hidden = !palette.hidden; }, "data");
+  [...BLOCK_EXPRESSION_OPERATORS.map(([, label]) => label), "(", ")", ...BLOCK_CONDITION_OPERATORS.map(([, label]) => label)]
+    .forEach(operator => key(operator, () => insert(operator), ["<", "≤", ">", "≥", "=", "상향돌파", "하향돌파"].includes(operator) ? "compare" : ""));
+  BLOCK_CONDITION_METRICS.filter(([metric]) => kind !== "buy" || !["average_price", "profit_rate"].includes(metric))
+    .forEach(([metric, label]) => {
       const button = document.createElement("button");
       button.type = "button";
       button.textContent = label;
       button.disabled = disabled;
-      button.addEventListener("click", () => insertConditionFormulaOperand(condition, kind, metric));
+      button.addEventListener("pointerdown", event => { capture(); event.preventDefault(); });
+      button.addEventListener("click", () => insert([expressionMetricLeaf(metric)], { selectMetric: true }));
       palette.append(button);
     });
-    panel.append(palette);
-  }
-  if (selection.activeSide === "operator") {
-    const operatorPanel = document.createElement("div");
-    operatorPanel.className = "condition-token-editor comparison-editor";
-    const title = document.createElement("strong");
-    title.textContent = "비교 연산";
-    const select = conditionSelect(conditionOperatorOptions(condition), condition.operator, disabled, (value, render) => {
-      condition.operator = value;
-      commitBlockRuleMutation(render);
-    });
-    operatorPanel.append(title, select);
-    panel.append(operatorPanel);
-  } else if (["left", "right"].includes(selection.activeSide)) {
-    const editor = createCompactFormulaTokenEditor(
-      kind, condition, selection.activeSide, selection[selection.activeSide] || [], disabled,
-    );
-    if (editor) panel.append(editor);
-  }
+  renderText();
+  validate(false);
+  showDetails();
   return panel;
 }
 
@@ -4635,6 +4761,8 @@ async function loadBlockEditorData(name, openToken = null) {
   ]);
   if (openToken != null && openToken !== state.strategyOpenToken) return false;
   state.blockPackage = blockPackage;
+  resetConditionFormulaDrafts();
+  state.blockExpressionSelections = new WeakMap();
   state.blockConditionCache = new Map();
   normalizeManagedBlockSettings(state.blockPackage.settings);
   prepareBlockVisualLayout(name);
@@ -4675,6 +4803,7 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
           ruleKind: kind,
           flowId,
           parentId: node.id,
+          boundaryIndex: index,
           operator: node.operator || "ALL",
         });
       }
@@ -4686,6 +4815,8 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
       ruleKind: kind,
       flowId,
       parentId: node.id,
+      nodeId: ruleComposerNodeId(kind, flowId, node.id),
+      isRoot,
       depth,
       totalCount: ruleCount,
       disabled: (node.children || []).length >= 20,
@@ -4709,6 +4840,7 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
     ruleKind: kind,
     flowId,
     ruleNodeId: node.id,
+    isLogic: node.kind === "logic",
     isRoot,
     children,
   };
@@ -4827,13 +4959,13 @@ function createComposerLogicConnector(entry, running) {
   button.type = "button";
   button.className = `composer-logic-connector ${entry.operator === "ANY" ? "any" : "all"}`;
   button.textContent = entry.operator === "ANY" ? "OR" : "AND";
-  button.title = `${button.textContent} 연결 · 눌러서 변경`;
-  button.setAttribute("aria-label", `${button.textContent} 연결 방식 변경`);
+  button.title = `${button.textContent} · 이 연결만 ${entry.operator === "ANY" ? "AND" : "OR"}로 변경`;
+  button.setAttribute("aria-label", `${entry.boundaryIndex}번과 ${entry.boundaryIndex + 1}번 조건 사이 ${button.textContent} 연결 변경`);
   button.disabled = running;
   button.addEventListener("click", event => {
     event.stopPropagation();
-    setBlockRuleOperator(
-      entry.ruleKind, entry.flowId, entry.parentId,
+    setBlockRuleConnection(
+      entry.ruleKind, entry.flowId, entry.parentId, entry.boundaryIndex,
       entry.operator === "ANY" ? "ALL" : "ANY",
     );
   });
@@ -4842,11 +4974,13 @@ function createComposerLogicConnector(entry, running) {
 }
 
 function createComposerRuleAddMenu(entry, running) {
+  const toolbar = document.createElement("div");
+  toolbar.className = "composer-rule-toolbar";
   const menu = document.createElement("details");
   menu.className = "composer-tree-rule-add";
   const summary = document.createElement("summary");
-  summary.textContent = "+ 조건 또는 묶음";
-  summary.setAttribute("aria-label", "조건 또는 AND·OR 묶음 추가 메뉴");
+  summary.textContent = "+ 조건 추가";
+  summary.setAttribute("aria-label", "조건식 또는 괄호 묶음 추가 메뉴");
   menu.append(summary);
   const options = document.createElement("div");
   options.className = "composer-tree-rule-add-options";
@@ -4867,10 +5001,23 @@ function createComposerRuleAddMenu(entry, running) {
     options.append(button);
   };
   make("+ 조건식", "condition");
-  make("+ AND", "logic", "ALL");
-  make("+ OR", "logic", "ANY");
+  make("( ) 괄호 묶음", "logic", "ALL");
   menu.append(options);
-  return menu;
+  const settings = document.createElement("button");
+  settings.type = "button";
+  settings.className = "composer-rule-settings";
+  settings.textContent = entry.isRoot ? "전체 조건 설정" : "괄호 설정";
+  settings.dataset.blockNode = entry.nodeId;
+  settings.setAttribute("aria-label", `${settings.textContent} · 연결과 주문 편집`);
+  settings.classList.toggle("selected", state.blockSelectedNode === entry.nodeId);
+  settings.addEventListener("click", event => {
+    event.stopPropagation();
+    state.blockSelectedNode = entry.nodeId;
+    renderStrategyBlocks();
+    focusComposerInspector();
+  });
+  toolbar.append(menu, settings);
+  return toolbar;
 }
 
 function createComposerThenBranch(entry, definitions, running) {
@@ -4928,6 +5075,8 @@ function renderComposerTreeBranch(entry, definitions, running) {
   branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}${entry.kind === "rule-node" ? " composer-rule-branch" : ""}`;
   if (entry.kind === "rule-node") {
     branch.classList.add(entry.isRoot ? "composer-rule-root" : "composer-rule-nested");
+    branch.classList.toggle("composer-rule-group", entry.isLogic);
+    if (entry.isLogic) branch.setAttribute("aria-label", entry.isRoot ? "전체 조건" : "괄호로 묶은 조건");
   }
   if (entry.tone) {
     branch.classList.add(entry.tone);
@@ -4935,7 +5084,7 @@ function renderComposerTreeBranch(entry, definitions, running) {
   }
   branch.dataset.composerBranch = entry.id || entry.nodeId || "branch";
   if (entry.title) branch.append(createComposerTreeBranchHeader(entry, running));
-  if (entry.nodeId) {
+  if (entry.nodeId && !entry.isLogic) {
     const definition = definitions.get(entry.nodeId);
     if (definition) branch.append(createComposerTreeRow(definition, running));
   }
@@ -5000,7 +5149,7 @@ function bindBlockCanvasPan(world) {
   if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
   if (canvas._blockKeyHandler) canvas.removeEventListener("keydown", canvas._blockKeyHandler);
   const panHandler = event => {
-    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-add-row, .composer-inspector, button, input, select, textarea, a")) return;
+    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-add-row, .composer-inspector, button, input, select, textarea, a, summary, [contenteditable]")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     const strategyName = state.selected;
@@ -5209,6 +5358,7 @@ function captureComposerInspectorView() {
     id: active?.id || null,
     controlIndex: active ? controls.indexOf(active) : -1,
     selection,
+    formulaFocus: captureConditionFormulaFocus(inspector),
   };
 }
 
@@ -5227,6 +5377,7 @@ function restoreComposerInspectorView(snapshot) {
       try { control.setSelectionRange(...snapshot.selection); } catch (_) { /* Non-text control. */ }
     }
   }
+  restoreConditionFormulaFocus(snapshot.formulaFocus, inspector);
   body.scrollTop = snapshot.top;
   body.scrollLeft = snapshot.left;
 }
@@ -5491,15 +5642,11 @@ function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
       const conditionCount = blockRuleConditionNodes(node).length;
       nodes.push({
         id: nodeId,
-        title: isRoot
-          ? `${kind === "sell" ? "매도" : "매수"} 판단`
-          : `${operator === "ANY" ? "OR" : "AND"} 조건 묶음`,
-        meta: isRoot
-          ? `${conditionCount}개 조건 · ${operator === "ANY" ? "먼저 참인 분기 실행" : "모두 충족"}`
-          : `${conditionCount}개 조건`,
-        tone: operator === "ANY" ? "any" : "all",
-        logic: operator === "ANY" ? "OR" : "AND",
-        logicTone: operator === "ANY" ? "any" : "all",
+        title: isRoot ? "전체 조건 설정" : "괄호 설정",
+        meta: `${conditionCount}개 조건 · 연결과 주문`,
+        tone: "condition",
+        logic: "( )",
+        logicTone: "condition",
         width: 560,
         summary: [],
         description: isRoot
@@ -5917,7 +6064,6 @@ async function openStrategy(name) {
   if (state.dirty && !window.confirm("저장하지 않은 변경 사항이 있습니다. 저장하지 않고 다른 전략을 열까요?")) return;
   const openToken = ++state.strategyOpenToken;
   state.blockSelectedNode = null;
-  state.blockExpressionSelections = new WeakMap();
   state.openingStrategy = name;
   try {
     const payload = await api(`/api/strategies/${encodeURIComponent(name)}`);
@@ -5927,6 +6073,8 @@ async function openStrategy(name) {
       if (!await loadBlockEditorData(name, openToken)) return;
     } else {
       state.blockPackage = null;
+      resetConditionFormulaDrafts();
+      state.blockExpressionSelections = new WeakMap();
       state.blockConditions = [];
       state.blockConditionKey = null;
       state.blockConditionError = null;
@@ -5979,9 +6127,12 @@ async function openDashboard() {
   state.strategyPermission = null;
   state.strategySummary = null;
   state.blockPackage = null;
+  resetConditionFormulaDrafts();
+  state.blockExpressionSelections = new WeakMap();
   state.blockConditions = [];
   state.blockConditionKey = null;
   state.blockConditionError = null;
+  setDirty(false);
   showWorkspaceView("dashboard");
   resetActivity("전략을 선택하면 실행 기록이 표시됩니다.");
   renderStrategies();
@@ -6030,6 +6181,8 @@ async function saveStrategy() {
     ]);
     elements.editor.value = strategy.source;
     state.blockPackage = blockPackage;
+    resetConditionFormulaDrafts();
+    state.blockExpressionSelections = new WeakMap();
     state.blockSource = strategy.source;
     updateLineNumbers();
     renderStrategyBlocks();
