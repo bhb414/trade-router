@@ -2878,9 +2878,13 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-tree-branch[data-tone="condition"] > .composer-tree-children::before { background: #7991b4; }
 .composer-tree-branch[data-tone="sell"] > .composer-tree-children::before { background: #b47b84; }
 
-/* Conditions read vertically like an expression. Only explicit nested groups
-   get parentheses; the editable join sits on the line between its operands. */
+/* Peers share one left rail. Nesting is expressed only by indentation, and the
+   editable AND/OR text sits directly on that rail between its operands. */
 .composer-rule-branch {
+  --rule-rail-offset: 19px;
+  --rule-level-indent: 36px;
+  --rule-rail-color: #aeb9c6;
+  --rule-canvas-color: #f6f7f8;
   gap: 0;
   padding: 0;
   border: 0;
@@ -2888,11 +2892,7 @@ button.composer-tree-add-row { cursor: pointer; }
   background: transparent;
 }
 .composer-rule-group.composer-rule-nested {
-  padding: 12px 16px;
-  border-left: 2px solid #a4b2c5;
-  border-right: 2px solid #a4b2c5;
-  border-radius: 16px;
-  background: rgba(244, 247, 251, .42);
+  margin-left: var(--rule-level-indent);
 }
 .composer-rule-branch > .composer-tree-children {
   gap: 0;
@@ -2903,55 +2903,80 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-rule-branch > .composer-tree-children > *::before {
   display: none;
 }
+.composer-rule-group > .composer-tree-children::before {
+  display: block;
+  top: 23px;
+  bottom: 18px;
+  left: calc(-1 * var(--rule-rail-offset));
+  background: var(--rule-rail-color);
+}
+.composer-rule-group > .composer-tree-children > .composer-rule-branch::before {
+  display: block;
+  top: 23px;
+  left: calc(-1 * var(--rule-rail-offset));
+  width: var(--rule-rail-offset);
+  background: var(--rule-rail-color);
+}
+.composer-rule-group > .composer-tree-children > .composer-rule-group.composer-rule-nested::before {
+  left: calc(-1 * (var(--rule-level-indent) + var(--rule-rail-offset)));
+  width: var(--rule-level-indent);
+}
 .composer-rule-branch[data-tone="condition"] > .composer-tree-children {
   margin: 8px 0 0 22px;
 }
 .composer-logic-connector-row {
-  min-height: 46px;
+  height: 22px;
+  min-height: 22px;
   position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 .composer-logic-connector-row::after {
+  display: none;
+}
+.composer-logic-connector {
+  width: 32px;
+  min-width: 32px;
+  height: 28px;
+  min-height: 28px;
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: 1px;
-  background: #a8b4c5;
+  top: 50%;
+  left: calc(-1 * var(--rule-rail-offset));
+  z-index: 1;
+  transform: translate(-50%, -50%);
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #5d6b7b;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 14px;
+  text-align: center;
+  letter-spacing: .02em;
+  cursor: pointer;
+}
+.composer-logic-connector::before {
+  position: absolute;
+  inset: 7px 2px;
+  z-index: -1;
+  background: var(--rule-canvas-color);
   content: "";
   pointer-events: none;
 }
-.composer-logic-connector {
-  min-width: 52px;
-  min-height: 25px;
-  position: relative;
-  z-index: 1;
-  padding: 4px 11px;
-  border: 1px solid #b89bcf;
-  border-radius: 999px;
-  background: #f4eff8;
-  color: #704b92;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: .04em;
-  cursor: pointer;
+.composer-logic-connector:hover:not(:disabled) {
+  color: #315f9d;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
-.composer-logic-connector.any {
-  border-color: #9bb3df;
-  background: #edf3fd;
-  color: #3066ad;
-}
-.composer-logic-connector:hover:not(:disabled) { box-shadow: 0 0 0 3px rgba(52, 105, 199, .11); }
 .composer-logic-connector:disabled { opacity: .56; cursor: default; }
 .composer-rule-toolbar {
   min-width: 0;
+  position: relative;
   display: flex;
+  flex-wrap: wrap;
   align-items: start;
   justify-content: space-between;
   gap: 10px;
-  padding: 10px 1px 4px;
+  padding: 8px 1px 4px;
 }
 .composer-rule-settings {
   min-height: 27px;
@@ -3026,6 +3051,107 @@ button.composer-tree-add-row { cursor: pointer; }
   cursor: pointer;
 }
 .composer-tree-rule-add-options button:hover:not(:disabled) { border-color: #8fa8d0; color: #315f9d; }
+.composer-rule-draggable {
+  position: relative;
+}
+.composer-rule-draggable > .composer-tree-row-main {
+  grid-template-columns: 16px auto minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.composer-rule-drag-handle {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #9aa6b5;
+  font-size: 17px;
+  line-height: 1;
+  cursor: grab;
+  user-select: none;
+}
+.composer-rule-draggable:hover .composer-rule-drag-handle {
+  color: #5f7696;
+}
+.rule-dragging .composer-rule-draggable,
+.rule-dragging .composer-rule-drag-handle {
+  cursor: grabbing;
+}
+.composer-rule-draggable.rule-drag-source {
+  opacity: .42;
+}
+.composer-rule-draggable.rule-drop-before::before,
+.composer-rule-draggable.rule-drop-after::after {
+  height: 3px;
+  position: absolute;
+  right: 0;
+  left: 0;
+  z-index: 3;
+  border-radius: 2px;
+  background: #3974cc;
+  box-shadow: 0 0 0 2px rgba(57, 116, 204, .10);
+  content: "";
+  pointer-events: none;
+}
+.composer-rule-draggable.rule-drop-before::before { top: -5px; }
+.composer-rule-draggable.rule-drop-after::after { bottom: -5px; }
+.composer-rule-draggable.rule-drop-invalid {
+  outline: 2px solid #bd5260;
+  outline-offset: 2px;
+}
+.composer-rule-drop-end {
+  position: absolute;
+  inset: 8px 1px 4px;
+  z-index: 2;
+  min-height: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 10px;
+  border: 1px dashed #a4b4c8;
+  border-radius: 4px;
+  background: rgba(249, 251, 254, .9);
+  color: #6b7c92;
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+.rule-dragging .composer-rule-toolbar > :not(.composer-rule-drop-end) { visibility: hidden; }
+.rule-dragging .composer-rule-drop-end { display: flex; }
+.composer-rule-drop-end.rule-drop-inside {
+  border-color: #3974cc;
+  background: #eaf2ff;
+  color: #285d9f;
+  box-shadow: inset 0 0 0 1px #3974cc;
+}
+.composer-rule-drop-end.rule-drop-invalid {
+  border-color: #bd5260;
+  background: #fff4f5;
+  color: #a53e4d;
+}
+.rule-move-controls {
+  display: grid;
+  gap: 9px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e3e8ef;
+}
+.rule-move-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.rule-move-destination {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.rule-move-destination select {
+  width: auto;
+  min-width: 0;
+  flex: 1;
+}
+.rule-move-destination button { flex: 0 0 auto; }
 .composer-then-branch {
   position: relative;
   display: grid;

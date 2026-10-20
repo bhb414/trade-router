@@ -474,7 +474,7 @@ def test_block_ui_uses_rule_tree_markers_and_removes_the_fixed_close_ui() -> Non
         "데이터 추가",
         "setBlockRuleConnection",
         "boundaryIndex",
-        "( ) 괄호 묶음",
+        "하위 계층 추가",
         "전체 조건 설정",
         "통과하면",
         "order_type",

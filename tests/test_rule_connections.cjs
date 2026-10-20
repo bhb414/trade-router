@@ -20,6 +20,7 @@ const context = vm.createContext({ structuredClone });
   "blockRuleTreeEditError", "retainBlockRuleConditionReferences",
   "setBlockRuleConnection", "ensureBlockRuleTree",
   "findBlockRuleNode", "removeBlockRuleNode", "blockRuleConditionNodes",
+  "blockRuleNodePath", "rewriteBlockRuleMove", "moveBlockRuleNode", "composerRuleDropPlan",
 ].forEach(name => vm.runInContext(functionSource(name), context));
 const plain = value => JSON.parse(JSON.stringify(value));
 const condition = (id, action = null) => ({ kind: "condition", id, condition: { label: id }, action });
@@ -168,4 +169,114 @@ test("deleting a condition prunes all now-empty parentheses without changing sur
   assert.deepEqual(structure(original), ["ANY", "B"]);
   assert.equal(original.children[0], surviving);
   assert.equal(original.children[0].action.id, "surviving-action");
+});
+
+test("moving sibling conditions uses the target position after removal and recognizes no-ops", () => {
+  const original = logic("ANY", ["A", "B", "C"].map(id => condition(id)));
+  const before = structuredClone(original);
+  const toEnd = context.rewriteBlockRuleMove(original, "A", "C", "after");
+  assert.equal(toEnd.error, "");
+  assert.deepEqual(structure(plain(toEnd.tree)), ["ANY", "B", "C", "A"]);
+  const toStart = context.rewriteBlockRuleMove(original, "C", "A", "before");
+  assert.deepEqual(structure(plain(toStart.tree)), ["ANY", "C", "A", "B"]);
+  assert.equal(context.rewriteBlockRuleMove(original, "A", "B", "before").unchanged, true);
+  assert.equal(context.rewriteBlockRuleMove(original, "C", "root", "inside").unchanged, true);
+  assert.deepEqual(original, before);
+});
+
+test("moving between levels preserves IDs, condition content, actions and explicit surviving groups", () => {
+  const original = logic("ANY", [
+    logic("ALL", [condition("A"), condition("B")], null, "G"),
+    condition("C", action("order-c")),
+  ], action("root-order"));
+  const movedOut = context.rewriteBlockRuleMove(original, "B", "C", "after");
+  assert.deepEqual(structure(plain(movedOut.tree)), ["ANY", ["ALL", "A"], "C", "B"]);
+  assert.equal(movedOut.tree.children[0].id, "G");
+  assert.equal(movedOut.tree.children[1].action.id, "order-c");
+  assert.equal(movedOut.tree.action.id, "root-order");
+  const movedIn = context.rewriteBlockRuleMove(original, "C", "G", "inside");
+  assert.deepEqual(structure(plain(movedIn.tree)), ["ANY", ["ALL", "A", "B", "C"]]);
+  assert.equal(movedIn.tree.children[0].children[2].action.id, "order-c");
+});
+
+test("moving the last child prunes empty actionless ancestors but rejects orphaning an order", () => {
+  const original = logic("ANY", [
+    logic("ALL", [logic("ALL", [condition("A")], null, "inner")], null, "outer"),
+    condition("B"),
+  ]);
+  const moved = context.rewriteBlockRuleMove(original, "A", "B", "after");
+  assert.deepEqual(structure(plain(moved.tree)), ["ANY", "B", "A"]);
+  original.children[0].action = action("group-order");
+  const before = structuredClone(original);
+  const rejected = context.rewriteBlockRuleMove(original, "A", "B", "after");
+  assert.equal(rejected.tree, null);
+  assert.match(rejected.error, /주문만 남습니다/);
+  assert.deepEqual(original, before);
+});
+
+test("moving rejects self, descendants, the root, and conflicting AND branch actions", () => {
+  const original = logic("ANY", [
+    condition("A", action("order-a")),
+    logic("ALL", [condition("B", action("order-b")), condition("C")], null, "G"),
+  ]);
+  const before = structuredClone(original);
+  assert.match(context.rewriteBlockRuleMove(original, "A", "A", "after").error, /자기 자신/);
+  assert.match(context.rewriteBlockRuleMove(original, "G", "B", "before").error, /하위 단계/);
+  assert.equal(context.rewriteBlockRuleMove(original, "root", "G", "inside").tree, null);
+  assert.match(context.rewriteBlockRuleMove(original, "A", "G", "inside").error, /각각 주문/);
+  assert.deepEqual(original, before);
+});
+
+test("moves enforce final depth, child limit, and SELL condition requirement", () => {
+  let deep = logic("ALL", [condition("deep-condition")], null, "deep-destination");
+  for (let index = 0; index < 6; index += 1) deep = logic("ALL", [deep], null, `deep-${index}`);
+  const root = logic("ANY", [
+    logic("ALL", [condition("source-leaf")], null, "source-group"), deep,
+  ]);
+  assert.equal(context.blockRuleTreeEditError(root), "");
+  assert.match(context.rewriteBlockRuleMove(root, "source-group", "deep-destination", "inside").error, /8단계/);
+  const full = logic("ALL", Array.from({ length: 20 }, (_, index) => condition(`full-${index}`)), null, "full");
+  assert.match(context.rewriteBlockRuleMove(logic("ANY", [condition("A"), full]), "A", "full", "inside").error, /20개/);
+  const emptySell = logic("ANY", [logic("ALL", [], null, "empty-a"), logic("ALL", [], null, "empty-b")]);
+  assert.match(context.rewriteBlockRuleMove(emptySell, "empty-a", "empty-b", "after", "SELL").error, /매도 흐름/);
+});
+
+test("a committed move preserves unfinished formula identities and is blocked while running", () => {
+  const original = logic("ANY", [condition("A"), condition("B")], action("fallback"));
+  const draft = new WeakMap([[original.children[0].condition, "ATR +"]]);
+  let commits = 0;
+  context.state = { blockPackage: { settings: { buy_rule_tree: original } } };
+  context.selectedState = () => ({ running: false });
+  context.blockRuleTree = () => context.state.blockPackage.settings.buy_rule_tree;
+  context.ruleComposerNodeId = (kind, flowId, nodeId) => `${kind}-rule-${nodeId}`;
+  context.commitBlockRuleMutation = () => { commits += 1; };
+  context.notify = message => assert.fail(message);
+  assert.equal(context.moveBlockRuleNode("buy", null, "A", "B", "after"), true);
+  const changed = context.state.blockPackage.settings.buy_rule_tree;
+  assert.equal(draft.get(changed.children[1].condition), "ATR +");
+  assert.equal(changed.action.id, "fallback");
+  assert.equal(context.state.blockSelectedNode, "buy-rule-A");
+  assert.equal(commits, 1);
+  assert.equal(context.moveBlockRuleNode("buy", null, "A", "B", "before", false), true);
+  assert.equal(context.state.blockSelectedNode, false);
+  assert.equal(commits, 2);
+  const afterClosedMove = context.state.blockPackage.settings.buy_rule_tree;
+  context.selectedState = () => ({ running: true });
+  assert.equal(context.moveBlockRuleNode("buy", null, "A", "B", "after"), false);
+  assert.equal(context.state.blockPackage.settings.buy_rule_tree, afterClosedMove);
+  assert.equal(commits, 2);
+});
+
+test("drop proposals never cross strategies, time flows, or buy/sell sides", () => {
+  context.state = {
+    selected: "strategy-a",
+    blockRuleDrag: { strategy: "strategy-a", kind: "buy", flowId: "flow-a", nodeId: "A" },
+  };
+  const reference = { kind: "buy", flowId: "flow-a", nodeId: "B" };
+  context.blockRuleTree = () => logic("ANY", [condition("A"), condition("B")]);
+  assert.equal(context.composerRuleDropPlan(reference, "after").error, "");
+  assert.match(context.composerRuleDropPlan({ ...reference, kind: "sell" }, "after").error, /같은 시간대 흐름/);
+  assert.match(context.composerRuleDropPlan({ ...reference, flowId: "flow-b" }, "after").error, /같은 시간대 흐름/);
+  context.state.selected = "strategy-b";
+  assert.match(context.composerRuleDropPlan(reference, "after").error, /같은 시간대 흐름/);
 });
