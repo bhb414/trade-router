@@ -470,49 +470,84 @@ def test_external_open_order_blocks_same_account_symbol(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_manual_cancel_missing_from_broker_open_orders_closes_router_order(
+def test_missing_from_broker_open_orders_does_not_close_live_router_orders(
     tmp_path: Path,
 ) -> None:
     async def run() -> None:
-        store = RuntimeStore(tmp_path / "manual-cancel.sqlite3")
+        store = RuntimeStore(tmp_path / "open-snapshot-gap.sqlite3")
         gateway = SimulationGateway()
         service = OrderService(store, gateway)
         try:
-            row, _ = store.reserve_order(
-                strategy_id="neutral-strategy",
-                account_alias="broker-account",
-                client_order_id="cancelled-on-mobile",
-                request={"code": "005930", "side": "BUY", "quantity": "1"},
-            )
-            store.update_order(
-                row["id"],
-                status=OrderStatus.ACKNOWLEDGED,
-                provider_order_id="broker-manual-cancel",
-            )
-            gateway.orders = (
-                AccountOrder(
-                    provider_order_id="broker-manual-cancel",
-                    account_alias="broker-account",
-                    instrument=InstrumentId("005930"),
-                    side=OrderSide.BUY,
-                    order_type=OrderType.LIMIT,
-                    status=OrderStatus.ACKNOWLEDGED,
-                    requested_quantity=Decimal("1"),
-                    filled_quantity=Decimal("0"),
-                    remaining_quantity=Decimal("1"),
-                    ordered_at=datetime.now(SEOUL) - timedelta(seconds=30),
-                    provider=gateway.provider,
-                    price=Decimal("74000"),
+            rows: list[dict[str, object]] = []
+            broker_orders: list[AccountOrder] = []
+            for index, (status, filled_quantity) in enumerate(
+                (
+                    (OrderStatus.ACKNOWLEDGED, Decimal("0")),
+                    (OrderStatus.PARTIALLY_FILLED, Decimal("0.5")),
                 ),
-            )
+                start=1,
+            ):
+                provider_order_id = f"broker-live-{index}"
+                row, _ = store.reserve_order(
+                    strategy_id="neutral-strategy",
+                    account_alias="broker-account",
+                    client_order_id=f"live-order-{index}",
+                    request={
+                        "code": f"00593{index}",
+                        "side": "BUY",
+                        "quantity": "1",
+                    },
+                )
+                row = store.update_order(
+                    row["id"],
+                    status=OrderStatus.ACKNOWLEDGED,
+                    provider_order_id=provider_order_id,
+                )
+                if status is OrderStatus.PARTIALLY_FILLED:
+                    row = store.update_order(
+                        row["id"],
+                        status=status,
+                        filled_quantity=filled_quantity,
+                        average_fill_price=Decimal("73500"),
+                    )
+                rows.append(row)
+                broker_orders.append(
+                    AccountOrder(
+                        provider_order_id=provider_order_id,
+                        account_alias="broker-account",
+                        instrument=InstrumentId(f"00593{index}"),
+                        side=OrderSide.BUY,
+                        order_type=OrderType.LIMIT,
+                        status=status,
+                        requested_quantity=Decimal("1"),
+                        filled_quantity=filled_quantity,
+                        remaining_quantity=Decimal("1") - filled_quantity,
+                        ordered_at=datetime.now(SEOUL) - timedelta(seconds=30),
+                        provider=gateway.provider,
+                        price=Decimal("74000"),
+                        average_fill_price=(
+                            Decimal("73500")
+                            if status is OrderStatus.PARTIALLY_FILLED
+                            else None
+                        ),
+                    )
+                )
+            gateway.orders = tuple(broker_orders)
             gateway.open_orders = ()
 
+            updated = await service.refresh_unresolved_orders("broker-account")
             await service.reconcile_account("broker-account")
 
-            updated = store.order(row["id"])
-            assert updated is not None
-            assert updated["status"] == OrderStatus.CANCELLED.value
-            assert store.unresolved_orders(account_alias="broker-account") == []
+            assert updated == []
+            persisted = [store.order(str(row["id"])) for row in rows]
+            assert [row["status"] for row in persisted if row is not None] == [
+                OrderStatus.ACKNOWLEDGED.value,
+                OrderStatus.PARTIALLY_FILLED.value,
+            ]
+            assert {
+                row["id"]
+                for row in store.unresolved_orders(account_alias="broker-account")
+            } == {row["id"] for row in rows}
         finally:
             store.close()
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Protocol
 from zoneinfo import ZoneInfo
@@ -1387,27 +1387,18 @@ def _reconciled_order_status(
     *,
     open_provider_ids: set[str],
 ) -> OrderStatus:
-    """Resolve history rows against the broker's actual open-order list.
+    """Use an explicit broker status as the ledger's reconciliation result.
 
-    KIS daily history can retain the original row as acknowledged after a
-    cancellation made in HTS/MTS.  The amend/cancel-eligible list is the
-    authoritative source for whether quantity is still live.  A short grace
-    period avoids treating a just-accepted order as cancelled while broker
-    snapshots converge.
+    Broker open-order snapshots are eventually consistent and may briefly omit
+    an accepted or partially filled order.  Absence from that snapshot is not
+    proof of cancellation, so only order history or a realtime notice may move
+    the central ledger into a terminal state.
     """
 
-    status = OrderStatus(getattr(broker_order, "status"))
-    if status not in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
-        return status
-    provider_order_id = str(getattr(broker_order, "provider_order_id", ""))
-    if provider_order_id in open_provider_ids:
-        return status
-    ordered_at = getattr(broker_order, "ordered_at", None)
-    if not isinstance(ordered_at, datetime):
-        return status
-    if datetime.now(SEOUL) - ordered_at.astimezone(SEOUL) < timedelta(seconds=10):
-        return status
-    return OrderStatus.CANCELLED
+    # The caller still supplies this snapshot for reconciliation context, but
+    # it must not be used on its own to infer a terminal order state.
+    del open_provider_ids
+    return OrderStatus(getattr(broker_order, "status"))
 
 
 def _open_buy_reservations(rows: list[dict[str, object]]) -> Decimal:

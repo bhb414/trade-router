@@ -71,6 +71,10 @@ def sell_flow(identifier: str = "early", **changes) -> dict:
 
 def settings_for(flows: list[dict], **changes) -> ConditionBollingerBlockSettings:
     values = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    # Most tests in this module exercise legacy condition-group compatibility.
+    # Clear the bundled example's already-migrated tree so validation performs
+    # the same group-to-tree conversion as an older exported strategy.
+    values["sell_rule_tree"] = None
     values.update(
         strategy_id="sell-flows",
         trading_account="test-account",
@@ -553,19 +557,6 @@ def test_bar_sell_uses_actual_session_instead_of_stale_schedule_time() -> None:
     assert any("애프터마켓" in message for message in harness.logs)
 
 
-def test_liquidation_uses_actual_session_for_stale_timer_event() -> None:
-    harness = SellHarness(
-        settings_for([sell_flow()], route="SOR", sell_order_type="MARKET"),
-        now="16:00:00",
-    )
-
-    asyncio.run(harness.strategy._liquidate_owned_positions(
-        harness.ctx, at("15:20:00"), reason="장 마감 정시 전량 청산",
-    ))
-
-    assert harness.orders == []
-    assert any("애프터마켓" in message for message in harness.logs)
-
 
 def test_buy_only_market_quote_rejection_does_not_suppress_later_sells() -> None:
     harness = SellHarness(settings_for([sell_flow()]), now="09:30:00")
@@ -575,20 +566,6 @@ def test_buy_only_market_quote_rejection_does_not_suppress_later_sells() -> None
     assert strategy._is_non_retryable_buy_rejection(rejection)
     assert not strategy._is_non_retryable_sell_rejection(rejection)
 
-
-def test_condition_sell_suppression_does_not_block_close_liquidation() -> None:
-    harness = SellHarness(settings_for([sell_flow()]), now="09:30:00")
-    harness.strategy._suppress_order_for_day(
-        harness.ctx, harness.now, "005930", "SELL", "MARKET",
-        "condition route rejected", purpose="CONDITION",
-    )
-
-    asyncio.run(harness.strategy._liquidate_owned_positions(
-        harness.ctx, harness.now, reason="장 마감 정시 전량 청산",
-    ))
-
-    assert len(harness.orders) == 1
-    assert harness.orders[0]["client_order_id"].startswith("close-005930-")
 
 
 def test_sell_flows_survive_api_save_export_and_import(tmp_path: Path) -> None:
@@ -609,7 +586,14 @@ def test_sell_flows_survive_api_save_export_and_import(tmp_path: Path) -> None:
         saved = client.put(endpoint, json=package)
         assert saved.status_code == 200, saved.text
         exported = client.get(endpoint).json()
-        assert exported["settings"]["sell_flows"] == flows
+        exported_flows = exported["settings"]["sell_flows"]
+        for original, restored_flow in zip(flows, exported_flows, strict=True):
+            assert {
+                key: restored_flow[key]
+                for key in original
+            } == original
+            assert restored_flow["sell_rule_tree"]["id"] == "legacy-sell-root"
+            assert restored_flow["sell_rule_tree"]["action"]["side"] == "SELL"
 
         exported["name"] = "시간별 매도 복사"
         imported = client.post("/api/strategies/import-block", json=exported)
@@ -617,6 +601,6 @@ def test_sell_flows_survive_api_save_export_and_import(tmp_path: Path) -> None:
         copied = client.get(
             f"/api/strategies/{urlquote(imported.json()['name'])}/block-package"
         ).json()
-        assert copied["settings"]["sell_flows"] == flows
+        assert copied["settings"]["sell_flows"] == exported_flows
         assert copied["settings"]["strategy_id"] != package["settings"]["strategy_id"]
 

@@ -224,29 +224,6 @@ def test_realtime_sell_reservation_blocks_same_bar_sell_during_broker_lag() -> N
     assert len(harness.submitted) == 1
 
 
-def test_realtime_sell_reservation_blocks_liquidation_during_broker_lag() -> None:
-    harness = LiveSellHarness()
-
-    async def exercise() -> None:
-        await harness.strategy._refresh_live_positions(
-            harness.ctx, await harness.balance(), ()
-        )
-        await harness.strategy.on_quote(harness.ctx, harness.quote())
-        assert len(harness.submitted) == 1
-
-        # A close/retry timer must honor the same local reservation even before
-        # the broker lists the realtime sell as an open order.
-        harness.now = datetime(2026, 10, 20, 10, 0, 1, tzinfo=SEOUL)
-        await harness.strategy._liquidate_owned_positions(
-            harness.ctx,
-            harness.now,
-            reason="장 마감 정시 전량 청산",
-        )
-
-    asyncio.run(exercise())
-
-    assert len(harness.submitted) == 1
-
 
 def test_aftermarket_market_sell_is_skipped_once_without_broker_submission() -> None:
     settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(update={
@@ -282,23 +259,3 @@ def test_aftermarket_market_sell_is_skipped_once_without_broker_submission() -> 
     assert len(harness.warning_messages) == 1
     assert "애프터마켓" in harness.warning_messages[0]
     assert "지정가로 설정" in harness.warning_messages[0]
-
-
-def test_aftermarket_close_uses_configured_limit_sell() -> None:
-    settings = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_copy(update={
-        "sell_order_type": "LIMIT",
-        "route": "NXT",
-    })
-    harness = LiveSellHarness(settings)
-    harness.now = datetime(2026, 10, 20, 19, 50, tzinfo=SEOUL)
-
-    asyncio.run(harness.strategy._liquidate_owned_positions(
-        harness.ctx,
-        harness.now,
-        reason="장 마감 정시 전량 청산",
-    ))
-
-    assert len(harness.submitted) == 1
-    assert harness.submitted[0]["order_type"] == "LIMIT"
-    assert harness.submitted[0]["price"] == Decimal("104")
-

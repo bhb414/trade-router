@@ -1,5 +1,6 @@
 const LOG_CLEAR_STORAGE_KEY = "trade-router.log-clear-cursors.v1";
 const BLOCK_LAYOUT_STORAGE_KEY = "trade-router.block-layouts.v5";
+const UPDATE_NOTICE_STORAGE_KEY = "trade-router.update-notice-version.v1";
 const BLOCK_VIEWPORT_COORD_LIMIT = 20000;
 const BLOCK_ZOOM_MIN = .2;
 const BLOCK_ZOOM_MAX = 2;
@@ -55,6 +56,8 @@ const state = {
   strategyBalanceTab: "balance",
   accountBalanceTab: "balance",
   activeAccount: null,
+  updateResult: null,
+  updateCheckPromise: null,
 };
 
 const elements = {
@@ -103,6 +106,8 @@ const elements = {
   runtime: document.querySelector("#runtime-status"),
   connections: document.querySelector("#connection-status"),
   workspace: document.querySelector("#workspace-path"),
+  updateAvailable: document.querySelector("#update-available-button"),
+  updateAvailableVersion: document.querySelector("#update-available-version"),
   settingsModal: document.querySelector("#settings-modal"),
   serviceDetailModal: document.querySelector("#service-detail-modal"),
   serviceDetailBody: document.querySelector("#service-detail-body"),
@@ -165,6 +170,63 @@ function notify(message, error = false) {
   elements.toast.classList.add("visible");
   window.clearTimeout(notify.timer);
   notify.timer = window.setTimeout(() => elements.toast.classList.remove("visible"), 3200);
+}
+
+function renderUpdateResult(result) {
+  state.updateResult = result;
+  const button = document.querySelector("#update-button");
+  const status = document.querySelector("#update-status");
+  status.textContent = result.message;
+  if (result.available && result.can_apply) {
+    button.dataset.ready = "true";
+    button.textContent = "업데이트 시작";
+  } else {
+    delete button.dataset.ready;
+    button.textContent = "업데이트 확인";
+  }
+  const available = Boolean(result.available);
+  elements.updateAvailable.hidden = !available;
+  elements.updateAvailable.classList.toggle("pending-assets", available && !result.can_apply);
+  elements.updateAvailableVersion.textContent = result.latest ? `v${result.latest}` : "새 버전";
+  elements.updateAvailable.title = available ? result.message : "";
+  elements.updateAvailable.setAttribute("aria-label", available ? result.message : "업데이트 확인");
+}
+
+function fetchUpdateResult() {
+  if (!state.updateCheckPromise) {
+    state.updateCheckPromise = api("/api/updates/check")
+      .finally(() => { state.updateCheckPromise = null; });
+  }
+  return state.updateCheckPromise;
+}
+
+function updateNoticeWasShown(version) {
+  if (!version) return false;
+  try {
+    return window.sessionStorage.getItem(UPDATE_NOTICE_STORAGE_KEY) === version;
+  } catch (_) {
+    return false;
+  }
+}
+
+function rememberUpdateNotice(version) {
+  if (!version) return;
+  try { window.sessionStorage.setItem(UPDATE_NOTICE_STORAGE_KEY, version); }
+  catch (_) {}
+}
+
+async function checkForStartupUpdate() {
+  try {
+    const result = await fetchUpdateResult();
+    renderUpdateResult(result);
+    const version = String(result.latest || "");
+    if (result.available && !updateNoticeWasShown(version)) {
+      rememberUpdateNotice(version);
+      notify(`${result.message} 상단의 업데이트 표시에서 확인할 수 있습니다.`);
+    }
+  } catch (_) {
+    // Trade Router remains fully usable while offline. Manual checks still report errors.
+  }
 }
 
 function setDirty(value) {
@@ -1503,6 +1565,7 @@ function blockPackageFields() {
   if (!settings) return [];
   const custom = new Set([
     "buy_conditions", "sell_conditions", "buy_condition_groups", "sell_condition_groups",
+    "buy_rule_tree", "sell_rule_tree",
     "buy_condition_logic", "sell_condition_logic", "bar_interval", "bar_data_mode",
     "bollinger_period", "bollinger_stddev", "buy_flows", "sell_flows",
   ]);
@@ -1544,11 +1607,11 @@ function currentBlockModel() {
 const BLOCK_BUY_FLOW_FIELDS = [
   "target_source", "hts_user_id", "condition_id", "expected_condition_name",
   "ranking_kind", "ranking_venue", "ranking_market", "ranking_limit", "symbols",
-  "buy_scan_seconds", "buy_start_time", "buy_end_time", "buy_condition_groups",
+  "buy_scan_seconds", "buy_start_time", "buy_end_time", "buy_condition_groups", "buy_rule_tree",
 ];
 
 const BLOCK_SELL_FLOW_FIELDS = [
-  "sell_scan_seconds", "sell_start_time", "sell_end_time", "sell_condition_groups",
+  "sell_scan_seconds", "sell_start_time", "sell_end_time", "sell_condition_groups", "sell_rule_tree",
 ];
 
 function blockBuyFlows() {
@@ -1562,7 +1625,7 @@ function blockBuyFlow(flowId) {
 
 function blockBuyFlowFields(flow) {
   return ["name", ...BLOCK_BUY_FLOW_FIELDS]
-    .filter(key => !["expected_condition_name", "buy_condition_groups"].includes(key))
+    .filter(key => !["expected_condition_name", "buy_condition_groups", "buy_rule_tree"].includes(key))
     .map(settingKey => {
       const sourceName = packageFieldSourceName(settingKey);
       const [category, label] = genericConstantMeta(sourceName);
@@ -1585,7 +1648,7 @@ function blockSellFlow(flowId) {
 
 function blockSellFlowFields(flow) {
   return ["name", ...BLOCK_SELL_FLOW_FIELDS]
-    .filter(key => key !== "sell_condition_groups")
+    .filter(key => !["sell_condition_groups", "sell_rule_tree"].includes(key))
     .map(settingKey => {
       const sourceName = packageFieldSourceName(settingKey);
       const [category, label] = genericConstantMeta(sourceName);
@@ -1642,6 +1705,7 @@ function addBlockBuyFlow() {
     symbols: [], buy_scan_seconds: previous?.buy_scan_seconds || 30,
     buy_start_time: clock(minutes), buy_end_time: clock(Math.min(23 * 60 + 59, minutes + 60)),
     buy_condition_groups: [],
+    buy_rule_tree: newBlockRuleRoot("buy", [], true),
   };
   flows.push(flow);
   setScheduleSectionExpanded(`flow:${flow.id}`, true);
@@ -1678,6 +1742,7 @@ function addBlockSellFlow() {
     sell_start_time: clock(minutes),
     sell_end_time: clock(Math.min(23 * 60 + 59, minutes + 60)),
     sell_condition_groups: [newConditionGroup("sell")],
+    sell_rule_tree: newBlockRuleRoot("sell", [newBlockRuleCondition("sell")], true),
   };
   flows.push(flow);
   setScheduleSectionExpanded(`sell-flow:${flow.id}`, true);
@@ -1692,7 +1757,7 @@ function removeBlockSellFlow(flowId) {
   if (index < 0 || flows.length <= 1 || selectedState()?.running) return;
   flows.splice(index, 1);
   if (String(state.blockSelectedNode || "").startsWith(`${blockFlowNodePrefix("sell", flowId)}-`)) {
-    state.blockSelectedNode = "sellOrder";
+    state.blockSelectedNode = `${blockFlowNodePrefix("sell", flows[Math.max(0, index - 1)].id)}-schedule`;
   }
   setDirty(true);
   renderStrategyBlocks();
@@ -2034,7 +2099,7 @@ function createStrategyBlockNode({ title, meta, tone, fields = [], actions = [],
 function createComposerTreeRow(definition, disabled) {
   const node = document.createElement("article");
   node.className = `composer-tree-card composer-tree-row ${definition.tone || "general"}`;
-  node.classList.toggle("composer-tree-action", ["buyOrder", "sellOrder"].includes(definition.id));
+  node.classList.toggle("composer-tree-action", Boolean(definition.ruleActionOwner));
   node.dataset.blockNode = definition.id;
   const selected = state.blockSelectedNode === definition.id;
   node.classList.toggle("selected", selected);
@@ -2163,6 +2228,8 @@ function createComposerInspector(definition, running, flowCounts = {}) {
     const group = definition.conditionGroup;
     body.append(createConditionEditor(group.kind, group.index, running, group.flowId));
   }
+  if (definition.ruleNode) body.append(createBlockRuleNodeEditor(definition.ruleNode, running));
+  if (definition.ruleActionOwner) body.append(createBlockRuleActionEditor(definition.ruleActionOwner, running));
   if (definition.emptyBuyFlowId) body.append(createEmptyBuyConditionEditor(running, definition.emptyBuyFlowId));
   if (definition.actions?.length) {
     const actions = document.createElement("div");
@@ -2188,6 +2255,127 @@ function createComposerInspector(definition, running, flowCounts = {}) {
   }
   inspector.append(body);
   return inspector;
+}
+
+function createAttachedRuleActionEditor(kind, flowId, node, disabled) {
+  const section = document.createElement("section");
+  section.className = "rule-attached-action";
+  const heading = document.createElement("div");
+  heading.className = "rule-editor-section-heading";
+  const title = document.createElement("strong");
+  title.textContent = "통과하면";
+  const hint = document.createElement("span");
+  hint.textContent = node.action ? "이 노드에서 주문 실행" : "행동 없음 · 상위 묶음으로 계속";
+  heading.append(title, hint);
+  section.append(heading);
+  if (node.action) {
+    const summary = document.createElement("div");
+    summary.className = `rule-action-summary ${kind}`;
+    const side = document.createElement("strong");
+    side.textContent = kind === "sell" ? "매도 주문" : "매수 주문";
+    const order = document.createElement("span");
+    order.textContent = node.action.order_type === "LIMIT" ? "현재가 지정가" : "시장가";
+    summary.append(side, order);
+    section.append(summary);
+  } else {
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "button quiet compact rule-add-action";
+    add.textContent = `+ ${kind === "sell" ? "매도" : "매수"} 행동 추가`;
+    add.disabled = disabled;
+    add.addEventListener("click", () => addBlockRuleAction(kind, flowId, node.id));
+    section.append(add);
+  }
+  return section;
+}
+
+function createBlockRuleNodeEditor(reference, disabled) {
+  const found = findBlockRuleNode(reference.kind, reference.flowId, reference.nodeId);
+  const node = found?.node;
+  const wrap = document.createElement("div");
+  wrap.className = "rule-node-editor";
+  if (!node) return wrap;
+  if (node.kind === "logic") {
+    const section = document.createElement("section");
+    section.className = "rule-editor-section";
+    const title = document.createElement("strong");
+    title.className = "rule-editor-section-title";
+    title.textContent = "묶음 조건";
+    const logic = conditionSelect(
+      [["ALL", "모두 충족 (AND)"], ["ANY", "하나 이상 충족 (OR)"]],
+      node.operator || "ALL", disabled,
+      value => setBlockRuleOperator(reference.kind, reference.flowId, node.id, value),
+    );
+    section.append(title, formulaControl("묶음 방식", logic, true));
+    const help = document.createElement("p");
+    help.className = "composer-inspector-hint";
+    help.textContent = node.operator === "ANY"
+      ? "괄호 안의 조건 중 하나만 참이어도 통과하며, 위에서 먼저 참인 분기의 행동을 실행합니다."
+      : "괄호 안의 모든 조건이 참이어야 통과합니다. 행동은 한 자식 경로에 두거나, 묶음 자체에 공통 fallback으로 둘 수 있습니다.";
+    section.append(help);
+    const adds = document.createElement("div");
+    adds.className = "rule-node-add-actions";
+    const addControl = (label, childKind, operator = "ALL") => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button quiet compact";
+      button.textContent = label;
+      const addedNodes = childKind === "logic" ? 2 : 1;
+      const addedDepth = childKind === "logic" ? 2 : 1;
+      button.disabled = disabled
+        || (node.children || []).length >= 20
+        || blockRuleNodeCount(blockRuleTree(reference.kind, reference.flowId)) + addedNodes > 100
+        || Number(found.depth || 0) + addedDepth > 8;
+      button.addEventListener("click", () => addBlockRuleChild(
+        reference.kind, reference.flowId, node.id, childKind, operator,
+      ));
+      adds.append(button);
+    };
+    addControl("+ 조건식", "condition");
+    addControl("+ AND 묶음", "logic", "ALL");
+    addControl("+ OR 묶음", "logic", "ANY");
+    section.append(adds);
+    wrap.append(section);
+  } else {
+    wrap.append(createConditionFormulaEditor(reference.kind, node, disabled));
+  }
+  wrap.append(createAttachedRuleActionEditor(reference.kind, reference.flowId, node, disabled));
+  if (!reference.isRoot) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button quiet compact danger-text rule-remove-node";
+    remove.textContent = node.kind === "logic" ? "이 조건 묶음 삭제" : "이 조건식 삭제";
+    remove.disabled = disabled;
+    remove.addEventListener("click", () => removeBlockRuleNode(reference.kind, reference.flowId, node.id));
+    wrap.append(remove);
+  }
+  return wrap;
+}
+
+function createBlockRuleActionEditor(reference, disabled) {
+  const node = findBlockRuleNode(reference.kind, reference.flowId, reference.nodeId)?.node;
+  const wrap = document.createElement("div");
+  wrap.className = "rule-action-editor";
+  if (!node?.action) return wrap;
+  const hint = document.createElement("p");
+  hint.className = "composer-inspector-hint";
+  hint.textContent = reference.kind === "sell"
+    ? "이 조건 경로가 통과하면 전략 소유 수량을 선택한 방식으로 매도합니다."
+    : "이 조건 경로가 통과하면 공통 예산과 주문 위험 검사를 거쳐 매수합니다.";
+  const order = conditionSelect(
+    [["MARKET", "시장가"], ["LIMIT", "현재가 지정가"]],
+    node.action.order_type || "MARKET", disabled,
+    (value, render) => updateBlockRuleAction(reference.kind, reference.flowId, node.id, value, render),
+  );
+  const field = formulaControl("주문 방식", order, true);
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "button quiet compact danger-text";
+  remove.textContent = "이 행동 삭제";
+  remove.disabled = disabled;
+  remove.addEventListener("click", () => removeBlockRuleAction(reference.kind, reference.flowId, node.id));
+  wrap.append(hint, field, remove);
+  return wrap;
 }
 
 const BLOCK_CONDITION_METRICS = [
@@ -2612,6 +2800,268 @@ function blockConditionGroups(kind, flowId = null) {
   const settings = flowId ? blockFlow(kind, flowId) : state.blockPackage?.settings;
   const groups = settings?.[`${kind}_condition_groups`];
   return Array.isArray(groups) ? groups : [];
+}
+
+function nextBlockRuleId(prefix) {
+  state.conditionGroupSerial += 1;
+  return `${prefix}-${Date.now().toString(36)}-${state.conditionGroupSerial}`;
+}
+
+function newBlockOrderAction(kind, orderType = null) {
+  const side = kind === "sell" ? "SELL" : "BUY";
+  const fallback = state.blockPackage?.settings?.[`${kind}_order_type`] || "MARKET";
+  return { kind: "order", id: nextBlockRuleId(`${kind}-order`), side, order_type: orderType || fallback };
+}
+
+function newBlockRuleCondition(kind, condition = null) {
+  return {
+    kind: "condition",
+    id: nextBlockRuleId(`${kind}-condition`),
+    condition: structuredClone(condition || newBlockTradeCondition(kind)),
+    action: null,
+  };
+}
+
+function newBlockRuleLogic(kind, operator = "ALL", children = [], withAction = false) {
+  return {
+    kind: "logic",
+    id: nextBlockRuleId(`${kind}-logic`),
+    operator: operator === "ANY" ? "ANY" : "ALL",
+    children,
+    action: withAction ? newBlockOrderAction(kind) : null,
+  };
+}
+
+function newBlockRuleRoot(kind, children = [], withAction = true) {
+  const root = newBlockRuleLogic(kind, "ALL", children, withAction);
+  root.id = `${kind}-rule-root`;
+  return root;
+}
+
+function legacyGroupsRuleTree(kind, groups, withAction = true) {
+  const children = (groups || []).map(group => newBlockRuleLogic(
+    kind,
+    "ANY",
+    (group.conditions || []).map(condition => newBlockRuleCondition(kind, condition)),
+    false,
+  ));
+  return newBlockRuleRoot(kind, children, withAction);
+}
+
+function ensureBlockRuleTree(kind, owner) {
+  if (!owner || typeof owner !== "object") return null;
+  const key = `${kind}_rule_tree`;
+  const current = owner[key];
+  if (current && current.kind === "logic" && Array.isArray(current.children)) return current;
+  owner[key] = legacyGroupsRuleTree(kind, owner[`${kind}_condition_groups`] || [], true);
+  return owner[key];
+}
+
+function blockRuleTree(kind, flowId = null) {
+  const owner = flowId ? blockFlow(kind, flowId) : state.blockPackage?.settings;
+  return ensureBlockRuleTree(kind, owner);
+}
+
+function walkBlockRule(node, visitor, parent = null, index = -1, depth = 0) {
+  if (!node || typeof node !== "object") return;
+  visitor(node, parent, index, depth);
+  if (node.kind === "logic") {
+    (node.children || []).forEach((child, childIndex) => walkBlockRule(child, visitor, node, childIndex, depth + 1));
+  }
+}
+
+function findBlockRuleNode(kind, flowId, nodeId) {
+  let found = null;
+  walkBlockRule(blockRuleTree(kind, flowId), (node, parent, index, depth) => {
+    if (!found && node.id === nodeId) found = { node, parent, index, depth };
+  });
+  return found;
+}
+
+function blockRuleNodeCount(root) {
+  let count = 0;
+  walkBlockRule(root, () => { count += 1; });
+  return count;
+}
+
+function promoteLegacyBlockRuleTree(kind, owner, flowId = null) {
+  const key = `${kind}_rule_tree`;
+  const root = owner?.[key];
+  if (!root || !String(root.id || "").startsWith("legacy-")) return;
+  walkBlockRule(root, node => {
+    const oldNodeId = node.id;
+    node.id = nextBlockRuleId(`${kind}-${node.kind === "logic" ? "logic" : "condition"}`);
+    const prefix = blockFlowNodePrefix(kind, flowId);
+    if (state.blockSelectedNode === `${prefix}-rule-${oldNodeId}`) {
+      state.blockSelectedNode = `${prefix}-rule-${node.id}`;
+    }
+    if (node.action) {
+      const oldActionId = node.action.id;
+      node.action.id = nextBlockRuleId(`${kind}-order`);
+      if (state.blockSelectedNode === `${prefix}-action-${oldActionId}`) {
+        state.blockSelectedNode = `${prefix}-action-${node.action.id}`;
+      }
+    }
+  });
+  owner[`${kind}_condition_groups`] = [];
+}
+
+function promoteLegacyBlockRuleTrees() {
+  const settings = state.blockPackage?.settings;
+  if (!settings) return;
+  promoteLegacyBlockRuleTree("buy", settings);
+  promoteLegacyBlockRuleTree("sell", settings);
+  (settings.buy_flows || []).forEach(flow => promoteLegacyBlockRuleTree("buy", flow, flow.id));
+  (settings.sell_flows || []).forEach(flow => promoteLegacyBlockRuleTree("sell", flow, flow.id));
+}
+
+function commitBlockRuleMutation(render = true) {
+  // The backend exposes materialized legacy trees for old packages. Once the
+  // user edits that tree it becomes authoritative, so give every node a fresh
+  // id and drop the stale flat groups that could otherwise rebuild over it.
+  promoteLegacyBlockRuleTrees();
+  setDirty(true);
+  if (render) renderStrategyBlocks();
+}
+
+function setBlockRuleOperator(kind, flowId, nodeId, operator) {
+  const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
+  if (node?.kind !== "logic") return;
+  const normalized = operator === "ANY" ? "ANY" : "ALL";
+  if (normalized === "ALL" && (node.children || []).filter(blockRuleContainsAction).length > 1) {
+    notify("AND 묶음은 행동이 들어 있는 자식 경로를 하나만 가질 수 있습니다. 행동을 정리한 뒤 AND로 바꿔 주세요.", true);
+    return;
+  }
+  node.operator = normalized;
+  commitBlockRuleMutation();
+}
+
+function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL") {
+  const parentFound = findBlockRuleNode(kind, flowId, parentId);
+  const parent = parentFound?.node;
+  const root = blockRuleTree(kind, flowId);
+  if (parent?.kind !== "logic") return;
+  if ((parent.children || []).length >= 20) {
+    notify("한 조건 묶음에는 자식을 20개까지 넣을 수 있습니다.", true);
+    return;
+  }
+  const addedNodes = childKind === "logic" ? 2 : 1;
+  const addedDepth = childKind === "logic" ? 2 : 1;
+  if (blockRuleNodeCount(root) + addedNodes > 100) {
+    notify("한 흐름의 조건 계층은 노드 100개까지 만들 수 있습니다.", true);
+    return;
+  }
+  if ((parentFound?.depth || 0) + addedDepth > 8) {
+    notify("조건 괄호는 8단계까지 중첩할 수 있습니다.", true);
+    return;
+  }
+  const child = childKind === "logic"
+    ? newBlockRuleLogic(kind, operator, [newBlockRuleCondition(kind)], false)
+    : newBlockRuleCondition(kind);
+  parent.children.push(child);
+  state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${child.id}`;
+  commitBlockRuleMutation();
+}
+
+function removeBlockRuleNode(kind, flowId, nodeId) {
+  const found = findBlockRuleNode(kind, flowId, nodeId);
+  if (!found?.parent || selectedState()?.running) return;
+  if (kind === "sell") {
+    const rootConditionCount = blockRuleConditionNodes(blockRuleTree(kind, flowId)).length;
+    const removedConditionCount = found.node.kind === "condition"
+      ? 1 : blockRuleConditionNodes(found.node).length;
+    if (rootConditionCount - removedConditionCount < 1) {
+      notify("매도 흐름에는 조건식이 하나 이상 필요합니다. 새 조건을 만든 뒤 이 조건을 삭제하세요.", true);
+      return;
+    }
+  }
+  let selectedParent = found.parent;
+  if (found.parent.children.length === 1) {
+    const parentFound = findBlockRuleNode(kind, flowId, found.parent.id);
+    if (parentFound?.parent) {
+      // A nested logic group may not remain empty: deleting its final child
+      // removes that now-meaningless pair of parentheses as one unit.
+      parentFound.parent.children.splice(parentFound.index, 1);
+      selectedParent = parentFound.parent;
+    } else {
+      found.parent.children.splice(found.index, 1);
+    }
+  } else {
+    found.parent.children.splice(found.index, 1);
+  }
+  let clearedUnsafeSellAction = false;
+  if (kind === "sell") {
+    walkBlockRule(blockRuleTree(kind, flowId), node => {
+      if (node.kind === "logic" && node.action && blockRuleConditionNodes(node).length === 0) {
+        node.action = null;
+        clearedUnsafeSellAction = true;
+      }
+    });
+  }
+  state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${selectedParent.id}`;
+  commitBlockRuleMutation();
+  if (clearedUnsafeSellAction) notify("조건이 없는 매도 묶음의 주문 행동도 함께 제거했습니다.");
+}
+
+function blockRuleContainsAction(node) {
+  let found = false;
+  walkBlockRule(node, candidate => { if (candidate.action) found = true; });
+  return found;
+}
+
+function blockRuleNodePath(root, nodeId, path = []) {
+  if (!root) return null;
+  const next = [...path, root];
+  if (root.id === nodeId) return next;
+  if (root.kind !== "logic") return null;
+  for (const child of root.children || []) {
+    const found = blockRuleNodePath(child, nodeId, next);
+    if (found) return found;
+  }
+  return null;
+}
+
+function blockRuleActionConflict(root, nodeId) {
+  const path = blockRuleNodePath(root, nodeId);
+  if (!path) return false;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const ancestor = path[index];
+    if (ancestor.kind !== "logic" || ancestor.operator !== "ALL") continue;
+    const activeBranch = path[index + 1];
+    if ((ancestor.children || []).some(child => child !== activeBranch && blockRuleContainsAction(child))) return true;
+  }
+  return false;
+}
+
+function addBlockRuleAction(kind, flowId, nodeId) {
+  const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
+  if (!node || node.action || selectedState()?.running) return;
+  if (kind === "sell" && node.kind === "logic" && blockRuleConditionNodes(node).length === 0) {
+    notify("매도 행동을 추가하려면 이 묶음에 조건식을 먼저 추가하세요.", true);
+    return;
+  }
+  if (blockRuleActionConflict(blockRuleTree(kind, flowId), nodeId)) {
+    notify("AND 묶음에서는 한 자식 경로에만 행동을 둘 수 있습니다. 묶음 자체의 공통 행동을 사용해 주세요.", true);
+    return;
+  }
+  node.action = newBlockOrderAction(kind);
+  state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-action-${node.action.id}`;
+  commitBlockRuleMutation();
+}
+
+function removeBlockRuleAction(kind, flowId, nodeId) {
+  const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
+  if (!node?.action || selectedState()?.running) return;
+  node.action = null;
+  state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${node.id}`;
+  commitBlockRuleMutation();
+}
+
+function updateBlockRuleAction(kind, flowId, nodeId, orderType, render = true) {
+  const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
+  if (!node?.action) return;
+  node.action.order_type = orderType === "LIMIT" ? "LIMIT" : "MARKET";
+  commitBlockRuleMutation(render);
 }
 
 function updateBlockCondition(kind, groupIndex, conditionIndex, key, value, flowId = null, render = true) {
@@ -3089,6 +3539,463 @@ function createExpressionWorkbench(kind, groupIndex, conditionIndex, side, condi
   }
   workbench.append(actions);
   return workbench;
+}
+
+function formulaSelectionState(condition) {
+  let selection = state.blockExpressionSelections.get(condition);
+  if (!selection) {
+    selection = { left: [], right: [], activeSide: null, showData: false, expectOperand: false };
+    state.blockExpressionSelections.set(condition, selection);
+  }
+  return selection;
+}
+
+function selectFormulaToken(condition, side, path = []) {
+  const selection = formulaSelectionState(condition);
+  selection.activeSide = side;
+  selection[side] = [...path];
+  selection.showData = false;
+  selection.expectOperand = false;
+}
+
+function formulaMetricTokenLabel(expression) {
+  if (!expression || expression.kind !== "metric") return conditionExpressionTokenLabel(expression);
+  const label = new Map(BLOCK_CONDITION_METRICS).get(expression.metric) || expression.metric || "지표";
+  if (["average_price", "profit_rate"].includes(expression.metric)) return label;
+  const context = `${expressionIntervalLabel(expression.bar_interval)}, ${expressionBarPosition(expression)}`;
+  if (expression.metric === "atr") return `ATR[${expression.atr_period || 14}, ${context}]`;
+  if (String(expression.metric).startsWith("bollinger_")) {
+    return `${label}[${expression.bollinger_period || 55}, ${expression.bollinger_stddev || "1.04"}, ${context}]`;
+  }
+  return `${label}[${context}]`;
+}
+
+function formulaExpressionSummary(expression, nested = false) {
+  if (!expression || typeof expression !== "object") return "값 미설정";
+  if (expression.kind !== "binary") return expression.kind === "metric"
+    ? formulaMetricTokenLabel(expression) : String(expression.value ?? "0");
+  const operator = new Map(BLOCK_EXPRESSION_OPERATORS).get(expression.operator) || expression.operator || "+";
+  const text = `${formulaExpressionSummary(expression.left, true)} ${operator} ${formulaExpressionSummary(expression.right, true)}`;
+  return nested ? `(${text})` : text;
+}
+
+function effectiveFormulaExpression(condition, side) {
+  return conditionSideExpression(condition, side) || legacyOperandExpression(condition, side);
+}
+
+function isDirectObvFormula(condition) {
+  const left = effectiveFormulaExpression(condition, "left");
+  const right = effectiveFormulaExpression(condition, "right");
+  return left?.kind === "metric" && left.metric === "obv"
+    && right?.kind === "metric" && right.metric === "obv";
+}
+
+function mutateConditionFormulaExpression(condition, side, path, mutator, render = true) {
+  const key = `${side}_expression`;
+  const root = structuredClone(effectiveFormulaExpression(condition, side));
+  const node = expressionNodeAt(root, path);
+  if (!node) return;
+  const replacement = mutator(node, root);
+  const candidate = replacement && replacement !== node ? replaceExpressionNode(root, path, replacement) : root;
+  if (expressionDepth(candidate) > 4 || expressionNodeCount(candidate) > 31) {
+    notify("계산식은 깊이 4단계, 구성 요소 31개까지 만들 수 있습니다.", true);
+    return false;
+  }
+  const wasObv = isDirectObvFormula(condition);
+  condition[key] = candidate;
+  if (wasObv && candidate?.kind === "metric" && candidate.metric === "obv") {
+    const otherSide = side === "left" ? "right" : "left";
+    const other = structuredClone(effectiveFormulaExpression(condition, otherSide));
+    if (other?.kind === "metric" && other.metric === "obv") {
+      other.bar_interval = candidate.bar_interval;
+      other.bar_data_mode = candidate.bar_data_mode;
+      condition[`${otherSide}_expression`] = other;
+    }
+  }
+  normalizeConditionAtrPeriods(condition);
+  commitBlockRuleMutation(render);
+  return true;
+}
+
+function canWrapConditionFormula(condition, side, path) {
+  const root = structuredClone(effectiveFormulaExpression(condition, side));
+  const node = expressionNodeAt(root, path);
+  if (!node || expressionContainsMetric(root, "obv")) return false;
+  const candidate = replaceExpressionNode(root, path, {
+    kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
+  });
+  return expressionDepth(candidate) <= 4 && expressionNodeCount(candidate) <= 31;
+}
+
+function appendFormulaExpressionTokens(container, condition, side, expression, path = []) {
+  const selection = formulaSelectionState(condition);
+  const selected = selection.activeSide === side && expressionPathsEqual(path, selection[side] || []);
+  if (expression.kind === "binary") {
+    const open = document.createElement("span");
+    open.className = "condition-formula-parenthesis";
+    open.textContent = "(";
+    container.append(open);
+    appendFormulaExpressionTokens(container, condition, side, expression.left, [...path, "left"]);
+    const operator = document.createElement("button");
+    operator.type = "button";
+    operator.className = `condition-formula-token operator${selected ? " selected" : ""}`;
+    operator.textContent = new Map(BLOCK_EXPRESSION_OPERATORS).get(expression.operator) || "+";
+    operator.title = "이 계산 연산 편집";
+    operator.addEventListener("click", event => {
+      event.stopPropagation();
+      selectFormulaToken(condition, side, path);
+      renderStrategyBlocks();
+    });
+    container.append(operator);
+    appendFormulaExpressionTokens(container, condition, side, expression.right, [...path, "right"]);
+    const close = document.createElement("span");
+    close.className = "condition-formula-parenthesis";
+    close.textContent = ")";
+    container.append(close);
+    return;
+  }
+  const token = document.createElement("button");
+  token.type = "button";
+  token.className = `condition-formula-token ${expression.kind === "constant" ? "constant" : "metric"}${selected ? " selected" : ""}`;
+  token.textContent = expression.kind === "metric" ? formulaMetricTokenLabel(expression) : String(expression.value ?? "0");
+  token.title = expression.kind === "metric" ? `${formulaMetricTokenLabel(expression)} 편집` : "숫자 편집";
+  token.addEventListener("click", event => {
+    event.stopPropagation();
+    selectFormulaToken(condition, side, path);
+    renderStrategyBlocks();
+  });
+  container.append(token);
+}
+
+function formulaControl(labelText, control, wide = false) {
+  const label = document.createElement("label");
+  if (wide) label.className = "wide";
+  const text = document.createElement("span");
+  text.textContent = labelText;
+  label.append(text, control);
+  return label;
+}
+
+function createCompactFormulaTokenEditor(kind, condition, side, path, disabled) {
+  const root = effectiveFormulaExpression(condition, side);
+  const expression = expressionNodeAt(root, path);
+  if (!expression) return null;
+  const panel = document.createElement("div");
+  panel.className = "condition-token-editor";
+  const heading = document.createElement("div");
+  heading.className = "condition-token-editor-heading";
+  const title = document.createElement("strong");
+  title.textContent = expression.kind === "binary" ? "선택한 계산" : "선택한 데이터";
+  const summary = document.createElement("span");
+  summary.textContent = expression.kind === "metric" ? formulaMetricTokenLabel(expression) : conditionExpressionTokenLabel(expression);
+  heading.append(title, summary);
+  panel.append(heading);
+  const grid = document.createElement("div");
+  grid.className = "condition-token-editor-grid";
+  const mutate = (mutator, render = true) => mutateConditionFormulaExpression(condition, side, path, mutator, render);
+  if (expression.kind === "binary") {
+    const operator = conditionSelect(BLOCK_EXPRESSION_OPERATORS, expression.operator || "ADD", disabled, (value, render) => {
+      mutate(node => { node.operator = value; return node; }, render);
+    });
+    grid.append(formulaControl("연산", operator, true));
+  } else {
+    const metricOptions = expressionMetricOptions(kind, expression.metric);
+    const current = expression.kind === "constant" ? "constant" : expression.metric;
+    const metric = conditionSelect(metricOptions, current, disabled || expression.metric === "obv", (value, render) => {
+      mutate(node => value === "constant"
+        ? { kind: "constant", value: "0" }
+        : expressionMetricLeaf(value, node.kind === "metric" ? node : {}), render);
+    });
+    grid.append(formulaControl("데이터", metric, true));
+    if (expression.kind === "constant") {
+      const value = expressionInput({ value: expression.value ?? "0", step: "any", disabled,
+        onChange: (next, render) => mutate(node => { node.value = String(next || "0"); return node; }, render) });
+      grid.append(formulaControl("숫자", value, true));
+    } else if (["average_price", "profit_rate"].includes(expression.metric)) {
+      const hint = document.createElement("p");
+      hint.className = "condition-token-editor-hint";
+      hint.textContent = expression.metric === "average_price"
+        ? "전략이 추적하는 평균 매수가를 사용합니다."
+        : "실시간 현재가와 평균 매수가로 계산합니다.";
+      grid.append(hint);
+    } else {
+      const interval = document.createElement("select");
+      BLOCK_BAR_INTERVALS.forEach(value => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value === "1d" ? "일봉" : value;
+        interval.append(option);
+      });
+      interval.value = expression.bar_interval || "3m";
+      interval.disabled = disabled;
+      bindBlockConditionControl(interval, (value, render) => mutate(node => {
+        node.bar_interval = value;
+        if (node.metric === "atr") node.atr_period = clampBlockAtrPeriod(node.atr_period, value);
+        return node;
+      }, render));
+      const mode = conditionSelect(
+        [["COMPLETE_ONLY", "완성봉만"], ["INCLUDE_CURRENT", "진행 중 봉 포함"]],
+        expression.bar_data_mode || "COMPLETE_ONLY", disabled,
+        (value, render) => mutate(node => { node.bar_data_mode = value; return node; }, render),
+      );
+      const barMode = expression.bar_data_mode || "COMPLETE_ONLY";
+      const offset = expressionInput({
+        value: displayedExpressionOffset(expression), min: barMode === "COMPLETE_ONLY" ? 1 : 0,
+        max: barMode === "COMPLETE_ONLY" ? 201 : 200, disabled,
+        onChange: (value, render) => mutate(node => {
+          node.offset = storedConditionOffset(value, node.bar_data_mode || "COMPLETE_ONLY");
+          return node;
+        }, render),
+      });
+      grid.append(
+        formulaControl("봉 주기", interval),
+        formulaControl("봉 상태", mode),
+        formulaControl("봉 위치", offset),
+      );
+      if (expression.metric === "atr") {
+        const period = expressionInput({
+          value: clampBlockAtrPeriod(expression.atr_period, expression.bar_interval), min: 1,
+          max: blockAtrMaxPeriod(expression.bar_interval), disabled,
+          onChange: (value, render) => mutate(node => {
+            node.atr_period = clampBlockAtrPeriod(value, node.bar_interval);
+            return node;
+          }, render),
+        });
+        grid.append(formulaControl("ATR 기간", period));
+      }
+      if (String(expression.metric).startsWith("bollinger_")) {
+        const period = expressionInput({ value: expression.bollinger_period || 55, min: 2, max: 2000, disabled,
+          onChange: (value, render) => mutate(node => { node.bollinger_period = Math.max(2, Number.parseInt(value, 10) || 55); return node; }, render) });
+        const deviation = expressionInput({ value: expression.bollinger_stddev || "1.04", min: .01, step: "any", disabled,
+          onChange: (value, render) => mutate(node => { node.bollinger_stddev = String(value || "1.04"); return node; }, render) });
+        grid.append(formulaControl("볼린저 기간", period), formulaControl("표준편차", deviation));
+      }
+    }
+  }
+  panel.append(grid);
+  return panel;
+}
+
+function insertConditionFormulaOperand(condition, kind, metric) {
+  const selection = formulaSelectionState(condition);
+  const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
+  const path = selection[side] || [];
+  const source = expressionNodeAt(effectiveFormulaExpression(condition, side), path) || {};
+  const operand = metric === "constant" ? { kind: "constant", value: "0" } : expressionMetricLeaf(metric, source);
+  if (selection.expectOperand) {
+    if (mutateConditionFormulaExpression(condition, side, path, () => operand, false) === false) return;
+    selection.expectOperand = false;
+  } else {
+    if (mutateConditionFormulaExpression(condition, side, path, node => ({
+      kind: "binary", operator: "ADD", left: structuredClone(node), right: operand,
+    }), false) === false) return;
+    selection[side] = [...path, "right"];
+  }
+  selection.activeSide = side;
+  selection.showData = false;
+  renderStrategyBlocks();
+}
+
+function applyConditionObvComparison(condition) {
+  const selected = formulaSelectionState(condition);
+  const selectedSide = ["left", "right"].includes(selected.activeSide) ? selected.activeSide : "left";
+  const selectedSource = expressionNodeAt(
+    effectiveFormulaExpression(condition, selectedSide), selected[selectedSide] || [],
+  );
+  const source = selectedSource?.kind === "metric" ? selectedSource : {
+    bar_interval: condition.left_bar_interval || "3m",
+    bar_data_mode: condition.left_bar_data_mode || "COMPLETE_ONLY",
+  };
+  condition.left = "obv";
+  condition.right = "obv";
+  condition.left_expression = expressionMetricLeaf("obv", { ...source, offset: 0 });
+  condition.right_expression = expressionMetricLeaf("obv", { ...source, offset: 10 });
+  condition.operator = "GT";
+  selected.activeSide = "left";
+  selected.left = [];
+  selected.right = [];
+  selected.showData = false;
+  selected.expectOperand = false;
+  commitBlockRuleMutation();
+}
+
+function releaseConditionObvComparison(condition) {
+  const selected = formulaSelectionState(condition);
+  const source = effectiveFormulaExpression(condition, "left");
+  condition.left = "close";
+  condition.right = "value";
+  condition.value = "0";
+  condition.left_expression = expressionMetricLeaf("close", source?.kind === "metric" ? source : {});
+  condition.right_expression = { kind: "constant", value: "0" };
+  condition.operator = "GT";
+  selected.activeSide = "left";
+  selected.left = [];
+  selected.right = [];
+  selected.showData = false;
+  selected.expectOperand = false;
+  commitBlockRuleMutation();
+}
+
+function createConditionFormulaEditor(kind, ruleNode, disabled) {
+  const condition = ruleNode.condition;
+  const obvMode = isDirectObvFormula(condition);
+  const panel = document.createElement("section");
+  panel.className = "condition-formula-editor";
+  const hint = document.createElement("p");
+  hint.className = "condition-formula-hint";
+  hint.textContent = "조건식을 토큰으로 만듭니다. 데이터 토큰을 누르면 봉 주기와 지표 값을 바로 편집할 수 있습니다.";
+  const strip = document.createElement("div");
+  strip.className = "condition-formula-strip";
+  strip.setAttribute("aria-label", "조건식");
+  appendFormulaExpressionTokens(strip, condition, "left", effectiveFormulaExpression(condition, "left"));
+  const selection = formulaSelectionState(condition);
+  const compare = document.createElement("button");
+  compare.type = "button";
+  compare.className = `condition-formula-token comparison${selection.activeSide === "operator" ? " selected" : ""}`;
+  compare.textContent = new Map(BLOCK_CONDITION_OPERATORS).get(condition.operator) || condition.operator;
+  compare.title = "비교 연산 편집";
+  compare.addEventListener("click", () => {
+    selection.activeSide = "operator";
+    selection.showData = false;
+    renderStrategyBlocks();
+  });
+  strip.append(compare);
+  appendFormulaExpressionTokens(strip, condition, "right", effectiveFormulaExpression(condition, "right"));
+  const timing = document.createElement("span");
+  timing.className = `block-condition-timing${isLiveProfitCondition(condition) ? " live" : ""}`;
+  timing.textContent = `판단 기준 · ${blockConditionTiming(condition)}`;
+  panel.append(hint, strip, timing);
+
+  const keypad = document.createElement("div");
+  keypad.className = "condition-formula-keypad";
+  const key = (label, title, onClick, className = "") => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `condition-formula-key ${className}`.trim();
+    button.textContent = label;
+    button.title = title;
+    button.disabled = disabled;
+    button.addEventListener("click", onClick);
+    keypad.append(button);
+    return button;
+  };
+  const dataKey = key("+ 데이터 추가", "지표 데이터를 조건식에 추가", () => {
+    if (!["left", "right"].includes(selection.activeSide)) {
+      selection.activeSide = "left";
+      selection.left = [];
+    }
+    selection.showData = !selection.showData;
+    renderStrategyBlocks();
+  }, "data");
+  dataKey.disabled = disabled || obvMode;
+  const numberKey = key("숫자", "숫자 값을 조건식에 추가", () => insertConditionFormulaOperand(condition, kind, "constant"));
+  numberKey.disabled = disabled || obvMode;
+  key(obvMode ? "OBV 비교 해제" : "OBV 비교", obvMode
+    ? "양쪽 OBV를 함께 일반 종가 비교식으로 바꿉니다"
+    : "같은 봉 기준의 1봉 전 OBV와 11봉 전 OBV 비교식을 만듭니다", () => {
+    if (obvMode) releaseConditionObvComparison(condition);
+    else applyConditionObvComparison(condition);
+  }, "data");
+  BLOCK_EXPRESSION_OPERATORS.forEach(([operator, label]) => {
+    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
+    const path = selection[side] || [];
+    const button = key(label, `${label} 계산 추가`, () => {
+      if (mutateConditionFormulaExpression(condition, side, path, node => ({
+        kind: "binary", operator, left: structuredClone(node), right: { kind: "constant", value: "0" },
+      }), false) === false) return;
+      selection.activeSide = side;
+      selection[side] = [...path, "right"];
+      selection.expectOperand = true;
+      renderStrategyBlocks();
+    }, "arithmetic");
+    button.disabled = disabled || obvMode || !canWrapConditionFormula(condition, side, path);
+  });
+  conditionOperatorOptions(condition).forEach(([operator, label, optionDisabled]) => {
+    const button = key(label, `${label} 비교`, () => {
+      condition.operator = operator;
+      selection.activeSide = "operator";
+      commitBlockRuleMutation();
+    }, "compare");
+    button.disabled = disabled || optionDisabled;
+  });
+  const openKey = key("(", "선택한 값을 새 괄호 계산으로 확장", () => {
+    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
+    const path = selection[side] || [];
+    if (mutateConditionFormulaExpression(condition, side, path, node => ({
+      kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
+    }), false) === false) return;
+    selection.activeSide = side;
+    selection[side] = [...path, "right"];
+    selection.expectOperand = true;
+    renderStrategyBlocks();
+  }, "parenthesis");
+  {
+    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
+    const path = selection[side] || [];
+    openKey.disabled = disabled || obvMode || !canWrapConditionFormula(condition, side, path);
+  }
+  const closeKey = key(")", "현재 괄호의 바깥 계산 선택", () => {
+    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : "left";
+    const path = selection[side] || [];
+    selection[side] = path.length > 1 ? path.slice(0, -2) : [];
+    selection.expectOperand = false;
+    renderStrategyBlocks();
+  }, "parenthesis");
+  closeKey.disabled = disabled || obvMode;
+  const deleteKey = key("삭제", "선택한 계산 항목 제거", () => {
+    const side = ["left", "right"].includes(selection.activeSide) ? selection.activeSide : null;
+    if (!side) return;
+    const path = selection[side] || [];
+    if (!path.length) {
+      mutateConditionFormulaExpression(condition, side, [], () => side === "right"
+        ? { kind: "constant", value: "0" } : expressionMetricLeaf("close"), false);
+      selection[side] = [];
+    } else {
+      const parentPath = path.slice(0, -1);
+      const branch = path.at(-1);
+      mutateConditionFormulaExpression(condition, side, parentPath, parent => structuredClone(
+        branch === "left" ? parent.right : parent.left,
+      ), false);
+      selection[side] = parentPath;
+    }
+    selection.expectOperand = false;
+    renderStrategyBlocks();
+  }, "remove");
+  deleteKey.disabled = disabled || obvMode;
+  panel.append(keypad);
+
+  if (selection.showData && !obvMode) {
+    const palette = document.createElement("div");
+    palette.className = "condition-data-palette";
+    const options = expressionMetricOptions(kind);
+    options.filter(([metric]) => metric !== "constant").forEach(([metric, label]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.disabled = disabled;
+      button.addEventListener("click", () => insertConditionFormulaOperand(condition, kind, metric));
+      palette.append(button);
+    });
+    panel.append(palette);
+  }
+  if (selection.activeSide === "operator") {
+    const operatorPanel = document.createElement("div");
+    operatorPanel.className = "condition-token-editor comparison-editor";
+    const title = document.createElement("strong");
+    title.textContent = "비교 연산";
+    const select = conditionSelect(conditionOperatorOptions(condition), condition.operator, disabled, (value, render) => {
+      condition.operator = value;
+      commitBlockRuleMutation(render);
+    });
+    operatorPanel.append(title, select);
+    panel.append(operatorPanel);
+  } else if (["left", "right"].includes(selection.activeSide)) {
+    const editor = createCompactFormulaTokenEditor(
+      kind, condition, selection.activeSide, selection[selection.activeSide] || [], disabled,
+    );
+    if (editor) panel.append(editor);
+  }
+  return panel;
 }
 
 function appendExpressionModeAction(panel, { enabled, disabled, onClick, controlKey = null }) {
@@ -3614,6 +4521,7 @@ function normalizeManagedBlockSettings(settings) {
       sell_start_time: settings.sell_start_time || "09:00",
       sell_end_time: settings.sell_end_time || "15:20",
       sell_condition_groups: structuredClone(settings.sell_condition_groups || []),
+      sell_rule_tree: settings.sell_rule_tree ? structuredClone(settings.sell_rule_tree) : null,
     }];
   }
   settings.sell_flows.forEach((flow, index) => {
@@ -3624,6 +4532,7 @@ function normalizeManagedBlockSettings(settings) {
       sell_start_time: settings.sell_start_time || "09:00",
       sell_end_time: settings.sell_end_time || "15:20",
       sell_condition_groups: settings.sell_condition_groups || [],
+      sell_rule_tree: settings.sell_rule_tree || null,
     };
     for (const key of BLOCK_SELL_FLOW_FIELDS) {
       if (flow[key] == null) flow[key] = structuredClone(fallbacks[key]);
@@ -3665,6 +4574,10 @@ function normalizeManagedBlockSettings(settings) {
   ].forEach(group => (group.conditions || []).forEach(normalizeConditionAtrPeriods));
   settings.buy_order_type ||= "MARKET";
   settings.sell_order_type ||= "MARKET";
+  ensureBlockRuleTree("buy", settings);
+  ensureBlockRuleTree("sell", settings);
+  settings.buy_flows.forEach(flow => ensureBlockRuleTree("buy", flow));
+  settings.sell_flows.forEach(flow => ensureBlockRuleTree("sell", flow));
   return settings;
 }
 
@@ -3698,12 +4611,79 @@ function conditionJoin(text = "또는 (OR)") {
   return join;
 }
 
+function ruleComposerNodeId(kind, flowId, nodeId) {
+  return `${blockFlowNodePrefix(kind, flowId)}-rule-${nodeId}`;
+}
+
+function ruleComposerActionId(kind, flowId, actionId) {
+  return `${blockFlowNodePrefix(kind, flowId)}-action-${actionId}`;
+}
+
+function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, totalCount = null) {
+  const ruleCount = totalCount ?? blockRuleNodeCount(node);
+  const children = [];
+  if (node.kind === "logic") {
+    (node.children || []).forEach((child, index) => {
+      if (index) {
+        children.push({
+          kind: "logic-join",
+          id: `${node.id}-join-${index}`,
+          ruleKind: kind,
+          flowId,
+          parentId: node.id,
+          operator: node.operator || "ALL",
+        });
+      }
+      children.push(buildComposerRuleBranch(kind, flowId, child, false, depth + 1, ruleCount));
+    });
+    children.push({
+      kind: "rule-add",
+      id: `${node.id}-add-child`,
+      ruleKind: kind,
+      flowId,
+      parentId: node.id,
+      depth,
+      totalCount: ruleCount,
+      disabled: (node.children || []).length >= 20,
+    });
+  }
+  children.push({
+    kind: "then",
+    id: `${node.id}-then`,
+    ruleKind: kind,
+    flowId,
+    ownerId: node.id,
+    children: node.action
+      ? [{ kind: "node", nodeId: ruleComposerActionId(kind, flowId, node.action.id) }]
+      : [{
+        kind: "add",
+        id: `${node.id}-add-action`,
+        label: `${kind === "sell" ? "매도" : "매수"} 행동 추가`,
+        action: "add-rule-action",
+        ruleKind: kind,
+        flowId,
+        ownerId: node.id,
+      }],
+  });
+  return {
+    kind: "rule-node",
+    id: ruleComposerNodeId(kind, flowId, node.id),
+    nodeId: ruleComposerNodeId(kind, flowId, node.id),
+    tone: node.kind === "logic" ? (node.operator === "ANY" ? "any" : "all") : "condition",
+    ruleKind: kind,
+    flowId,
+    ruleNodeId: node.id,
+    isRoot,
+    children,
+  };
+}
+
 function buildComposerTreeModel(settings) {
   const flows = Array.isArray(settings?.buy_flows) ? settings.buy_flows : [];
   const sellFlows = Array.isArray(settings?.sell_flows) ? settings.sell_flows : [];
   const flowBranches = flows.map((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
-    const groups = flow.buy_condition_groups || [];
+    const ruleTree = blockRuleTree("buy", flow.id);
     return {
       kind: "branch",
       id: prefix,
@@ -3713,23 +4693,13 @@ function buildComposerTreeModel(settings) {
       nodeId: `${prefix}-schedule`,
       children: [
         { kind: "node", nodeId: `${prefix}-target` },
-        ...(groups.length
-          ? groups.map(group => ({ kind: "node", nodeId: `${prefix}-group-${group.id}` }))
-          : [{ kind: "node", nodeId: `${prefix}-empty` }]),
-        {
-          kind: "add",
-          id: `${prefix}-add-condition`,
-          label: "매수 조건 블록 추가",
-          action: "add-buy-condition",
-          flowId: flow.id,
-          disabled: groups.length >= 8,
-        },
+        buildComposerRuleBranch("buy", flow.id, ruleTree, true, 0, blockRuleNodeCount(ruleTree)),
       ],
     };
   });
   const sellFlowBranches = sellFlows.map((flow, flowIndex) => {
     const prefix = blockFlowNodePrefix("sell", flow.id);
-    const groups = flow.sell_condition_groups || [];
+    const ruleTree = blockRuleTree("sell", flow.id);
     return {
       kind: "branch",
       id: prefix,
@@ -3738,15 +4708,7 @@ function buildComposerTreeModel(settings) {
       tone: "sell",
       nodeId: `${prefix}-schedule`,
       children: [
-        ...groups.map(group => ({ kind: "node", nodeId: `${prefix}-group-${group.id}` })),
-        {
-          kind: "add",
-          id: `${prefix}-add-condition`,
-          label: "매도 조건 블록 추가",
-          action: "add-sell-condition",
-          flowId: flow.id,
-          disabled: groups.length >= 8,
-        },
+        buildComposerRuleBranch("sell", flow.id, ruleTree, true, 0, blockRuleNodeCount(ruleTree)),
       ],
     };
   });
@@ -3771,13 +4733,11 @@ function buildComposerTreeModel(settings) {
           disabled: flows.length >= 8,
         },
         {
-          kind: "branch",
-          id: "shared-buy-order",
-          title: "공통 주문 처리",
+          kind: "node",
+          id: "shared-buy-budget",
           badge: "SHARED",
           tone: "shared",
           nodeId: "buyRules",
-          children: [{ kind: "node", nodeId: "buyOrder" }],
         },
       ],
     }, {
@@ -3795,21 +4755,8 @@ function buildComposerTreeModel(settings) {
           label: "시간대별 매도 흐름 추가",
           action: "add-sell-flow",
           disabled: sellFlows.length >= 8,
-        }, {
-          kind: "branch",
-          id: "shared-sell-order",
-          title: "공통 주문 처리",
-          badge: "SHARED",
-          tone: "shared",
-          nodeId: "sellOrder",
-        }, {
-        kind: "branch",
-        id: "close-position",
-        title: "장 마감",
-        badge: "CLOSE",
-        tone: "close",
-        nodeId: "closeSchedule",
-      }],
+        },
+      ],
     }],
   };
 }
@@ -3830,18 +4777,91 @@ function createComposerTreeAddRow(entry, running) {
     event.stopPropagation();
     if (entry.action === "add-buy-flow") addBlockBuyFlow();
     else if (entry.action === "add-sell-flow") addBlockSellFlow();
-    else if (entry.action === "add-buy-condition") addConditionGroup("buy", entry.flowId);
-    else if (entry.action === "add-sell-condition") addConditionGroup("sell", entry.flowId);
+    else if (entry.action === "add-rule-action") {
+      addBlockRuleAction(entry.ruleKind, entry.flowId, entry.ownerId);
+    }
   });
   return button;
 }
 
-function createComposerTreeBranchHeader(entry) {
+function createComposerLogicConnector(entry, running) {
+  const row = document.createElement("div");
+  row.className = "composer-logic-connector-row";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `composer-logic-connector ${entry.operator === "ANY" ? "any" : "all"}`;
+  button.textContent = entry.operator === "ANY" ? "OR" : "AND";
+  button.title = `${button.textContent} 연결 · 눌러서 변경`;
+  button.setAttribute("aria-label", `${button.textContent} 연결 방식 변경`);
+  button.disabled = running;
+  button.addEventListener("click", event => {
+    event.stopPropagation();
+    setBlockRuleOperator(
+      entry.ruleKind, entry.flowId, entry.parentId,
+      entry.operator === "ANY" ? "ALL" : "ANY",
+    );
+  });
+  row.append(button);
+  return row;
+}
+
+function createComposerRuleAddMenu(entry, running) {
+  const menu = document.createElement("div");
+  menu.className = "composer-tree-rule-add";
+  const make = (label, childKind, operator = "ALL") => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    const addedNodes = childKind === "logic" ? 2 : 1;
+    const addedDepth = childKind === "logic" ? 2 : 1;
+    button.disabled = running
+      || Boolean(entry.disabled)
+      || Number(entry.totalCount || 0) + addedNodes > 100
+      || Number(entry.depth || 0) + addedDepth > 8;
+    button.addEventListener("click", event => {
+      event.stopPropagation();
+      addBlockRuleChild(entry.ruleKind, entry.flowId, entry.parentId, childKind, operator);
+    });
+    menu.append(button);
+  };
+  make("+ 조건식", "condition");
+  make("+ AND 묶음", "logic", "ALL");
+  make("+ OR 묶음", "logic", "ANY");
+  return menu;
+}
+
+function createComposerThenBranch(entry, definitions, running) {
+  const branch = document.createElement("div");
+  branch.className = "composer-then-branch";
+  const label = document.createElement("span");
+  label.className = "composer-then-label";
+  label.textContent = "통과하면";
+  branch.append(label);
+  const children = document.createElement("div");
+  children.className = "composer-then-children";
+  (entry.children || []).forEach(child => children.append(renderComposerTreeBranch(child, definitions, running)));
+  branch.append(children);
+  return branch;
+}
+
+function createComposerTreeBranchHeader(entry, running) {
   const header = document.createElement("div");
   header.className = "composer-tree-flow";
-  const badge = document.createElement("span");
+  const badge = document.createElement(entry.ruleNodeId ? "button" : "span");
+  if (entry.ruleNodeId) badge.type = "button";
   badge.className = `composer-tree-badge ${entry.tone || "general"}`;
   badge.textContent = entry.badge || "GROUP";
+  if (entry.ruleNodeId) {
+    badge.disabled = running;
+    badge.title = "묶음 연결 방식 변경";
+    badge.addEventListener("click", event => {
+      event.stopPropagation();
+      const node = findBlockRuleNode(entry.ruleKind, entry.flowId, entry.ruleNodeId)?.node;
+      if (node?.kind === "logic") {
+        setBlockRuleOperator(entry.ruleKind, entry.flowId, node.id, node.operator === "ANY" ? "ALL" : "ANY");
+      }
+    });
+  }
   const copy = document.createElement("span");
   copy.className = "composer-node-copy";
   const title = document.createElement("strong");
@@ -3858,14 +4878,17 @@ function createComposerTreeBranchHeader(entry) {
 
 function renderComposerTreeBranch(entry, definitions, running) {
   if (entry.kind === "add") return createComposerTreeAddRow(entry, running);
+  if (entry.kind === "logic-join") return createComposerLogicConnector(entry, running);
+  if (entry.kind === "rule-add") return createComposerRuleAddMenu(entry, running);
+  if (entry.kind === "then") return createComposerThenBranch(entry, definitions, running);
   const branch = document.createElement(entry.kind === "section" ? "section" : "div");
-  branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}`;
+  branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}${entry.kind === "rule-node" ? " composer-rule-branch" : ""}`;
   if (entry.tone) {
     branch.classList.add(entry.tone);
     branch.dataset.tone = entry.tone;
   }
   branch.dataset.composerBranch = entry.id || entry.nodeId || "branch";
-  if (entry.title) branch.append(createComposerTreeBranchHeader(entry));
+  if (entry.title) branch.append(createComposerTreeBranchHeader(entry, running));
   if (entry.nodeId) {
     const definition = definitions.get(entry.nodeId);
     if (definition) branch.append(createComposerTreeRow(definition, running));
@@ -4392,16 +5415,81 @@ function renderConditionSchedule(parsed, running, snapshot) {
   addSell.disabled = running || sellFlows.length >= 8;
   addSell.addEventListener("click", addBlockSellFlow);
   root.append(addSell);
-  const closing = createScheduleSection({ key: "closing", title: `${settings.close_time}  장 마감 청산`,
-    summary: "전략 보유종목 청산 → 미체결·보유 수량 재확인", badge: "정시 실행", tone: "closing" });
-  closing.content.append(createScheduleFields(take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"), running));
-  root.append(closing.section);
   const generated = document.createElement("p");
   generated.className = "schedule-generated-note";
   generated.textContent = "실행용 Python 코드 자동 생성";
   root.append(generated);
   elements.blockCanvas.append(root);
   restoreScheduleView(snapshot);
+}
+
+function blockRuleConditionNodes(root) {
+  const conditions = [];
+  walkBlockRule(root, node => {
+    if (node.kind === "condition" && node.condition) conditions.push(node.condition);
+  });
+  return conditions;
+}
+
+function blockRuleConditionSummary(condition) {
+  const operator = new Map(BLOCK_CONDITION_OPERATORS).get(condition.operator) || condition.operator || "=";
+  return `${formulaExpressionSummary(effectiveFormulaExpression(condition, "left"))} ${operator} ${formulaExpressionSummary(effectiveFormulaExpression(condition, "right"))}`;
+}
+
+function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
+  walkBlockRule(root, (node, parent, index, depth) => {
+    const isRoot = node === root;
+    const nodeId = ruleComposerNodeId(kind, flowId, node.id);
+    if (node.kind === "logic") {
+      const operator = node.operator === "ANY" ? "ANY" : "ALL";
+      const conditionCount = blockRuleConditionNodes(node).length;
+      nodes.push({
+        id: nodeId,
+        title: isRoot
+          ? `${kind === "sell" ? "매도" : "매수"} 판단`
+          : `${operator === "ANY" ? "OR" : "AND"} 조건 묶음`,
+        meta: `${conditionCount}개 조건식 · ${operator === "ANY" ? "위에서 먼저 참인 분기 우선" : "모두 충족"}`,
+        tone: operator === "ANY" ? "any" : "all",
+        logic: operator === "ANY" ? "OR" : "AND",
+        logicTone: operator === "ANY" ? "any" : "all",
+        width: 560,
+        summary: [operator === "ANY" ? "하나 이상 충족 · 위에서 먼저 참인 분기의 행동 실행" : "괄호 안의 조건을 모두 만족하면 통과"],
+        description: isRoot
+          ? `이 흐름 안의 조건 계층을 위에서부터 판단합니다. 각 괄호 묶음의 AND·OR을 눌러 바로 바꿀 수 있습니다.`
+          : "이 묶음은 하나의 괄호처럼 처리됩니다. 안쪽에 조건식이나 다른 묶음을 넣을 수 있습니다.",
+        ruleNode: { kind, flowId, nodeId: node.id, isRoot },
+      });
+    } else {
+      nodes.push({
+        id: nodeId,
+        title: "조건식",
+        meta: blockConditionTiming(node.condition),
+        tone: "condition",
+        logic: "IF",
+        logicTone: "condition",
+        width: 620,
+        summary: [blockRuleConditionSummary(node.condition)],
+        description: "식의 데이터와 계산·비교를 한 줄에서 구성합니다. 데이터 토큰을 누르면 지표와 봉 기준을 편집할 수 있습니다.",
+        ruleNode: { kind, flowId, nodeId: node.id, isRoot: false },
+      });
+    }
+    if (node.action) {
+      nodes.push({
+        id: ruleComposerActionId(kind, flowId, node.action.id),
+        title: kind === "sell" ? "매도 주문" : "매수 주문",
+        meta: node.action.order_type === "LIMIT" ? "현재가 지정가" : "시장가",
+        tone: "event",
+        logic: node.action.side || (kind === "sell" ? "SELL" : "BUY"),
+        logicTone: kind === "sell" ? "sell" : "buy",
+        width: 420,
+        summary: [node.action.order_type === "LIMIT" ? "현재가 지정가 주문" : "시장가 주문"],
+        actions: kind === "sell"
+          ? ["전략 소유 수량", "주문 제출", "상태 조정"]
+          : ["공통 예산", "멱등성 예약", "위험 검사", "주문 제출"],
+        ruleActionOwner: { kind, flowId, nodeId: node.id, order_type: node.action.order_type },
+      });
+    }
+  });
 }
 
 function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = null) {
@@ -4422,23 +5510,15 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       summary: [valueOf("trading_account"), valueOf("condition_source"), `${valueOf("market_venue")} → ${valueOf("route")}`],
       description: "계좌와 API, 시세 시장, 주문 경로를 모든 매수 일정과 매도 판단에서 공유합니다.",
       actions: ["같은 계좌", "공통 예산", "공통 보유종목"] },
-    { id: "buyRules", title: "매수 주문 조건", meta: "전략 전체 공유", tone: "risk", logic: "ALL", logicTone: "all", width: 460,
+    { id: "buyRules", title: "공통 예산 · 위험", meta: "전략 전체 공유", tone: "risk", logic: "공통", logicTone: "all", width: 460,
       fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
       summary: [`종목당 ${money(valueOf("buy_budget_per_symbol"))}`, `총 ${money(valueOf("total_operating_budget"))}`, `조회당 ${valueOf("max_new_buys_per_scan")}종목`],
       actions: ["미보유", "미체결 없음", "가능 수량 ≥ 1", "운용 예산 이내"] },
-    { id: "buyOrder", title: "매수 주문", meta: "중앙 주문 처리", tone: "event", logic: "BUY", logicTone: "buy", width: 460,
-      fields: take("buy_order_type"), actions: ["시간 재확인", "멱등성 예약", "위험 검사", "주문 제출", "상태 조정"], vertical: true },
-    { id: "sellOrder", title: "매도 주문", meta: "공통 보유종목", tone: "event", logic: "SELL", logicTone: "sell", width: 460,
-      fields: take("sell_order_type"), actions: ["전략 소유 수량", "주문 제출", "상태 조정"], vertical: true },
-    { id: "closeSchedule", title: "장 마감 청산", meta: "정시 · 재확인", tone: "schedule", logic: "마감", logicTone: "close", width: 460,
-      fields: take("close_time", "close_retry_start", "close_retry_end", "close_confirm_time"),
-      summary: [`청산 ${valueOf("close_time")}`, `재확인 ${valueOf("close_retry_start")}–${valueOf("close_retry_end")}`] },
   ];
   flows.forEach((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
     const flowFields = new Map(blockBuyFlowFields(flow).map(field => [field.settingKey, field]));
     const takeFlow = (...keys) => keys.map(key => flowFields.get(key)).filter(Boolean);
-    const groups = blockConditionGroups("buy", flow.id);
     const conditions = blockConditionData(flow);
     const targetFields = flow.target_source === "RANKING"
       ? takeFlow("target_source", "ranking_kind", "ranking_venue", "ranking_market", "ranking_limit")
@@ -4452,33 +5532,22 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       id: `${prefix}-schedule`, title: flow.name || `매수 흐름 ${flowIndex + 1}`, meta: "한국 시각 · 종료 시각 제외", tone: "schedule", logic: "시간", logicTone: "schedule", width: 460,
       fields: takeFlow("name", "buy_start_time", "buy_end_time", "buy_scan_seconds"), flowKind: "buy", flowId: flow.id,
       summary: [`${flow.buy_start_time}–${flow.buy_end_time}`, `${flow.buy_scan_seconds}초마다`],
-      description: "이 시간대의 종목 조회와 매수 조건은 다른 매수 흐름과 독립적으로 실행됩니다.",
+      description: "이 시간대의 종목 조회와 매수 판단은 다른 매수 흐름과 독립적으로 실행됩니다.",
     }, {
       id: `${prefix}-target`, title: targetLabels[flow.target_source] || "종목 데이터", meta: flow.target_source === "HTS_CONDITION"
         ? (conditions.loading ? "조건식 조회 중" : conditions.error ? "조회 실패" : `${conditions.conditions.length}개 조건식`) : "이 흐름에서 조회",
       tone: "target", logic: "대상", logicTone: "universe", width: 460, fields: targetFields,
       summary: [targetSummary], actions: ["조회 결과를 이 흐름의 조건에 전달"], vertical: true,
     });
-    if (!groups.length) nodes.push({
-      id: `${prefix}-empty`, title: "매수 조건", meta: "조건 없이 통과", tone: "risk", logic: "PASS", logicTone: "any", width: 460,
-      summary: ["대상 종목을 바로 주문 조건으로 전달"],
-      emptyBuyFlowId: flow.id,
-    });
-    groups.forEach((group, index) => nodes.push({
-      id: `${prefix}-group-${group.id}`, title: `매수 조건 ${index + 1}`,
-      meta: `${group.conditions.length}개 · 내부 OR${index ? " · 이전 블록과 AND" : ""}`,
-      tone: "risk", logic: index ? "AND" : "ANY", logicTone: index ? "all" : "any", width: 460,
-      summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "buy", index, flowId: flow.id },
-    }));
+    collectComposerRuleDefinitions(nodes, "buy", flow.id, blockRuleTree("buy", flow.id));
   });
   sellFlows.forEach((flow, flowIndex) => {
     const prefix = blockFlowNodePrefix("sell", flow.id);
     const flowFields = new Map(blockSellFlowFields(flow).map(field => [field.settingKey, field]));
     const takeFlow = (...keys) => keys.map(key => flowFields.get(key)).filter(Boolean);
-    const groups = blockConditionGroups("sell", flow.id);
-    const conditions = groups.flatMap(group => group.conditions || []);
-    const hasLiveConditions = conditions.some(isLiveProfitCondition);
-    const hasBarConditions = conditions.some(hasBarMetricCondition);
+    const ruleConditions = blockRuleConditionNodes(blockRuleTree("sell", flow.id));
+    const hasLiveConditions = ruleConditions.some(isLiveProfitCondition);
+    const hasBarConditions = ruleConditions.some(hasBarMetricCondition);
     const scheduleMeta = hasLiveConditions && hasBarConditions
       ? "실시간 · 봉 시점"
       : hasLiveConditions ? "실시간" : "봉 시점";
@@ -4493,15 +5562,10 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       fields: takeFlow("name", "sell_start_time", "sell_end_time", "sell_scan_seconds"),
       flowKind: "sell", flowId: flow.id,
       summary: [`${flow.sell_start_time}–${flow.sell_end_time}`, scheduleMeta],
-      description: "이 시간대의 매도 조건은 다른 매도 흐름과 독립적으로 실행됩니다. 활성 흐름 중 하나가 통과하면 공통 매도 주문으로 이어집니다.",
+      description: "이 시간대에는 이 매도 계층만 독립적으로 판단합니다. 조건이나 묶음에 붙은 행동이 통과한 경로에서 실행됩니다.",
       actions: scheduleActions,
     });
-    groups.forEach((group, index) => nodes.push({
-      id: `${prefix}-group-${group.id}`, title: `매도 조건 ${index + 1}`,
-      meta: `${group.conditions.length}개 · 내부 OR${index ? " · 이전 블록과 AND" : ""}`,
-      tone: "risk", logic: index ? "AND" : "ANY", logicTone: index ? "all" : "any", width: 460,
-      summary: [scheduleConditionSummary(group)], conditionGroup: { kind: "sell", index, flowId: flow.id },
-    }));
+    collectComposerRuleDefinitions(nodes, "sell", flow.id, blockRuleTree("sell", flow.id));
   });
   const nodeIds = new Set(nodes.map(node => node.id));
   if (state.blockSelectedNode == null || (state.blockSelectedNode && !nodeIds.has(state.blockSelectedNode))) {
@@ -4564,10 +5628,12 @@ function renderStrategyBlocks() {
   if (parsed.template === "condition-bollinger-v1" && state.blockPackage) {
     const flows = blockBuyFlows();
     const sellFlows = blockSellFlows();
-    const buyGroups = flows.flatMap(flow => blockConditionGroups("buy", flow.id));
-    const sellGroups = sellFlows.flatMap(flow => blockConditionGroups("sell", flow.id));
-    const buyConditions = buyGroups.reduce((count, group) => count + group.conditions.length, 0);
-    const sellConditions = sellGroups.reduce((count, group) => count + group.conditions.length, 0);
+    const buyConditions = flows.reduce(
+      (count, flow) => count + blockRuleConditionNodes(blockRuleTree("buy", flow.id)).length, 0,
+    );
+    const sellConditions = sellFlows.reduce(
+      (count, flow) => count + blockRuleConditionNodes(blockRuleTree("sell", flow.id)).length, 0,
+    );
     elements.blockSummary.textContent = `매수 흐름 ${flows.length}개 · 매수 조건 ${buyConditions}개 · 매도 흐름 ${sellFlows.length}개 · 매도 조건 ${sellConditions}개 · 예산·보유 공유`;
   } else {
     elements.blockSummary.textContent = `${parsed.fields.length}개 설정 · ${parsed.schedules.length}개 일정 · ${parsed.handlers.length}개 실행 흐름`;
@@ -6009,15 +7075,8 @@ document.querySelector("#update-button").addEventListener("click", async () => {
   button.disabled = true;
   button.textContent = "확인 중";
   try {
-    const result = await api("/api/updates/check");
-    status.textContent = result.message;
-    if (result.available && result.can_apply) {
-      button.dataset.ready = "true";
-      button.textContent = "업데이트 시작";
-    } else {
-      delete button.dataset.ready;
-      button.textContent = "업데이트 확인";
-    }
+    const result = await fetchUpdateResult();
+    renderUpdateResult(result);
     notify(result.message);
   } catch (error) {
     status.textContent = error.message;
@@ -6026,6 +7085,9 @@ document.querySelector("#update-button").addEventListener("click", async () => {
     button.textContent = "업데이트 확인";
   }
   finally { button.disabled = false; }
+});
+elements.updateAvailable.addEventListener("click", () => {
+  openSettings("general").catch(error => notify(error.message, true));
 });
 document.querySelector("#restart-button").addEventListener("click", async () => {
   if (!window.confirm("실행 중인 전략을 중지하고 Trade Router를 재시작할까요?")) return;
@@ -6220,6 +7282,7 @@ async function initialize() {
     renderDashboard();
     resetActivity("전략을 선택하면 실행 기록이 표시됩니다.");
   } catch (error) { notify(error.message, true); }
+  void checkForStartupUpdate();
   window.setInterval(() => refreshStatus(), 2000);
   window.setInterval(() => {
     if (state.view === "dashboard") refreshDashboard().catch(() => {});

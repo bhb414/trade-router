@@ -796,6 +796,7 @@ def test_managed_block_rejects_atr_offset_or_cross_beyond_fixed_window_cap() -> 
     )
     for condition in conditions:
         payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+        payload["buy_rule_tree"] = None
         payload["buy_condition_groups"] = [{
             "id": "atr-history-cap", "conditions": [condition],
         }]
@@ -895,6 +896,7 @@ def test_managed_block_supports_legacy_atr_side_fields() -> None:
 
 def test_managed_block_formula_metrics_enable_bar_capability() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_rule_tree"] = None
     payload["buy_condition_groups"] = [{
         "id": "atr-bars",
         "conditions": [{
@@ -1002,6 +1004,7 @@ def test_managed_block_division_by_zero_is_a_safe_no_match() -> None:
 
 def test_managed_block_validates_formula_metrics_in_strategy_context() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_rule_tree"] = None
     payload["buy_condition_groups"] = [{
         "id": "invalid-position-formula",
         "conditions": [{
@@ -1021,6 +1024,7 @@ def test_managed_block_validates_formula_metrics_in_strategy_context() -> None:
         raise AssertionError("Buy formulas must reject position-only metrics recursively.")
 
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_rule_tree"] = None
     payload["buy_condition_groups"] = [{
         "id": "too-much-history",
         "conditions": [{
@@ -1060,6 +1064,7 @@ def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> N
 
 def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metrics() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["sell_rule_tree"] = None
     sell_condition = payload["sell_condition_groups"][0]["conditions"][2]
     sell_condition["left_bar_interval"] = "1h"
     sell_condition["right_bar_interval"] = "1h"
@@ -1079,6 +1084,7 @@ def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metr
             "value": "1",
         }],
     }]
+    payload["buy_rule_tree"] = None
     try:
         ConditionBollingerBlockSettings.model_validate(payload)
     except ValueError as exc:
@@ -1125,6 +1131,7 @@ def test_managed_block_can_include_the_current_forming_bar() -> None:
 
 def test_managed_block_limits_daily_history_to_one_period_request() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["sell_rule_tree"] = None
     condition = payload["sell_condition_groups"][0]["conditions"][2]
     condition["right_bar_interval"] = "1d"
     condition["right_bollinger_period"] = 401
@@ -1138,6 +1145,7 @@ def test_managed_block_limits_daily_history_to_one_period_request() -> None:
 
 def test_managed_block_rejects_history_windows_larger_than_the_adapter_bound() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["sell_rule_tree"] = None
     condition = payload["sell_condition_groups"][0]["conditions"][2]
     condition["right_bar_interval"] = "30m"
     try:
@@ -1289,6 +1297,7 @@ def test_managed_block_stops_after_the_first_matching_or_condition() -> None:
 def test_managed_block_does_not_require_bars_for_account_only_conditions() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
     payload["buy_condition_groups"] = []
+    payload["sell_rule_tree"] = None
     payload["sell_condition_groups"] = [{
         "id": "account-only",
         "conditions": [BlockTradeCondition(
@@ -1307,6 +1316,7 @@ def test_managed_block_does_not_require_bars_for_account_only_conditions() -> No
 def test_managed_block_treats_profit_rate_as_live_account_data() -> None:
     payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
     payload["buy_condition_groups"] = []
+    payload["sell_rule_tree"] = None
     payload["sell_condition_groups"] = [{
         "id": "profit-only",
         "conditions": [BlockTradeCondition(
@@ -1483,6 +1493,13 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         static_script = client.get("/static/app.js")
         assert static_script.status_code == 200
         assert static_script.headers["cache-control"] == "no-store, max-age=0"
+        static_page = client.get("/")
+        assert static_page.status_code == 200
+        assert 'id="update-available-button"' in static_page.text
+        assert "function renderUpdateResult(result)" in static_script.text
+        assert "async function checkForStartupUpdate()" in static_script.text
+        assert "void checkForStartupUpdate();" in static_script.text
+        assert 'openSettings("general")' in static_script.text
         assert "사용자 Python 로직" not in static_script.text
         assert "blockPackageFields" in static_script.text
         assert "/api/block-options/conditions" in static_script.text

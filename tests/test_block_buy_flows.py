@@ -45,6 +45,52 @@ def condition_group(identifier="price", *, value="100", interval="3m", operator=
     }
 
 
+def nested_action_tree(identifier: str, order_type: str) -> dict:
+    return {
+        "kind": "logic",
+        "id": f"{identifier}-root",
+        "operator": "ALL",
+        "children": [{
+            "kind": "logic",
+            "id": f"{identifier}-choice",
+            "operator": "ANY",
+            "children": [{
+                "kind": "condition",
+                "id": f"{identifier}-condition",
+                "condition": BlockTradeCondition(
+                    left="close", operator="GT", right="value", value=Decimal("100"),
+                ).model_dump(mode="json"),
+                "action": {
+                    "kind": "order",
+                    "id": f"{identifier}-order",
+                    "side": "BUY",
+                    "order_type": order_type,
+                },
+            }],
+            "action": None,
+        }],
+        "action": None,
+    }
+
+
+def buy_order_event(client_order_id: str, status: OrderStatus):
+    request = OrderRequest(
+        instrument=InstrumentId("005930"),
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("2"),
+        client_order_id=client_order_id,
+        route=OrderRoute.KRX,
+    )
+    return SimpleNamespace(
+        client_order_id=client_order_id,
+        request=request,
+        status=status,
+        submitted_at=at("09:30:00"),
+        provider_order_id="broker-buy-1",
+    )
+
+
 def flow(identifier="early", **changes):
     values = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
     result = {key: values[key] for key in (
@@ -65,6 +111,11 @@ def flow(identifier="early", **changes):
 
 def settings_for(flows, **changes):
     values = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    if "sell_condition_groups" in changes and "sell_rule_tree" not in changes:
+        # Construct an actual legacy-groups payload.  The current bundled
+        # default already carries its migrated tree, which would otherwise be
+        # the intentional source of truth and mask the groups changed below.
+        values["sell_rule_tree"] = None
     values.update(
         strategy_id="shared-flows", trading_account="test-account",
         condition_source="test-api", hts_user_id="test-hts",
@@ -411,6 +462,207 @@ def test_existing_holdings_or_pending_orders_are_shared_between_flows(pending):
     assert harness.strategy.config.limits.max_exposure == Decimal("150000")
 
 
+def test_acknowledged_buy_stays_reserved_across_nested_flows_and_snapshot_delay():
+    harness = Harness(settings_for([
+        flow(
+            "early", condition_id="1", buy_start_time="09:00", buy_end_time="15:00",
+            buy_condition_groups=[], buy_rule_tree=nested_action_tree("market", "MARKET"),
+        ),
+        flow(
+            "other", condition_id="1", buy_start_time="09:00", buy_end_time="15:00",
+            buy_condition_groups=[], buy_rule_tree=nested_action_tree("limit", "LIMIT"),
+        ),
+    ]))
+
+    async def acknowledged_without_broker_snapshot(**kwargs):
+        harness.order_calls.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED, message="")
+
+    harness.ctx.orders.market_buy = acknowledged_without_broker_snapshot
+    harness.ctx.orders.limit_buy = acknowledged_without_broker_snapshot
+
+    async def exercise():
+        await harness.tick("early", scheduled_at=at("09:30:00"))
+        harness.now = at("09:30:30")
+        await harness.tick("other", scheduled_at=harness.now)
+        assert len(harness.order_calls) == 1
+        assert harness.strategy._buy_submit_pending == {"005930"}
+
+        # Empty balance/open-order snapshots are not terminal evidence. The
+        # code-level reservation must survive well beyond one scan interval.
+        harness.now = at("09:35:00")
+        await harness.tick("other", scheduled_at=harness.now)
+
+    asyncio.run(exercise())
+
+    assert len(harness.order_calls) == 1
+    reservation = harness.ctx.state.get("pending_buy_submissions")["005930"]
+    assert reservation == {
+        "client_order_id": "target-005930-20261020093000-buy",
+        "status": OrderStatus.ACKNOWLEDGED.value,
+        "quantity": "2",
+        "order_type": "MARKET",
+        "price": None,
+        "route": str(harness.order_calls[0]["route"]),
+        "submitted_at": at("09:30:00").isoformat(),
+        "provider_order_id": "",
+    }
+
+
+def test_broker_buy_order_disappearance_does_not_release_reservation():
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+
+    async def acknowledged_without_broker_snapshot(**kwargs):
+        harness.order_calls.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED, message="")
+
+    harness.ctx.orders.market_buy = acknowledged_without_broker_snapshot
+
+    async def exercise():
+        await harness.tick(scheduled_at=at("09:30:00"))
+        harness.pending_orders.append(SimpleNamespace(
+            instrument=SimpleNamespace(code="005930"),
+            remaining_quantity=Decimal("2"),
+            side=SimpleNamespace(value="BUY"),
+            status=OrderStatus.ACKNOWLEDGED,
+            provider_order_id="broker-buy-1",
+        ))
+        harness.now = at("09:30:30")
+        await harness.tick(scheduled_at=harness.now)
+
+        # The broker order disappears before the balance snapshot catches up.
+        # Its absence alone cannot be interpreted as cancellation.
+        harness.pending_orders.clear()
+        harness.now = at("09:35:00")
+        await harness.tick(scheduled_at=harness.now)
+        assert len(harness.order_calls) == 1
+
+    asyncio.run(exercise())
+
+    assert len(harness.order_calls) == 1
+    reservation = harness.ctx.state.get("pending_buy_submissions")["005930"]
+    assert reservation["provider_order_id"] == "broker-buy-1"
+
+
+def test_visible_position_clears_buy_reservation_and_keeps_symbol_blocked():
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+
+    async def acknowledged_without_broker_snapshot(**kwargs):
+        harness.order_calls.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED, message="")
+
+    harness.ctx.orders.market_buy = acknowledged_without_broker_snapshot
+
+    async def exercise():
+        await harness.tick(scheduled_at=at("09:30:00"))
+        harness.positions["005930"] = SimpleNamespace(
+            instrument=SimpleNamespace(code="005930"),
+            quantity=Decimal("2"), strategy_quantity=Decimal("2"),
+            available_quantity=Decimal("2"), average_price=Decimal("25000"),
+        )
+        harness.now = at("09:30:30")
+        await harness.tick(scheduled_at=harness.now)
+
+    asyncio.run(exercise())
+    assert len(harness.order_calls) == 1
+    assert harness.ctx.state.get("pending_buy_submissions") == {}
+    assert harness.ctx.state.get("strategy_positions") == {"005930": "2"}
+
+
+def test_acknowledged_buy_reservation_survives_strategy_restart():
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+
+    async def acknowledged_without_broker_snapshot(**kwargs):
+        harness.order_calls.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED, message="")
+
+    harness.ctx.orders.market_buy = acknowledged_without_broker_snapshot
+
+    async def exercise():
+        await harness.tick(scheduled_at=at("09:30:00"))
+        reservation = dict(harness.ctx.state.get("pending_buy_submissions"))
+
+        # Model a worker restart while both broker snapshots still lag.
+        harness.strategy = harness.namespace["ManagedBlockStrategy"]()
+        harness.now = at("09:32:00")
+        await harness.tick(scheduled_at=harness.now)
+
+        assert harness.ctx.state.get("pending_buy_submissions") == reservation
+
+    asyncio.run(exercise())
+    assert len(harness.order_calls) == 1
+
+
+@pytest.mark.parametrize("status", [
+    OrderStatus.ACKNOWLEDGED,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.CANCEL_PENDING,
+    OrderStatus.UNKNOWN_RECONCILING,
+    OrderStatus.FILLED,
+])
+def test_nonterminal_or_fill_buy_events_keep_reservation_until_position_is_visible(status):
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+
+    async def acknowledged_without_broker_snapshot(**kwargs):
+        harness.order_calls.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED, message="")
+
+    harness.ctx.orders.market_buy = acknowledged_without_broker_snapshot
+
+    async def exercise():
+        await harness.tick(scheduled_at=at("09:30:00"))
+        client_order_id = harness.order_calls[0]["client_order_id"]
+        await harness.strategy.on_order(
+            harness.ctx, buy_order_event(client_order_id, status),
+        )
+        harness.now = at("09:35:00")
+        await harness.tick(scheduled_at=harness.now)
+
+    asyncio.run(exercise())
+    assert len(harness.order_calls) == 1
+    assert harness.ctx.state.get("pending_buy_submissions")["005930"]["status"] == status.value
+
+
+def test_only_matching_terminal_buy_event_releases_reservation():
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+
+    async def acknowledged_without_broker_snapshot(**kwargs):
+        harness.order_calls.append(kwargs)
+        return SimpleNamespace(status=OrderStatus.ACKNOWLEDGED, message="")
+
+    harness.ctx.orders.market_buy = acknowledged_without_broker_snapshot
+
+    async def exercise():
+        await harness.tick(scheduled_at=at("09:30:00"))
+        client_order_id = harness.order_calls[0]["client_order_id"]
+
+        await harness.strategy.on_order(
+            harness.ctx, buy_order_event("older-buy-order", OrderStatus.CANCELLED),
+        )
+        assert "005930" in harness.ctx.state.get("pending_buy_submissions")
+
+        await harness.strategy.on_order(
+            harness.ctx, buy_order_event(client_order_id, OrderStatus.CANCELLED),
+        )
+        assert harness.ctx.state.get("pending_buy_submissions") == {}
+
+        harness.now = at("09:32:00")
+        await harness.tick(scheduled_at=harness.now)
+
+    asyncio.run(exercise())
+    assert len(harness.order_calls) == 2
+
+
 def test_overlapping_flows_share_the_same_tick_buy_limit():
     harness = Harness(settings_for([
         flow(buy_end_time="15:00"), flow("midday", buy_start_time="09:00"),
@@ -461,9 +713,12 @@ def test_rejected_submission_is_not_retried_by_an_overlapping_flow_in_same_tick(
 
     async def exercise():
         await asyncio.gather(harness.tick("early"), harness.tick("midday"))
+        assert harness.ctx.state.get("pending_buy_submissions") == {}
+        harness.now = at("09:30:30")
+        await harness.tick("early", scheduled_at=harness.now)
 
     asyncio.run(exercise())
-    assert len(attempts) == 1
+    assert len(attempts) == 2
 
 
 def test_aftermarket_market_buy_is_skipped_and_excluded_before_submission():

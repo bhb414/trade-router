@@ -298,6 +298,117 @@ class BlockConditionGroup(BaseModel):
     conditions: list[BlockTradeCondition] = Field(min_length=1, max_length=20)
 
 
+class BlockOrderAction(BaseModel):
+    """One order selected after a condition branch matches.
+
+    Quantity and exposure remain strategy-level safety settings.  A branch only
+    chooses the side and order style so different branches can use market and
+    limit orders without duplicating the portfolio/risk configuration.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["order"] = "order"
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
+    side: Literal["BUY", "SELL"]
+    order_type: Literal["MARKET", "LIMIT"] = "MARKET"
+
+
+class BlockConditionNode(BaseModel):
+    """A comparison leaf in a recursive condition/action tree."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["condition"] = "condition"
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
+    condition: BlockTradeCondition
+    action: BlockOrderAction | None = None
+
+
+class BlockLogicNode(BaseModel):
+    """A parenthesized ALL/ANY group with an optional fallback action."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["logic"] = "logic"
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
+    operator: Literal["ALL", "ANY"] = "ALL"
+    children: list["BlockRuleNode"] = Field(default_factory=list, max_length=20)
+    action: BlockOrderAction | None = None
+
+
+BlockRuleNode = Annotated[
+    BlockConditionNode | BlockLogicNode,
+    Field(discriminator="kind"),
+]
+BlockLogicNode.model_rebuild(_types_namespace={"BlockRuleNode": BlockRuleNode})
+
+
+def _rule_tree_nodes(
+    node: BlockRuleNode,
+    *,
+    depth: int = 0,
+) -> tuple[list[BlockRuleNode], list[BlockTradeCondition], list[BlockOrderAction], int]:
+    """Flatten a rule tree for validation and capability discovery."""
+
+    nodes: list[BlockRuleNode] = [node]
+    conditions: list[BlockTradeCondition] = []
+    actions: list[BlockOrderAction] = []
+    if node.action is not None:
+        actions.append(node.action)
+    if isinstance(node, BlockConditionNode):
+        conditions.append(node.condition)
+        return nodes, conditions, actions, depth
+    maximum_depth = depth
+    for child in node.children:
+        child_nodes, child_conditions, child_actions, child_depth = _rule_tree_nodes(
+            child, depth=depth + 1,
+        )
+        nodes.extend(child_nodes)
+        conditions.extend(child_conditions)
+        actions.extend(child_actions)
+        maximum_depth = max(maximum_depth, child_depth)
+    return nodes, conditions, actions, maximum_depth
+
+
+def _validate_rule_tree(
+    tree: BlockLogicNode | None,
+    *,
+    side: Literal["BUY", "SELL"],
+) -> None:
+    if tree is None:
+        return
+    nodes, conditions, actions, depth = _rule_tree_nodes(tree)
+    if depth > 8:
+        raise ValueError("조건 계층은 최대 8단계까지 중첩할 수 있습니다.")
+    if len(nodes) > 100:
+        raise ValueError("조건 계층은 최대 100개 블록까지 사용할 수 있습니다.")
+    node_ids = [node.id for node in nodes]
+    if len(node_ids) != len(set(node_ids)):
+        raise ValueError("같은 조건 계층의 블록 ID는 서로 달라야 합니다.")
+    action_ids = [action.id for action in actions]
+    if len(action_ids) != len(set(action_ids)):
+        raise ValueError("같은 조건 계층의 주문 행동 ID는 서로 달라야 합니다.")
+    if any(action.side != side for action in actions):
+        label = "매수" if side == "BUY" else "매도"
+        raise ValueError(f"{label} 흐름에는 {label} 주문 행동만 넣을 수 있습니다.")
+    if any(
+        isinstance(node, BlockLogicNode) and not node.children and node is not tree
+        for node in nodes
+    ):
+        raise ValueError("조건 계층 안의 그룹은 비워 둘 수 없습니다.")
+    for node in nodes:
+        if not isinstance(node, BlockLogicNode) or node.operator != "ALL":
+            continue
+        actionable_children = sum(
+            bool(_rule_tree_nodes(child)[2]) for child in node.children
+        )
+        if actionable_children > 1:
+            raise ValueError(
+                "AND 그룹에서는 하나의 하위 분기에만 주문 행동을 둘 수 있습니다. "
+                "여러 주문 행동은 OR 분기로 나누거나 AND 그룹 자체의 행동으로 설정하세요."
+            )
+    if side == "SELL" and not conditions:
+        raise ValueError("매도 조건 계층에는 하나 이상의 조건이 필요합니다.")
+
+
 def _legacy_condition_groups(
     conditions: list[object] | tuple[object, ...],
     logic: object,
@@ -364,6 +475,49 @@ def _embed_condition_calculations(
     return normalized
 
 
+def _legacy_rule_tree_payload(
+    groups: object,
+    *,
+    side: Literal["BUY", "SELL"],
+    order_type: Literal["MARKET", "LIMIT"],
+) -> dict[str, object]:
+    """Convert the former outer-AND/inner-OR representation to a rule tree."""
+
+    side_key = side.lower()
+    children: list[dict[str, object]] = []
+    for group_index, raw_group in enumerate(list(groups or []), start=1):
+        group = _condition_mapping(raw_group)
+        children.append({
+            "kind": "logic",
+            "id": f"legacy-{side_key}-group-{group_index}",
+            "operator": "ANY",
+            "children": [
+                {
+                    "kind": "condition",
+                    "id": f"legacy-{side_key}-condition-{group_index}-{condition_index}",
+                    "condition": _condition_mapping(condition),
+                    "action": None,
+                }
+                for condition_index, condition in enumerate(
+                    list(group.get("conditions") or []), start=1,
+                )
+            ],
+            "action": None,
+        })
+    return {
+        "kind": "logic",
+        "id": f"legacy-{side_key}-root",
+        "operator": "ALL",
+        "children": children,
+        "action": {
+            "kind": "order",
+            "id": f"legacy-{side_key}-order",
+            "side": side,
+            "order_type": order_type,
+        },
+    }
+
+
 class BlockBuyFlow(BaseModel):
     """A timed discovery and condition branch; ownership and risk stay shared."""
 
@@ -383,6 +537,7 @@ class BlockBuyFlow(BaseModel):
     buy_start_time: str = "09:00"
     buy_end_time: str = "15:00"
     buy_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
+    buy_rule_tree: BlockLogicNode | None = None
 
     _validate_times = field_validator("buy_start_time", "buy_end_time")(_validate_clock)
 
@@ -398,6 +553,7 @@ class BlockBuyFlow(BaseModel):
         identifiers = [group.id for group in self.buy_condition_groups]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("같은 매수 흐름의 조건 블록 ID는 서로 달라야 합니다.")
+        _validate_rule_tree(self.buy_rule_tree, side="BUY")
         return self
 
 
@@ -410,9 +566,8 @@ class BlockSellFlow(BaseModel):
     sell_scan_seconds: int = Field(default=30, ge=1, le=86_400)
     sell_start_time: str = "09:00"
     sell_end_time: str = "15:20"
-    sell_condition_groups: list[BlockConditionGroup] = Field(
-        min_length=1, max_length=8
-    )
+    sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
+    sell_rule_tree: BlockLogicNode | None = None
 
     _validate_times = field_validator("sell_start_time", "sell_end_time")(
         _validate_clock
@@ -424,9 +579,12 @@ class BlockSellFlow(BaseModel):
             self.sell_end_time
         ):
             raise ValueError("매도 흐름의 시작 시간은 종료 시간보다 빨라야 합니다.")
+        if self.sell_rule_tree is None and not self.sell_condition_groups:
+            raise ValueError("매도 흐름에는 조건 계층이나 기존 조건 블록이 필요합니다.")
         identifiers = [group.id for group in self.sell_condition_groups]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("같은 매도 흐름의 조건 블록 ID는 서로 달라야 합니다.")
+        _validate_rule_tree(self.sell_rule_tree, side="SELL")
         return self
 
 
@@ -466,8 +624,10 @@ class ConditionBollingerBlockSettings(BaseModel):
         max_length=20,
     )
     buy_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
+    buy_rule_tree: BlockLogicNode | None = None
     buy_flows: list[BlockBuyFlow] = Field(default_factory=list, max_length=8)
-    sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, min_length=1, max_length=8)
+    sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
+    sell_rule_tree: BlockLogicNode | None = None
     sell_flows: list[BlockSellFlow] = Field(default_factory=list, max_length=8)
     buy_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
     sell_order_type: Literal["MARKET", "LIMIT"] = "MARKET"
@@ -524,6 +684,54 @@ class ConditionBollingerBlockSettings(BaseModel):
         values["sell_condition_groups"] = _embed_condition_calculations(
             values.get("sell_condition_groups"), prefix="sell", common=common
         )
+        buy_order_type = str(values.get("buy_order_type") or "MARKET")
+        sell_order_type = str(values.get("sell_order_type") or "MARKET")
+        # Presence of a tree makes it authoritative, even when it originated
+        # from an earlier migration and still has ``legacy-*`` IDs.  This is
+        # essential for round-tripping edits: compatibility groups must never
+        # silently overwrite an explicitly supplied tree.
+        if values.get("buy_rule_tree") is None:
+            values["buy_rule_tree"] = _legacy_rule_tree_payload(
+                values.get("buy_condition_groups"),
+                side="BUY",
+                order_type=buy_order_type,
+            )
+        if values.get("sell_condition_groups") and values.get("sell_rule_tree") is None:
+            values["sell_rule_tree"] = _legacy_rule_tree_payload(
+                values.get("sell_condition_groups"),
+                side="SELL",
+                order_type=sell_order_type,
+            )
+
+        migrated_buy_flows: list[dict[str, object]] = []
+        for raw_flow in list(values.get("buy_flows") or []):
+            flow = _condition_mapping(raw_flow)
+            flow["buy_condition_groups"] = _embed_condition_calculations(
+                flow.get("buy_condition_groups"), prefix="buy", common=common
+            )
+            if flow.get("buy_rule_tree") is None:
+                flow["buy_rule_tree"] = _legacy_rule_tree_payload(
+                    flow.get("buy_condition_groups"),
+                    side="BUY",
+                    order_type=buy_order_type,
+                )
+            migrated_buy_flows.append(flow)
+        values["buy_flows"] = migrated_buy_flows
+
+        migrated_sell_flows: list[dict[str, object]] = []
+        for raw_flow in list(values.get("sell_flows") or []):
+            flow = _condition_mapping(raw_flow)
+            flow["sell_condition_groups"] = _embed_condition_calculations(
+                flow.get("sell_condition_groups"), prefix="sell", common=common
+            )
+            if flow.get("sell_condition_groups") and flow.get("sell_rule_tree") is None:
+                flow["sell_rule_tree"] = _legacy_rule_tree_payload(
+                    flow.get("sell_condition_groups"),
+                    side="SELL",
+                    order_type=sell_order_type,
+                )
+            migrated_sell_flows.append(flow)
+        values["sell_flows"] = migrated_sell_flows
         return values
 
     @field_validator("bar_interval")
@@ -557,16 +765,48 @@ class ConditionBollingerBlockSettings(BaseModel):
         sell_flow_identifiers = [flow.id for flow in self.sell_flows]
         if len(sell_flow_identifiers) != len(set(sell_flow_identifiers)):
             raise ValueError("매도 흐름 ID는 서로 달라야 합니다.")
-        all_buy_groups = [*self.buy_condition_groups, *(
-            group for flow in self.buy_flows for group in flow.buy_condition_groups
-        )]
+        if not self.sell_flows and self.sell_rule_tree is None:
+            raise ValueError("매도 조건 계층이나 매도 흐름이 필요합니다.")
+        _validate_rule_tree(self.buy_rule_tree, side="BUY")
+        _validate_rule_tree(self.sell_rule_tree, side="SELL")
+        all_buy_groups = [
+            *(self.buy_condition_groups if self.buy_rule_tree is None else ()),
+            *(
+                group
+                for flow in self.buy_flows
+                if flow.buy_rule_tree is None
+                for group in flow.buy_condition_groups
+            ),
+        ]
+        all_buy_trees = [tree for tree in (
+            self.buy_rule_tree,
+            *(flow.buy_rule_tree for flow in self.buy_flows),
+        ) if tree is not None]
         effective_sell_groups = (
-            [group for flow in self.sell_flows for group in flow.sell_condition_groups]
+            [
+                group
+                for flow in self.sell_flows
+                if flow.sell_rule_tree is None
+                for group in flow.sell_condition_groups
+            ]
             if self.sell_flows
-            else list(self.sell_condition_groups)
+            else list(self.sell_condition_groups if self.sell_rule_tree is None else ())
         )
+        effective_sell_trees = [tree for tree in (
+            self.sell_rule_tree,
+            *(flow.sell_rule_tree for flow in self.sell_flows),
+        ) if tree is not None]
         for group in all_buy_groups:
             for condition in group.conditions:
+                if any(
+                    metric.metric in position_only_metrics
+                    for metric in _condition_metric_leaves(condition)
+                ):
+                    raise ValueError(
+                        "매수 조건에서는 보유 후에만 생기는 평균 매수가·수익률을 사용할 수 없습니다."
+                    )
+        for tree in all_buy_trees:
+            for condition in _rule_tree_nodes(tree)[1]:
                 if any(
                     metric.metric in position_only_metrics
                     for metric in _condition_metric_leaves(condition)
@@ -577,9 +817,12 @@ class ConditionBollingerBlockSettings(BaseModel):
         identifiers = [group.id for group in (*self.buy_condition_groups, *self.sell_condition_groups)]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("매수·매도 조건 블록 ID는 서로 달라야 합니다.")
-        for group in (*all_buy_groups, *effective_sell_groups):
-            for condition in group.conditions:
-                for source in _condition_metric_leaves(condition):
+        effective_conditions = [
+            *(condition for group in (*all_buy_groups, *effective_sell_groups) for condition in group.conditions),
+            *(condition for tree in (*all_buy_trees, *effective_sell_trees) for condition in _rule_tree_nodes(tree)[1]),
+        ]
+        for condition in effective_conditions:
+            for source in _condition_metric_leaves(condition):
                     metric = source.metric
                     if metric in {"average_price", "profit_rate"}:
                         continue
@@ -804,8 +1047,10 @@ BUY_CONDITIONS_JSON = __BUY_CONDITIONS_JSON__
 SELL_CONDITION_LOGIC = __SELL_CONDITION_LOGIC__
 SELL_CONDITIONS_JSON = __SELL_CONDITIONS_JSON__
 BUY_CONDITION_GROUPS_JSON = __BUY_CONDITION_GROUPS_JSON__
+BUY_RULE_TREE_JSON = __BUY_RULE_TREE_JSON__
 BUY_FLOWS_JSON = __BUY_FLOWS_JSON__
 SELL_CONDITION_GROUPS_JSON = __SELL_CONDITION_GROUPS_JSON__
+SELL_RULE_TREE_JSON = __SELL_RULE_TREE_JSON__
 SELL_FLOWS_JSON = __SELL_FLOWS_JSON__
 BUY_ORDER_TYPE = __BUY_ORDER_TYPE__
 SELL_ORDER_TYPE = __SELL_ORDER_TYPE__
@@ -828,8 +1073,10 @@ BUY_CONDITIONS = tuple(json.loads(BUY_CONDITIONS_JSON))
 SELL_CONDITIONS = tuple(json.loads(SELL_CONDITIONS_JSON))
 BUY_CONDITION_GROUPS = tuple(json.loads(BUY_CONDITION_GROUPS_JSON))
 SELL_CONDITION_GROUPS = tuple(json.loads(SELL_CONDITION_GROUPS_JSON))
+BUY_RULE_TREE = json.loads(BUY_RULE_TREE_JSON)
+SELL_RULE_TREE = json.loads(SELL_RULE_TREE_JSON)
 CONFIGURED_BUY_FLOWS = tuple(json.loads(BUY_FLOWS_JSON))
-BUY_FLOWS = CONFIGURED_BUY_FLOWS or ({
+RAW_BUY_FLOWS = CONFIGURED_BUY_FLOWS or ({
     "id": "default", "name": "매수 흐름", "target_source": TARGET_SOURCE,
     "hts_user_id": HTS_USER_ID, "condition_id": CONDITION_ID,
     "expected_condition_name": EXPECTED_CONDITION_NAME,
@@ -837,19 +1084,68 @@ BUY_FLOWS = CONFIGURED_BUY_FLOWS or ({
     "ranking_market": RANKING_MARKET, "ranking_limit": RANKING_LIMIT,
     "symbols": SYMBOLS, "buy_scan_seconds": BUY_SCAN_SECONDS,
     "buy_start_time": BUY_START_TIME, "buy_end_time": BUY_END_TIME,
-    "buy_condition_groups": BUY_CONDITION_GROUPS,
+    "buy_condition_groups": BUY_CONDITION_GROUPS, "buy_rule_tree": BUY_RULE_TREE,
 },)
+CONFIGURED_SELL_FLOWS = tuple(json.loads(SELL_FLOWS_JSON))
+RAW_SELL_FLOWS = CONFIGURED_SELL_FLOWS or ({
+    "id": "default", "name": "매도 흐름",
+    "sell_scan_seconds": BUY_SCAN_SECONDS,
+    "sell_start_time": SELL_START_TIME, "sell_end_time": SELL_END_TIME,
+    "sell_condition_groups": SELL_CONDITION_GROUPS, "sell_rule_tree": SELL_RULE_TREE,
+},)
+
+
+def _legacy_rule_tree(groups, side, order_type):
+    """Adapt the former outer-AND/inner-OR layout without changing exports."""
+    side_key = side.lower()
+    children = []
+    for group_index, group in enumerate(groups, start=1):
+        children.append({
+            "kind": "logic",
+            "id": f"legacy-{side_key}-group-{group_index}",
+            "operator": "ANY",
+            "children": [
+                {
+                    "kind": "condition",
+                    "id": f"legacy-{side_key}-condition-{group_index}-{condition_index}",
+                    "condition": condition,
+                    "action": None,
+                }
+                for condition_index, condition in enumerate(group["conditions"], start=1)
+            ],
+            "action": None,
+        })
+    return {
+        "kind": "logic",
+        "id": f"legacy-{side_key}-root",
+        "operator": "ALL",
+        "children": children,
+        "action": {
+            "kind": "order",
+            "id": f"legacy-{side_key}-order",
+            "side": side,
+            "order_type": order_type,
+        },
+    }
+
+
+def _effective_rule_flow(flow, side, order_type):
+    key = f"{side.lower()}_rule_tree"
+    groups_key = f"{side.lower()}_condition_groups"
+    tree = flow.get(key) or _legacy_rule_tree(flow.get(groups_key, ()), side, order_type)
+    return {**flow, key: tree}
+
+
+BUY_FLOWS = tuple(
+    _effective_rule_flow(flow, "BUY", BUY_ORDER_TYPE) for flow in RAW_BUY_FLOWS
+)
+SELL_FLOWS = tuple(
+    _effective_rule_flow(flow, "SELL", SELL_ORDER_TYPE) for flow in RAW_SELL_FLOWS
+)
 BUY_FLOW_SCHEDULES = {
     (f"condition-scan-{flow['id']}" if CONFIGURED_BUY_FLOWS else "condition-scan"): flow
     for flow in BUY_FLOWS
 }
-CONFIGURED_SELL_FLOWS = tuple(json.loads(SELL_FLOWS_JSON))
-SELL_FLOWS = CONFIGURED_SELL_FLOWS or ({
-    "id": "default", "name": "매도 흐름",
-    "sell_scan_seconds": BUY_SCAN_SECONDS,
-    "sell_start_time": SELL_START_TIME, "sell_end_time": SELL_END_TIME,
-    "sell_condition_groups": SELL_CONDITION_GROUPS,
-},)
 BAR_METRICS = {
     "open", "high", "low", "close", "volume",
     "heikin_open", "heikin_high", "heikin_low", "heikin_close",
@@ -882,14 +1178,26 @@ def _condition_metric_names(condition):
     return tuple(name for name in names if name)
 
 
+def _rule_conditions(node):
+    if not node:
+        return ()
+    if node.get("kind") == "condition":
+        condition = node.get("condition")
+        return (condition,) if condition else ()
+    return tuple(
+        condition
+        for child in node.get("children", ())
+        for condition in _rule_conditions(child)
+    )
+
+
 NEEDS_BARS = any(
     metric in BAR_METRICS
-    for groups in (
-        *[flow["buy_condition_groups"] for flow in BUY_FLOWS],
-        *[flow["sell_condition_groups"] for flow in SELL_FLOWS],
+    for tree in (
+        *[flow["buy_rule_tree"] for flow in BUY_FLOWS],
+        *[flow["sell_rule_tree"] for flow in SELL_FLOWS],
     )
-    for group in groups
-    for condition in group["conditions"]
+    for condition in _rule_conditions(tree)
     for metric in _condition_metric_names(condition)
 )
 DISCOVERY_CAPABILITIES = tuple(dict.fromkeys(
@@ -1581,6 +1889,103 @@ class ManagedBlockStrategy(Strategy):
             matched_groups.append(matched)
         return True, matched_groups
 
+    async def _rule_tree_result(
+        self, ctx, code, tree, *, average_price=None, current_price=None, side,
+    ):
+        """Evaluate a parenthesized rule tree and select one branch action.
+
+        ANY is ordered like an if/elif chain: the first true child wins.  ALL
+        requires every child and keeps the first child action, falling back to
+        the group's own action.  Evaluation is side-effect free; callers submit
+        at most one selected order after account and duplicate-order checks.
+        """
+        if not tree:
+            return False, [], None
+        bars_by_request = {}
+        fetched_counts = {}
+        conditions = _rule_conditions(tree)
+        needs_current_price = any(
+            "profit_rate" in _condition_metric_names(condition)
+            for condition in conditions
+        )
+        if needs_current_price and current_price is None:
+            try:
+                current_price = await self._current_price(ctx, code)
+            except RouterError as exc:
+                ctx.log.warning(
+                    f"{self._instrument_label(ctx, code)} {side} 실시간 수익률 조회 실패 "
+                    f"[{exc.code.value}]: {exc.message}"
+                )
+
+        async def evaluate(node, depth=0):
+            if node.get("kind") == "condition":
+                condition = node["condition"]
+                for key, required in self._condition_requests(condition).items():
+                    if fetched_counts.get(key, 0) >= required:
+                        continue
+                    try:
+                        bars_by_request[key] = await self._condition_history(
+                            ctx, code, key, required,
+                            existing=bars_by_request.get(key, ()),
+                        )
+                        fetched_counts[key] = required
+                    except RouterError as exc:
+                        bars_by_request[key] = ()
+                        fetched_counts[key] = required
+                        ctx.log.warning(
+                            f"{self._instrument_label(ctx, code)} {side} 조건 자료 조회 실패 "
+                            f"[{exc.code.value}]: {exc.message}"
+                        )
+                matched = self._condition_matches(
+                    condition, bars_by_request, average_price, current_price,
+                )
+                return (
+                    matched,
+                    [condition] if matched else [],
+                    node.get("action") if matched else None,
+                )
+
+            children = node.get("children", ())
+            if not children:
+                # An empty ALL would be vacuously true.  That is useful only
+                # for the legacy/direct-buy form (condition-search results are
+                # bought without an extra indicator filter).  In every other
+                # position, especially SELL, fail closed so deleting the last
+                # condition can never become an unconditional order.
+                action = node.get("action")
+                if depth == 0 and action and action.get("side") == "BUY":
+                    return True, [], action
+                return False, [], None
+
+            operator = node.get("operator", "ALL")
+            if operator == "ANY":
+                for child in children:
+                    matched, branch_conditions, branch_action = await evaluate(
+                        child, depth + 1,
+                    )
+                    if matched:
+                        return (
+                            True,
+                            branch_conditions,
+                            branch_action or node.get("action"),
+                        )
+                return False, [], None
+
+            matched_conditions = []
+            selected_action = None
+            for child in children:
+                matched, branch_conditions, branch_action = await evaluate(
+                    child, depth + 1,
+                )
+                if not matched:
+                    return False, [], None
+                matched_conditions.extend(branch_conditions)
+                if selected_action is None and branch_action is not None:
+                    selected_action = branch_action
+            return True, matched_conditions, selected_action or node.get("action")
+
+        return await evaluate(tree)
+
     @classmethod
     def _expression_summary(cls, expression):
         if expression.get("kind") == "constant":
@@ -1625,6 +2030,111 @@ class ManagedBlockStrategy(Strategy):
             self._live_sell_pending = set()
         if not hasattr(self, "_live_sell_recheck_at"):
             self._live_sell_recheck_at = {}
+        if not hasattr(self, "_buy_submit_pending"):
+            self._buy_submit_pending = set()
+
+    def _load_buy_submit_pending(self, ctx):
+        """Load restart-safe buy reservations and refresh the in-memory index."""
+        self._ensure_live_state()
+        stored = ctx.state.get("pending_buy_submissions", {})
+        records = {
+            str(code): dict(record)
+            for code, record in stored.items()
+            if isinstance(code, str) and isinstance(record, dict)
+        } if isinstance(stored, dict) else {}
+        for code, record in tuple(records.items()):
+            if not str(record.get("client_order_id") or ""):
+                records.pop(code, None)
+        self._buy_submit_pending = set(records)
+        return records
+
+    def _save_buy_submit_pending(self, ctx, records):
+        self._buy_submit_pending = set(records)
+        ctx.state.set("pending_buy_submissions", records)
+
+    def _mark_buy_submit_pending(
+        self, ctx, code, *, client_order_id=None, status=None, at=None,
+        quantity=None, order_type=None, price=None, route=None,
+        provider_order_id=None, replace=True,
+    ):
+        """Reserve a symbol while an accepted buy reaches broker snapshots."""
+        records = self._load_buy_submit_pending(ctx)
+        current = records.get(code)
+        current_id = str((current or {}).get("client_order_id") or "")
+        event_id = str(client_order_id or "")
+        if current is not None and current_id and event_id and current_id != event_id:
+            if not replace:
+                return False
+            current = None
+            current_id = ""
+        if not event_id and not current_id:
+            return False
+        now = at or datetime.now(SEOUL)
+        base = dict(current or {})
+        if order_type is not None:
+            stored_price = str(price) if price is not None else None
+        else:
+            stored_price = base.get("price")
+        records[code] = {
+            "client_order_id": event_id or current_id,
+            "status": str(status or base.get("status") or OrderStatus.SUBMITTING.value),
+            "quantity": str(quantity if quantity is not None else base.get("quantity") or ""),
+            "order_type": str(order_type or base.get("order_type") or ""),
+            "price": stored_price,
+            "route": str(route or base.get("route") or ""),
+            "submitted_at": str(base.get("submitted_at") or now.isoformat()),
+            "provider_order_id": str(
+                provider_order_id or base.get("provider_order_id") or ""
+            ),
+        }
+        self._save_buy_submit_pending(ctx, records)
+        return True
+
+    def _clear_buy_submit_pending(self, ctx, code, *, client_order_id=None):
+        records = self._load_buy_submit_pending(ctx)
+        current = records.get(code)
+        if current is None:
+            return False
+        current_id = str(current.get("client_order_id") or "")
+        event_id = str(client_order_id or "")
+        if not current_id or not event_id or current_id != event_id:
+            return False
+        records.pop(code, None)
+        self._save_buy_submit_pending(ctx, records)
+        return True
+
+    def _reconcile_buy_submit_pending(self, ctx, open_orders, positions):
+        """Reconcile restart-safe buy reservations with fresh broker snapshots."""
+        records = self._load_buy_submit_pending(ctx)
+        held_codes = {
+            code for code, position in positions.items() if position.quantity > 0
+        }
+        broker_orders = {
+            item.instrument.code: item
+            for item in open_orders
+            if item.remaining_quantity > 0 and item.side.value == "BUY"
+        }
+        for code in held_codes:
+            records.pop(code, None)
+        for code, item in broker_orders.items():
+            current = records.get(code)
+            if current is None:
+                continue
+            status = getattr(getattr(item, "status", None), "value", None)
+            records[code] = {
+                **current,
+                "status": str(status or current.get("status") or OrderStatus.ACKNOWLEDGED.value),
+                "provider_order_id": str(
+                    getattr(item, "provider_order_id", None)
+                    or current.get("provider_order_id")
+                    or ""
+                ),
+            }
+        # Absence from an open-order snapshot is not terminal evidence. Broker
+        # snapshots can lag both acknowledgement and balance updates, so keep
+        # the reservation until a held position or matching terminal event is
+        # observed.
+        self._save_buy_submit_pending(ctx, records)
 
     def _mark_live_sell_pending(self, code, *, at=None):
         """Reserve a symbol while a submitted sell reaches the broker ledger."""
@@ -1693,13 +2203,12 @@ class ManagedBlockStrategy(Strategy):
             condition, {}, average_price, current_price=current_price,
         )
 
-    def _matched_live_profit_condition(self, groups, current_price, average_price):
-        for group in groups:
-            for condition in group["conditions"]:
-                if self._is_live_profit_condition(condition) and self._live_profit_match(
-                    condition, current_price, average_price
-                ):
-                    return condition
+    def _matched_live_profit_condition(self, tree, current_price, average_price):
+        for condition in _rule_conditions(tree):
+            if self._is_live_profit_condition(condition) and self._live_profit_match(
+                condition, current_price, average_price
+            ):
+                return condition
         return None
 
     @staticmethod
@@ -1752,6 +2261,7 @@ class ManagedBlockStrategy(Strategy):
         self._ensure_live_state()
         positions = {item.instrument.code: item for item in balance.positions}
         tracked = self._sync_tracked_positions(ctx, balance)
+        self._reconcile_buy_submit_pending(ctx, open_orders, positions)
         desired = {
             code
             for code in tracked
@@ -1794,7 +2304,8 @@ class ManagedBlockStrategy(Strategy):
         )
 
     @staticmethod
-    def _buy_order_session_is_open(at):
+    def _buy_order_session_is_open(at, order_type=None):
+        order_type = order_type or BUY_ORDER_TYPE
         if ORDER_ROUTE != "NXT":
             return True
         local_time = at.astimezone(SEOUL).time().replace(tzinfo=None)
@@ -1802,7 +2313,7 @@ class ManagedBlockStrategy(Strategy):
             return True
         if time(9, 0, 30) <= local_time < time(15, 20):
             return True
-        after_open = time(15, 40) if BUY_ORDER_TYPE == "MARKET" else time(15, 30)
+        after_open = time(15, 40) if order_type == "MARKET" else time(15, 30)
         return after_open <= local_time < time(20, 0)
 
     @staticmethod
@@ -1838,15 +2349,13 @@ class ManagedBlockStrategy(Strategy):
         buy_sources = [
             source
             for flow in BUY_FLOWS
-            for group in flow["buy_condition_groups"]
-            for condition in group["conditions"]
+            for condition in _rule_conditions(flow["buy_rule_tree"])
             for source in self._condition_sources(condition)
         ]
         sell_sources = [
             source
             for flow in SELL_FLOWS
-            for group in flow["sell_condition_groups"]
-            for condition in group["conditions"]
+            for condition in _rule_conditions(flow["sell_rule_tree"])
             for source in self._condition_sources(condition)
         ]
         buy_source_text = ", ".join(dict.fromkeys(
@@ -1858,8 +2367,8 @@ class ManagedBlockStrategy(Strategy):
             for item in sell_sources
             if self._source_uses_bars(item)
         )) or "봉 계산 없음"
-        ctx.log.info(f"매수 조건 블록: {buy_source_text} · 블록 내부 OR / 블록 간 순차 AND")
-        ctx.log.info(f"매도 조건 블록: {sell_source_text} · 블록 내부 OR / 블록 간 순차 AND")
+        ctx.log.info(f"매수 조건 계층: {buy_source_text} · 괄호 계층의 ALL/ANY 순서로 판단")
+        ctx.log.info(f"매도 조건 계층: {sell_source_text} · 괄호 계층의 ALL/ANY 순서로 판단")
         for schedule_id, flow in BUY_FLOW_SCHEDULES.items():
             ctx.scheduler.every(
                 seconds=flow["buy_scan_seconds"],
@@ -1875,8 +2384,7 @@ class ManagedBlockStrategy(Strategy):
         for flow in SELL_FLOWS:
             flow_sources = [
                 source
-                for group in flow["sell_condition_groups"]
-                for condition in group["conditions"]
+                for condition in _rule_conditions(flow["sell_rule_tree"])
                 for source in self._condition_sources(condition)
             ]
             bar_sell_sources = [
@@ -1919,23 +2427,13 @@ class ManagedBlockStrategy(Strategy):
                         )
             ctx.log.info(
                 f"매도 흐름 {flow['name']}: {flow['sell_start_time']} 이상 · "
-                f"{flow['sell_end_time']} 미만 / 조건 블록 "
-                f"{len(flow['sell_condition_groups'])}개 · 보유종목·주문 공유"
+                f"{flow['sell_end_time']} 미만 / 조건 계층 · 보유종목·주문 공유"
             )
-        ctx.scheduler.daily_at(CLOSE_TIME, schedule_id="close-all")
-        ctx.scheduler.every(
-            seconds=30,
-            schedule_id="close-retry",
-            between=(CLOSE_RETRY_START, CLOSE_RETRY_END),
-            aligned=True,
-        )
-        ctx.scheduler.daily_at(CLOSE_CONFIRM_TIME, schedule_id="close-confirm")
 
         if any(
             self._is_live_profit_condition(condition)
             for flow in SELL_FLOWS
-            for group in flow["sell_condition_groups"]
-            for condition in group["conditions"]
+            for condition in _rule_conditions(flow["sell_rule_tree"])
         ):
             ctx.log.info("익절·손절: 실시간 현재가 WebSocket 기준으로 감시합니다.")
             try:
@@ -1946,13 +2444,6 @@ class ManagedBlockStrategy(Strategy):
                 ctx.log.warning(
                     f"실시간 익절·손절 초기화 보류 [{exc.code.value}]: {exc.message} · 다음 조회에서 재시도합니다."
                 )
-
-        now = datetime.now(SEOUL)
-        local_time = now.time().replace(tzinfo=None)
-        if time.fromisoformat(CLOSE_TIME) <= local_time < time.fromisoformat(CLOSE_RETRY_END):
-            await self._liquidate_owned_positions(ctx, now, reason="장 마감 청산 시각 이후 시작 보완")
-        elif time.fromisoformat(CLOSE_RETRY_END) <= local_time < time.fromisoformat(CLOSE_CONFIRM_TIME):
-            await self._liquidate_owned_positions(ctx, now, reason="장 종료 후 청산 결과 확인", submit_orders=False)
 
         conditions_by_user = {}
         for flow in BUY_FLOWS:
@@ -1998,137 +2489,10 @@ class ManagedBlockStrategy(Strategy):
         ctx.state.set("strategy_positions", tracked)
         return tracked
 
-    async def _liquidate_owned_positions(self, ctx, scheduled_at, *, reason, submit_orders=True):
-        try:
-            balance = await ctx.account.balance()
-            open_orders = await ctx.account.open_orders()
-        except RouterError as exc:
-            ctx.log.warning(f"청산 확인 보류 [{exc.code.value}]: {exc.message} · 다음 확인에서 재시도합니다.")
-            return
-        positions = {item.instrument.code: item for item in balance.positions}
-        pending_codes = {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
-        tracked = self._sync_tracked_positions(ctx, balance)
-        desired = {
-            code
-            for code in tracked
-            if code in positions and positions[code].quantity > 0
-        }
-        self._reconcile_live_sell_pending(open_orders, desired=desired)
-        for code in list(tracked):
-            position = positions.get(code)
-            if position is None or position.quantity <= 0:
-                tracked.pop(code, None)
-                ctx.state.set("strategy_positions", tracked)
-                continue
-            if position.strategy_quantity is not None and position.strategy_quantity <= 0:
-                tracked.pop(code, None)
-                ctx.state.set("strategy_positions", tracked)
-                continue
-            if code in pending_codes or code in self._live_sell_pending:
-                ctx.log.info(f"{self._instrument_label(ctx, code)} 청산 대기: 계좌에 미체결 주문이 있습니다.")
-                continue
-            if not submit_orders:
-                ctx.log.warning(f"{self._instrument_label(ctx, code)} 장 종료 후 잔여 확인: 전략 소유 {tracked[code]}주 · 실제 보유 {position.quantity}주")
-                continue
-            tracked_quantity = position.strategy_quantity if position.strategy_quantity is not None else Decimal(str(tracked[code]))
-            quantity = min(tracked_quantity, position.available_quantity)
-            if quantity <= 0:
-                continue
-            order_at = datetime.now(SEOUL)
-            if self._order_attempt_is_suppressed(
-                ctx, order_at, code, "SELL", SELL_ORDER_TYPE, purpose="CLOSE"
-            ):
-                continue
-            limit_price = None
-            try:
-                if SELL_ORDER_TYPE == "LIMIT":
-                    limit_price = await self._current_price(ctx, code)
-                route_at = datetime.now(SEOUL)
-                order_route = await self._effective_order_route(
-                    ctx, code, route_at, current_price=limit_price
-                )
-                order_at = datetime.now(SEOUL)
-                if self._order_session(order_at) != self._order_session(route_at):
-                    order_route = await self._effective_order_route(
-                        ctx, code, order_at, current_price=limit_price
-                    )
-                blocked_reason = self._order_session_block_reason(
-                    order_at, order_route, SELL_ORDER_TYPE
-                )
-                if blocked_reason:
-                    if self._suppress_order_for_day(
-                        ctx, order_at, code, "SELL", SELL_ORDER_TYPE, blocked_reason,
-                        purpose="CLOSE",
-                    ):
-                        ctx.log.warning(
-                            f"{self._instrument_label(ctx, code)} {reason} 건너뜀: {blocked_reason}"
-                        )
-                    continue
-                order_id = f"close-{code}-{order_at:%Y%m%d%H%M%S}-sell"
-                if SELL_ORDER_TYPE == "LIMIT":
-                    order = await ctx.orders.limit_sell(
-                        code=code, quantity=quantity, price=limit_price,
-                        route=order_route, client_order_id=order_id,
-                    )
-                else:
-                    order = await ctx.orders.market_sell(
-                        code=code, quantity=quantity, route=order_route,
-                        client_order_id=order_id,
-                    )
-            except RouterError as exc:
-                failure_at = datetime.now(SEOUL)
-                if self._is_non_retryable_sell_rejection(exc.message):
-                    if self._suppress_order_for_day(
-                        ctx, failure_at, code, "SELL", SELL_ORDER_TYPE, exc.message,
-                        purpose="CLOSE",
-                    ):
-                        ctx.log.error(
-                            f"{self._instrument_label(ctx, code)} 청산 중단 "
-                            f"[{exc.code.value}]: {exc.message} · 오늘 같은 주문은 다시 시도하지 않습니다."
-                        )
-                else:
-                    ctx.log.error(f"{self._instrument_label(ctx, code)} 청산 실패 [{exc.code.value}]: {exc.message}")
-                continue
-            if order.status is OrderStatus.REJECTED:
-                message = str(order.message or "")
-                if self._is_non_retryable_sell_rejection(message):
-                    if self._suppress_order_for_day(
-                        ctx, datetime.now(SEOUL), code, "SELL", SELL_ORDER_TYPE,
-                        message, purpose="CLOSE",
-                    ):
-                        ctx.log.error(
-                            f"{self._instrument_label(ctx, code)} 청산 중단: {message} · "
-                            "오늘 같은 주문은 다시 시도하지 않습니다."
-                        )
-                continue
-            if order.status is not OrderStatus.REJECTED:
-                self._mark_live_sell_pending(code)
-            price_text = f" {limit_price}원" if limit_price is not None else ""
-            ctx.log.info(
-                f"{self._instrument_label(ctx, code)} {reason} · 전략 소유 {quantity}주 "
-                f"{SELL_ORDER_TYPE}{price_text} 매도 요청: {order.status.value}"
-            )
-            if order.status is OrderStatus.FILLED:
-                tracked.pop(code, None)
-                ctx.state.set("strategy_positions", tracked)
-
     async def on_timer(self, ctx, event):
         sell_flow = getattr(self, "_sell_flow_schedules", {}).get(event.schedule_id)
         if sell_flow is not None:
             await self.on_bar(ctx, event)
-            return
-        if event.schedule_id in {"close-all", "close-retry", "close-confirm"}:
-            labels = {
-                "close-all": "장 마감 정시 전량 청산",
-                "close-retry": "장 마감 전량 청산 재확인",
-                "close-confirm": "장 종료 후 청산 결과 확인",
-            }
-            await self._liquidate_owned_positions(
-                ctx,
-                event.scheduled_at,
-                reason=labels[event.schedule_id],
-                submit_orders=event.schedule_id != "close-confirm",
-            )
             return
         flow = BUY_FLOW_SCHEDULES.get(event.schedule_id)
         if flow is None:
@@ -2141,7 +2505,14 @@ class ManagedBlockStrategy(Strategy):
     async def _scan_buy_flow(self, ctx, event, flow):
         def active():
             now = datetime.now(SEOUL)
-            return self._buy_flow_is_active(flow, event.scheduled_at, now) and self._buy_order_session_is_open(now)
+            # The branch action selects MARKET/LIMIT only after its conditions
+            # match.  Keep the scan alive for the union of both order windows,
+            # then apply the selected action's exact window below.  Using the
+            # legacy global BUY_ORDER_TYPE here would incorrectly skip a LIMIT
+            # branch during NXT's 15:30-15:40 limit-only window.
+            return self._buy_flow_is_active(
+                flow, event.scheduled_at, now
+            ) and self._buy_order_session_is_open(now, "LIMIT")
 
         if not active():
             return
@@ -2185,15 +2556,24 @@ class ManagedBlockStrategy(Strategy):
             if code in tracked:
                 ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 전략 소유 종목으로 추적 중입니다.")
                 continue
-            if flow["buy_condition_groups"]:
-                passed, _ = await self._condition_groups_result(
-                    ctx, code, flow["buy_condition_groups"], side=f"{flow['name']} 매수"
-                )
-                if not active():
-                    return
-                if not passed:
-                    ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 매수 조건 블록을 통과하지 못했습니다.")
-                    continue
+            if code in self._buy_submit_pending:
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 제출한 매수 주문의 계좌 반영을 기다리고 있습니다.")
+                continue
+            passed, matched_conditions, action = await self._rule_tree_result(
+                ctx, code, flow["buy_rule_tree"], side=f"{flow['name']} 매수"
+            )
+            if not active():
+                return
+            if not passed:
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 제외: 매수 조건 계층을 통과하지 못했습니다.")
+                continue
+            if action is None:
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매수 보류: 통과한 조건 계층에 주문 행동이 없습니다.")
+                continue
+            order_type = action["order_type"]
+            now = datetime.now(SEOUL)
+            if not self._buy_order_session_is_open(now, order_type):
+                continue
             limit_price = None
             try:
                 market_price = await self._current_price(ctx, code)
@@ -2208,7 +2588,7 @@ class ManagedBlockStrategy(Strategy):
                 if not active():
                     return
                 blocked_reason = self._order_session_block_reason(
-                    order_at, order_route, BUY_ORDER_TYPE
+                    order_at, order_route, order_type
                 )
                 if blocked_reason:
                     self._exclude_buy_for_day(ctx, order_at, code, blocked_reason)
@@ -2218,11 +2598,11 @@ class ManagedBlockStrategy(Strategy):
                         f"{blocked_reason} 오늘은 다시 시도하지 않습니다."
                     )
                     continue
-                if BUY_ORDER_TYPE == "LIMIT":
+                if order_type == "LIMIT":
                     limit_price = market_price
                 buying_power = await ctx.account.buying_power(
                     code,
-                    order_type=BUY_ORDER_TYPE,
+                    order_type=order_type,
                     price=limit_price,
                     route=order_route,
                 )
@@ -2245,12 +2625,19 @@ class ManagedBlockStrategy(Strategy):
                 ctx.log.info(f"{flow['name']} 매수 보류: 적용 시간이 종료되었습니다.")
                 return
             # Reserve the symbol before awaiting submission. An ambiguous response
-            # must never let another branch retry it within the same scan tick.
+            # must never let another branch or later scan retry it while the
+            # broker's balance/open-order snapshots are still catching up.
             scan["attempted"].append(code)
             ctx.state.set("buy_scan_state", scan)
+            order_id = f"target-{code}-{event.scheduled_at:%Y%m%d%H%M%S}-buy"
+            self._mark_buy_submit_pending(
+                ctx, code, client_order_id=order_id,
+                status=OrderStatus.SUBMITTING.value, at=datetime.now(SEOUL),
+                quantity=quantity, order_type=order_type, price=limit_price,
+                route=order_route,
+            )
             try:
-                order_id = f"target-{code}-{event.scheduled_at:%Y%m%d%H%M%S}-buy"
-                if BUY_ORDER_TYPE == "LIMIT":
+                if order_type == "LIMIT":
                     order = await ctx.orders.limit_buy(
                         code=code, quantity=quantity, price=limit_price, route=order_route,
                         client_order_id=order_id,
@@ -2260,32 +2647,61 @@ class ManagedBlockStrategy(Strategy):
                         code=code, quantity=quantity, route=order_route, client_order_id=order_id,
                     )
             except RouterError as exc:
+                if exc.code.value == "ORDER_REJECTED":
+                    # An explicit broker rejection is terminal. Other errors
+                    # can be ambiguous transport failures and must remain
+                    # reserved until broker reconciliation proves otherwise.
+                    self._clear_buy_submit_pending(
+                        ctx, code, client_order_id=order_id,
+                    )
+                else:
+                    self._mark_buy_submit_pending(
+                        ctx, code, client_order_id=order_id,
+                        status=OrderStatus.UNKNOWN_RECONCILING.value,
+                        at=datetime.now(SEOUL),
+                    )
                 if self._is_non_retryable_buy_rejection(exc.message):
                     self._exclude_buy_for_day(ctx, event.scheduled_at, code, exc.message)
                     excluded_codes.add(code)
                     ctx.log.warning(
-                        f"{self._instrument_label(ctx, code)} 매수 제외: 시장가 주문 불가 상태로 오늘은 다시 시도하지 않습니다. ({exc.message})"
+                        f"{self._instrument_label(ctx, code)} 매수 제외: 주문 불가 상태로 오늘은 다시 시도하지 않습니다. ({exc.message})"
                     )
                 else:
                     ctx.log.error(f"{self._instrument_label(ctx, code)} 매수 요청 실패 [{exc.code.value}]: {exc.message}")
                 continue
-            if order.status is OrderStatus.REJECTED:
+            if order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED}:
+                self._clear_buy_submit_pending(
+                    ctx, code, client_order_id=order_id,
+                )
                 message = str(order.message or "")
-                if self._is_non_retryable_buy_rejection(message):
+                if (
+                    order.status is OrderStatus.REJECTED
+                    and self._is_non_retryable_buy_rejection(message)
+                ):
                     self._exclude_buy_for_day(ctx, event.scheduled_at, code, message)
                     excluded_codes.add(code)
                     ctx.log.warning(
-                        f"{self._instrument_label(ctx, code)} 매수 제외: 시장가 주문 불가 상태로 오늘은 다시 시도하지 않습니다. ({message})"
+                        f"{self._instrument_label(ctx, code)} 매수 제외: 주문 불가 상태로 오늘은 다시 시도하지 않습니다. ({message})"
                     )
                 continue
-            if order.status is not OrderStatus.REJECTED:
-                tracked[code] = str(quantity)
-                ctx.state.set("strategy_positions", tracked)
-                scan["submitted"] += 1
-                ctx.state.set("buy_scan_state", scan)
-                await self._subscribe_live_quote(ctx, code)
-                price_text = f" {limit_price}원" if limit_price is not None else ""
-                ctx.log.info(f"{self._instrument_label(ctx, code)} {BUY_ORDER_TYPE}{price_text} {quantity}주 매수 요청: {order.status.value}")
+            self._mark_buy_submit_pending(
+                ctx, code, client_order_id=order_id,
+                status=order.status.value, at=datetime.now(SEOUL),
+                provider_order_id=getattr(order, "provider_order_id", None),
+            )
+            tracked[code] = str(quantity)
+            ctx.state.set("strategy_positions", tracked)
+            scan["submitted"] += 1
+            ctx.state.set("buy_scan_state", scan)
+            await self._subscribe_live_quote(ctx, code)
+            price_text = f" {limit_price}원" if limit_price is not None else ""
+            reason = " 그리고 ".join(
+                self._condition_summary(item) for item in matched_conditions
+            ) or "시간·대상 조건"
+            ctx.log.info(
+                f"{self._instrument_label(ctx, code)} {reason} · "
+                f"{order_type}{price_text} {quantity}주 매수 요청: {order.status.value}"
+            )
             if scan["submitted"] >= MAX_NEW_BUYS_PER_SCAN:
                 break
 
@@ -2323,26 +2739,29 @@ class ManagedBlockStrategy(Strategy):
             if code in pending_codes or code in self._live_sell_pending:
                 continue
             average_price = position.average_price
-            should_sell, matched_groups = await self._condition_groups_result(
+            should_sell, matched_conditions, action = await self._rule_tree_result(
                 ctx,
                 code,
-                flow["sell_condition_groups"],
+                flow["sell_rule_tree"],
                 average_price=average_price,
                 side=f"{flow['name']} 매도",
             )
             if not should_sell:
                 continue
+            if action is None:
+                ctx.log.info(f"{self._instrument_label(ctx, code)} 매도 보류: 통과한 조건 계층에 주문 행동이 없습니다.")
+                continue
+            order_type = action["order_type"]
             sell_reason = " 그리고 ".join(
-                "(" + " 또는 ".join(self._condition_summary(item) for item in matched) + ")"
-                for matched in matched_groups
-            )
+                self._condition_summary(item) for item in matched_conditions
+            ) or "시간·보유 조건"
             tracked_quantity = position.strategy_quantity if position.strategy_quantity is not None else Decimal(str(tracked[code]))
             quantity = min(tracked_quantity, position.available_quantity)
             if quantity <= 0:
                 continue
             limit_price = None
             try:
-                if SELL_ORDER_TYPE == "LIMIT":
+                if order_type == "LIMIT":
                     limit_price = await self._current_price(ctx, code)
             except RouterError as exc:
                 ctx.log.error(
@@ -2354,7 +2773,7 @@ class ManagedBlockStrategy(Strategy):
             if not self._sell_flow_event_is_active(flow, event.scheduled_at, order_at):
                 return
             if self._order_attempt_is_suppressed(
-                ctx, order_at, code, "SELL", SELL_ORDER_TYPE
+                ctx, order_at, code, "SELL", order_type
             ):
                 continue
             try:
@@ -2372,11 +2791,11 @@ class ManagedBlockStrategy(Strategy):
                         ctx, code, order_at, current_price=limit_price
                     )
                 blocked_reason = self._order_session_block_reason(
-                    order_at, order_route, SELL_ORDER_TYPE
+                    order_at, order_route, order_type
                 )
                 if blocked_reason:
                     if self._suppress_order_for_day(
-                        ctx, order_at, code, "SELL", SELL_ORDER_TYPE,
+                        ctx, order_at, code, "SELL", order_type,
                         blocked_reason,
                     ):
                         ctx.log.warning(
@@ -2384,7 +2803,7 @@ class ManagedBlockStrategy(Strategy):
                         )
                     continue
                 order_id = f"exit-{code}-{order_at:%Y%m%d%H%M%S}-sell"
-                if SELL_ORDER_TYPE == "LIMIT":
+                if order_type == "LIMIT":
                     order = await ctx.orders.limit_sell(
                         code=code, quantity=quantity, price=limit_price, route=order_route,
                         client_order_id=order_id,
@@ -2397,7 +2816,7 @@ class ManagedBlockStrategy(Strategy):
                 failure_at = datetime.now(SEOUL)
                 if self._is_non_retryable_sell_rejection(exc.message):
                     if self._suppress_order_for_day(
-                        ctx, failure_at, code, "SELL", SELL_ORDER_TYPE,
+                        ctx, failure_at, code, "SELL", order_type,
                         exc.message,
                     ):
                         ctx.log.error(
@@ -2411,7 +2830,7 @@ class ManagedBlockStrategy(Strategy):
                 message = str(order.message or "")
                 if self._is_non_retryable_sell_rejection(message):
                     if self._suppress_order_for_day(
-                        ctx, datetime.now(SEOUL), code, "SELL", SELL_ORDER_TYPE,
+                        ctx, datetime.now(SEOUL), code, "SELL", order_type,
                         message,
                     ):
                         ctx.log.error(
@@ -2430,7 +2849,7 @@ class ManagedBlockStrategy(Strategy):
             ctx.log.info(
                 f"{self._instrument_label(ctx, code)} {flow['name']} · "
                 f"{decision_time} · {sell_reason} · "
-                f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
+                f"{order_type}{price_text} {quantity}주 매도 요청: {order.status.value}"
             )
             if order.status is OrderStatus.FILLED:
                 tracked.pop(code, None)
@@ -2460,7 +2879,7 @@ class ManagedBlockStrategy(Strategy):
             flow
             for flow in active_flows
             if self._matched_live_profit_condition(
-                flow["sell_condition_groups"], quote.price, position.average_price
+                flow["sell_rule_tree"], quote.price, position.average_price
             ) is not None
         )
         if not candidate_flows:
@@ -2485,22 +2904,28 @@ class ManagedBlockStrategy(Strategy):
         ):
             return
         matched_flow = None
-        matched_groups = None
+        matched_conditions = None
+        matched_action = None
         for flow in candidate_flows:
-            should_sell, flow_matches = await self._condition_groups_result(
+            should_sell, flow_matches, flow_action = await self._rule_tree_result(
                 ctx,
                 code,
-                flow["sell_condition_groups"],
+                flow["sell_rule_tree"],
                 average_price=position.average_price,
                 current_price=quote.price,
                 side=f"{flow['name']} 실시간 매도",
             )
-            if should_sell:
+            if should_sell and flow_action is not None and any(
+                self._is_live_profit_condition(condition)
+                for condition in flow_matches
+            ):
                 matched_flow = flow
-                matched_groups = flow_matches
+                matched_conditions = flow_matches
+                matched_action = flow_action
                 break
         if matched_flow is None:
             return
+        order_type = matched_action["order_type"]
         tracked_quantity = (
             position.strategy_quantity
             if position.strategy_quantity is not None
@@ -2515,12 +2940,12 @@ class ManagedBlockStrategy(Strategy):
         ):
             return
         if self._order_attempt_is_suppressed(
-            ctx, order_at, code, "SELL", SELL_ORDER_TYPE
+            ctx, order_at, code, "SELL", order_type
         ):
             return
         limit_price = None
         try:
-            if SELL_ORDER_TYPE == "LIMIT":
+            if order_type == "LIMIT":
                 limit_price = quote.price
             route_at = order_at
             order_route = await self._effective_order_route(
@@ -2536,11 +2961,11 @@ class ManagedBlockStrategy(Strategy):
                     ctx, code, order_at, current_price=quote.price
                 )
             blocked_reason = self._order_session_block_reason(
-                order_at, order_route, SELL_ORDER_TYPE
+                order_at, order_route, order_type
             )
             if blocked_reason:
                 if self._suppress_order_for_day(
-                    ctx, order_at, code, "SELL", SELL_ORDER_TYPE,
+                    ctx, order_at, code, "SELL", order_type,
                     blocked_reason,
                 ):
                     ctx.log.warning(
@@ -2550,7 +2975,7 @@ class ManagedBlockStrategy(Strategy):
                 return
             self._mark_live_sell_pending(code)
             order_id = f"live-exit-{code}-{order_at:%Y%m%d%H%M%S%f}-sell"
-            if SELL_ORDER_TYPE == "LIMIT":
+            if order_type == "LIMIT":
                 order = await ctx.orders.limit_sell(
                     code=code, quantity=quantity, price=limit_price,
                     route=order_route, client_order_id=order_id,
@@ -2565,7 +2990,7 @@ class ManagedBlockStrategy(Strategy):
             failure_at = datetime.now(SEOUL)
             if self._is_non_retryable_sell_rejection(exc.message):
                 if self._suppress_order_for_day(
-                    ctx, failure_at, code, "SELL", SELL_ORDER_TYPE,
+                    ctx, failure_at, code, "SELL", order_type,
                     exc.message,
                 ):
                     ctx.log.error(
@@ -2580,7 +3005,7 @@ class ManagedBlockStrategy(Strategy):
             message = str(order.message or "")
             if self._is_non_retryable_sell_rejection(message):
                 if self._suppress_order_for_day(
-                    ctx, datetime.now(SEOUL), code, "SELL", SELL_ORDER_TYPE,
+                    ctx, datetime.now(SEOUL), code, "SELL", order_type,
                     message,
                 ):
                     ctx.log.error(
@@ -2589,20 +3014,40 @@ class ManagedBlockStrategy(Strategy):
                     )
             return
         reason = " 그리고 ".join(
-            "(" + " 또는 ".join(self._condition_summary(item) for item in matched) + ")"
-            for matched in matched_groups
+            self._condition_summary(item) for item in matched_conditions
         )
         price_text = f" {limit_price}원" if limit_price is not None else ""
         ctx.log.info(
             f"{self._instrument_label(ctx, code)} {matched_flow['name']} · "
             f"실시간 현재가 {quote.price}원 ({reason}) · "
-            f"{SELL_ORDER_TYPE}{price_text} {quantity}주 매도 요청: {order.status.value}"
+            f"{order_type}{price_text} {quantity}주 매도 요청: {order.status.value}"
         )
 
     async def on_order(self, ctx, order):
         self._ensure_live_state()
         code = order.request.instrument.code
         if order.request.side.value == "BUY":
+            client_order_id = str(
+                getattr(order, "client_order_id", None)
+                or getattr(order.request, "client_order_id", None)
+                or ""
+            )
+            if order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED}:
+                self._clear_buy_submit_pending(
+                    ctx, code, client_order_id=client_order_id,
+                )
+                return
+            self._mark_buy_submit_pending(
+                ctx, code, client_order_id=client_order_id,
+                status=order.status.value,
+                at=getattr(order, "submitted_at", None) or datetime.now(SEOUL),
+                quantity=getattr(order.request, "quantity", None),
+                order_type=getattr(getattr(order.request, "order_type", None), "value", None),
+                price=getattr(order.request, "price", None),
+                route=getattr(getattr(order.request, "route", None), "value", None),
+                provider_order_id=getattr(order, "provider_order_id", None),
+                replace=False,
+            )
             if order.status is not OrderStatus.FILLED:
                 return
             try:
@@ -2667,8 +3112,10 @@ def _render_condition_bollinger(
         "__SELL_CONDITION_LOGIC__": _literal(settings.sell_condition_logic),
         "__SELL_CONDITIONS_JSON__": _json_literal(settings.sell_conditions),
         "__BUY_CONDITION_GROUPS_JSON__": _json_literal(settings.buy_condition_groups),
+        "__BUY_RULE_TREE_JSON__": _json_literal(settings.buy_rule_tree),
         "__BUY_FLOWS_JSON__": _json_literal(settings.buy_flows),
         "__SELL_CONDITION_GROUPS_JSON__": _json_literal(settings.sell_condition_groups),
+        "__SELL_RULE_TREE_JSON__": _json_literal(settings.sell_rule_tree),
         "__SELL_FLOWS_JSON__": _json_literal(settings.sell_flows),
         "__BUY_ORDER_TYPE__": _literal(settings.buy_order_type),
         "__SELL_ORDER_TYPE__": _literal(settings.sell_order_type),
@@ -2799,6 +3246,8 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
     sell_json = constants.get("SELL_CONDITIONS_JSON")
     buy_groups_json = constants.get("BUY_CONDITION_GROUPS_JSON")
     sell_groups_json = constants.get("SELL_CONDITION_GROUPS_JSON")
+    buy_rule_tree_json = constants.get("BUY_RULE_TREE_JSON")
+    sell_rule_tree_json = constants.get("SELL_RULE_TREE_JSON")
     buy_flows_json = constants.get("BUY_FLOWS_JSON")
     sell_flows_json = constants.get("SELL_FLOWS_JSON")
     # Missing means a pre-flow strategy; malformed explicit flow data must not
@@ -2843,6 +3292,20 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         required["sell_condition_groups"] = None
+    for field, raw in (
+        ("buy_rule_tree", buy_rule_tree_json),
+        ("sell_rule_tree", sell_rule_tree_json),
+    ):
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError("조건 계층 설정을 읽을 수 없습니다.")
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("조건 계층 설정을 읽을 수 없습니다.") from exc
+        if decoded is not None:
+            required[field] = decoded
     if not required["sell_conditions"]:
         legacy_conditions: list[dict[str, object]] = []
         if required["use_take_profit"]:
