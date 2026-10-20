@@ -30,7 +30,8 @@ class Element {
     this.style = {};
     this.listeners = {};
     this.attributes = {};
-    this.bounds = { top: 200, bottom: 230, height: 30 };
+    this.bounds = { left: 300, right: 510, width: 210, top: 200, bottom: 230, height: 30 };
+    this.offsetWidth = 210;
     this.offsetHeight = 30;
     this.className = "";
     this.classList = {
@@ -61,11 +62,11 @@ function harness(root, kind = "sell") {
   const notices = [];
   let commits = 0;
   const canvas = new Element("canvas");
-  canvas.bounds = { top: 100, bottom: 690, height: 590 };
+  canvas.bounds = { left: 240, right: 1260, width: 1020, top: 100, bottom: 690, height: 590 };
   const context = vm.createContext({
     structuredClone,
     document: { createElement: tag => new Element(tag) },
-    window: { innerHeight: 720 },
+    window: { innerHeight: 720, innerWidth: 1280 },
     elements: { blockCanvas: canvas },
     state: {
       conditionGroupSerial: 0,
@@ -247,11 +248,44 @@ test("menu dismisses with Escape or outside pointer and installs one canvas list
   assert.equal(second.menu.open, false);
 });
 
+test("opening a menu from the keyboard closes the previously open menu", () => {
+  const h = harness(group("root", [condition("A"), condition("B")]));
+  const first = h.menuFor("A");
+  const second = h.menuFor("B");
+  h.canvas.openMenus = [first.menu, second.menu];
+  first.menu.open = true;
+  second.menu.open = true;
+  second.menu.dispatch("toggle");
+  assert.equal(first.menu.open, false);
+  assert.equal(second.menu.open, true);
+  assert.equal(h.commits(), 0);
+});
+
+test("changing the canvas viewport dismisses measured popups without modifying conditions", () => {
+  const root = group("root", [condition("A")]);
+  const h = harness(root);
+  const { menu } = h.menuFor("A");
+  menu.open = true;
+  h.canvas.openMenus = [menu];
+  const viewport = { x: 25, y: -100, zoom: 1 };
+  h.context.ensureBlockLayout = () => ({ viewport });
+  h.context.constrainBlockViewport = value => value;
+  vm.runInContext(functionSource("applyBlockViewport"), h.context);
+  const original = JSON.stringify(root);
+  const world = { style: {} };
+  h.context.applyBlockViewport(world);
+  assert.equal(menu.open, false);
+  assert.equal(world.style.transform, "translate(25px, -100px) scale(1)");
+  assert.deepEqual(viewport, { x: 25, y: -100, zoom: 1 });
+  assert.equal(JSON.stringify(root), original);
+  assert.equal(h.commits(), 0);
+});
+
 test("lower menu opens upward within scaled canvas space without moving its toolbar", () => {
   const h = harness(group("root", [condition("A")]));
   const { menu, summary, options, toolbar } = h.menuFor("A");
   summary.bounds = { top: 650, bottom: 680, height: 30 };
-  options.bounds = { top: 685, bottom: 805, height: 120 };
+  options.bounds = { left: 300, right: 468, width: 168, top: 685, bottom: 805, height: 120 };
   options.offsetHeight = 150;
   const toolbarBefore = structuredClone(toolbar.bounds);
   menu.open = true;
@@ -262,4 +296,110 @@ test("lower menu opens upward within scaled canvas space without moving its tool
   summary.bounds = { top: 150, bottom: 180, height: 30 };
   menu.dispatch("toggle");
   assert.equal(menu.classList.contains("opens-up"), false);
+});
+
+function popupLayout(options, { left, scale, width = 240, height = 120 }) {
+  Object.defineProperty(options, "offsetWidth", {
+    get: () => Math.min(width, Number.parseFloat(options.style.maxWidth) || width),
+  });
+  Object.defineProperty(options, "offsetHeight", {
+    get: () => Math.min(height, Number.parseFloat(options.style.maxHeight) || height),
+  });
+  options.getBoundingClientRect = () => {
+    const actualWidth = Math.min(width, Number.parseFloat(options.style.maxWidth) || width) * scale;
+    const actualLeft = left + (Number.parseFloat(options.style.left) || 0) * scale;
+    const actualHeight = options.offsetHeight * scale;
+    return {
+      left: actualLeft, right: actualLeft + actualWidth, width: actualWidth,
+      top: 250, bottom: 250 + actualHeight, height: actualHeight,
+    };
+  };
+}
+
+test("menus stay inside both canvas edges at different zoom levels", () => {
+  for (const scale of [0.5, 1, 2]) {
+    for (const left of [210, 1200]) {
+      const h = harness(group("root", [condition("A")]));
+      const { menu, options } = h.menuFor("A");
+      popupLayout(options, { left, scale });
+      menu.open = true;
+      menu.dispatch("toggle");
+      const bounds = options.getBoundingClientRect();
+      assert.ok(bounds.left >= h.canvas.bounds.left + 8, `left edge at ${scale}x`);
+      assert.ok(bounds.right <= h.canvas.bounds.right - 8, `right edge at ${scale}x`);
+    }
+  }
+});
+
+test("a zoomed menu can shrink to a narrow visible canvas without its minimum width clipping", () => {
+  const h = harness(group("root", [condition("A")]));
+  h.canvas.bounds = { ...h.canvas.bounds, left: 900, right: 1260, width: 360 };
+  const { menu, options } = h.menuFor("A");
+  popupLayout(options, { left: 1200, scale: 2 });
+  menu.open = true;
+  menu.dispatch("toggle");
+  const bounds = options.getBoundingClientRect();
+  assert.equal(bounds.width, 344);
+  assert.equal(bounds.left, 908);
+  assert.equal(bounds.right, 1252);
+  assert.equal(options.style.minWidth, "172px");
+});
+
+test("a 2x popup includes its scaled gap when fitting above or below a fractional-height trigger", () => {
+  for (const opensUp of [true, false]) {
+    const h = harness(group("root", [condition("A")]));
+    h.canvas.bounds.top = 236.17;
+    h.canvas.bounds.bottom = opensUp ? 690 : 436.17;
+    const { menu, summary, options } = h.menuFor("A");
+    summary.bounds = { ...summary.bounds, top: opensUp ? 437.15 : 250, bottom: opensUp ? 491.15 : 304 };
+    const naturalHeight = 108 + 1 / 3;
+    options.offsetWidth = 210;
+    options.offsetHeight = 108;
+    options.getBoundingClientRect = () => {
+      const height = Math.min(naturalHeight, Number.parseFloat(options.style.maxHeight) || naturalHeight) * 2;
+      const top = menu.classList.contains("opens-up")
+        ? summary.bounds.top - 10 - height : summary.bounds.bottom + 10;
+      return { left: 300, right: 720, width: 420, top, bottom: top + height, height };
+    };
+    menu.open = true;
+    menu.dispatch("toggle");
+    const bounds = options.getBoundingClientRect();
+    assert.equal(menu.classList.contains("opens-up"), opensUp);
+    assert.ok(bounds.top >= h.canvas.bounds.top + 8 - 1e-6);
+    assert.ok(bounds.bottom <= h.canvas.bounds.bottom - 8 + 1e-6);
+  }
+});
+
+test("scrolling or dragging an open menu does not pan, zoom, capture pointers or persist the canvas", () => {
+  const h = harness(group("root", [condition("A")]));
+  const viewport = { x: 25, y: -150, zoom: 1.5 };
+  h.context.ensureBlockLayout = () => ({ viewport });
+  h.context.applyBlockViewport = () => { throw new Error("Menu scrolling must not move the canvas"); };
+  h.context.persistBlockLayout = () => { throw new Error("Menu scrolling must not persist a new viewport"); };
+  h.canvas.setPointerCapture = () => { throw new Error("Menu scrollbar dragging must not capture a canvas pointer"); };
+  vm.runInContext(functionSource("bindBlockCanvasPan"), h.context);
+  h.context.bindBlockCanvasPan({});
+  const original = structuredClone(viewport);
+  let prevented = false;
+  const target = {
+    closest: selector => selector.split(",").some(item => item.trim() === ".composer-tree-rule-add-options") ? {} : null,
+  };
+  h.canvas.dispatch("pointerdown", {
+    target, button: 0, pointerId: 1, clientX: 300, clientY: 400,
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, false, "Native popup scrollbar dragging remains available");
+  assert.deepEqual(viewport, original);
+  h.canvas.dispatch("wheel", {
+    target, deltaY: 60, deltaX: 0, ctrlKey: false, metaKey: false,
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, false, "Native popup scrolling remains available");
+  assert.deepEqual(viewport, original);
+  h.canvas.dispatch("wheel", {
+    target, deltaY: 60, deltaX: 0, ctrlKey: true, metaKey: false,
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true, "Ctrl-wheel on a menu must not zoom the browser page");
+  assert.deepEqual(viewport, original);
 });

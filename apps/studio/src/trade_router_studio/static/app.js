@@ -2590,6 +2590,9 @@ function createBlockRuleActionEditor(reference, disabled) {
   hint.textContent = reference.kind === "sell"
     ? "이 조건 경로가 통과하면 전략 소유 수량을 선택한 방식으로 매도합니다."
     : "이 조건 경로가 통과하면 공통 예산과 주문 위험 검사를 거쳐 매수합니다.";
+  if (node.kind === "logic") {
+    hint.textContent += " 통과한 하위 조건에서 선택된 주문이 없을 때 실행하는 기본 주문입니다.";
+  }
   const order = conditionSelect(
     [["MARKET", "시장가"], ["LIMIT", "현재가 지정가"]],
     node.action.order_type || "MARKET", disabled,
@@ -5366,17 +5369,33 @@ function createComposerRuleAddMenu(entry, running) {
   menu.append(options);
   menu.addEventListener("toggle", () => {
     if (!menu.open) return;
+    canvas.querySelectorAll(".composer-tree-rule-add[open]").forEach(openMenu => {
+      if (openMenu !== menu) openMenu.open = false;
+    });
     menu.classList.remove("opens-up");
     options.style.maxHeight = "";
+    options.style.maxWidth = "";
+    options.style.minWidth = "";
+    options.style.left = "";
     const canvasBounds = canvas.getBoundingClientRect();
     const triggerBounds = summary.getBoundingClientRect();
+    const naturalBounds = options.getBoundingClientRect();
+    const scale = Math.max(.2, options.offsetWidth > 0 ? naturalBounds.width / options.offsetWidth
+      : options.offsetHeight > 0 ? naturalBounds.height / options.offsetHeight : 1);
+    const leftEdge = Math.max(0, canvasBounds.left) + 8;
+    const rightEdge = Math.min(window.innerWidth, canvasBounds.right) - 8;
+    const maxWidth = Math.max(0, rightEdge - leftEdge) / scale;
+    options.style.maxWidth = `${Math.min(360, maxWidth)}px`;
+    options.style.minWidth = `${Math.min(210, maxWidth)}px`;
     const optionsBounds = options.getBoundingClientRect();
-    const lowerSpace = Math.min(window.innerHeight, canvasBounds.bottom) - triggerBounds.bottom - 8;
-    const upperSpace = triggerBounds.top - Math.max(0, canvasBounds.top) - 8;
+    const fittedLeft = Math.max(leftEdge, Math.min(optionsBounds.left, rightEdge - optionsBounds.width));
+    options.style.left = `${(fittedLeft - optionsBounds.left) / scale}px`;
+    const popupGap = 5 * scale;
+    const lowerSpace = Math.min(window.innerHeight, canvasBounds.bottom) - triggerBounds.bottom - popupGap - 8;
+    const upperSpace = triggerBounds.top - Math.max(0, canvasBounds.top) - popupGap - 8;
     const opensUp = optionsBounds.height > lowerSpace && upperSpace > lowerSpace;
-    const scale = options.offsetHeight > 0 ? optionsBounds.height / options.offsetHeight : 1;
     menu.classList.toggle("opens-up", opensUp);
-    options.style.maxHeight = `${Math.max(40, (opensUp ? upperSpace : lowerSpace) / Math.max(.2, scale))}px`;
+    options.style.maxHeight = `${Math.max(0, (opensUp ? upperSpace : lowerSpace) / scale)}px`;
   });
   menu.addEventListener("keydown", event => {
     if (event.key !== "Escape" || !menu.open) return;
@@ -5422,6 +5441,7 @@ function createComposerThenBranch(entry, definitions, running) {
   const label = document.createElement("span");
   label.className = "composer-then-label";
   label.textContent = conditionScope ? "통과하면" : "계층 통과 시";
+  if (!conditionScope) label.title = "통과한 하위 조건에서 선택된 주문이 없을 때 실행하는 기본 주문";
   branch.append(label);
   const children = document.createElement("div");
   children.className = "composer-then-children";
@@ -5533,6 +5553,9 @@ function constrainBlockViewport(viewport) {
 }
 
 function applyBlockViewport(world) {
+  elements.blockCanvas.querySelectorAll(".composer-tree-rule-add[open]").forEach(menu => {
+    menu.open = false;
+  });
   const viewport = constrainBlockViewport(ensureBlockLayout()?.viewport || { x: 24, y: 24, zoom: 1 });
   world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`;
   elements.blockCanvas.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`;
@@ -5546,7 +5569,7 @@ function bindBlockCanvasPan(world) {
   if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
   if (canvas._blockKeyHandler) canvas.removeEventListener("keydown", canvas._blockKeyHandler);
   const panHandler = event => {
-    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-add-row, .composer-inspector, button, input, select, textarea, a, summary, [contenteditable]")) return;
+    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-add-row, .composer-inspector, .composer-tree-rule-add-options, button, input, select, textarea, a, summary, [contenteditable]")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     const strategyName = state.selected;
@@ -5588,6 +5611,11 @@ function bindBlockCanvasPan(world) {
   };
   const wheelHandler = event => {
     if (event.target.closest(".composer-inspector")) return;
+    if (event.target.closest(".composer-tree-rule-add-options")) {
+      // Let a height-limited menu scroll without moving the canvas underneath it.
+      if (event.ctrlKey || event.metaKey) event.preventDefault();
+      return;
+    }
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     if (event.ctrlKey || event.metaKey) {
