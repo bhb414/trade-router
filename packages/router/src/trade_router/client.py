@@ -1175,6 +1175,12 @@ class OrderClient:
         order_type: OrderType | str = OrderType.LIMIT,
         route: OrderRoute | str | None = None,
     ) -> Order:
+        """Amend the full unfilled remainder of a router-owned order.
+
+        Omit quantity to use the confirmed remainder. A smaller quantity is
+        rejected because it could leave a separate working leg at the broker;
+        reducing size requires a confirmed partial cancellation first.
+        """
         payload = await self._router._post(
             f"/api/v1/orders/{order_id}/amend",
             {

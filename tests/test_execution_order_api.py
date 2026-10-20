@@ -352,15 +352,266 @@ def test_buy_amendment_rechecks_live_price_and_never_expands_reserved_budget(tmp
                 )
             assert blocked.value.code is RouterErrorCode.RISK_LIMIT_EXCEEDED
             assert gateway.changes == []
+            with pytest.raises(RouterError) as partial:
+                await service.amend(
+                    strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                    order_id=submitted.id, quantity=Decimal("5"), order_type=OrderType.BEST_LIMIT,
+                    price=None, route=None,
+                )
+            assert partial.value.code is RouterErrorCode.UNSUPPORTED_CAPABILITY
+            assert gateway.changes == []
+            gateway.calculation_price = Decimal("90000")
             amended = await service.amend(
                 strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
-                order_id=submitted.id, quantity=Decimal("5"), order_type=OrderType.BEST_LIMIT,
+                order_id=submitted.id, quantity=None, order_type=OrderType.BEST_LIMIT,
                 price=None, route=None,
             )
-            assert amended.request.quantity == 8
+            assert amended.request.quantity == 10
             assert amended.filled_quantity == 3
-            assert gateway.changes == [("amend", "broker-1", Decimal("5"))]
+            assert gateway.changes == [("amend", "broker-1", Decimal("7"))]
             assert store.order(submitted.id)["request"]["reserved_amount"] == "1000000"
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("rest_first", (False, True))
+@pytest.mark.parametrize("reversed_notices", (False, True))
+def test_original_rest_and_realtime_streams_never_double_count(
+    tmp_path: Path, rest_first: bool, reversed_notices: bool,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "original-overlap.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("original-overlap"), quantity=Decimal("10")),
+            )
+            base = {
+                "provider": "kis", "provider_order_id": "broker-1",
+                "original_order_id": "", "code": "005930",
+                "rejected": "0", "execution_code": "2",
+            }
+            notices = [
+                {**base, "quantity": "1", "price": "90000", "time": "160100"},
+                {**base, "quantity": "2", "price": "105000", "time": "160102"},
+            ]
+            if reversed_notices:
+                notices.reverse()
+            gateway.orders = (broker_order("broker-1", filled="3", average="100000"),)
+            if rest_first:
+                await service.refresh_unresolved_orders("broker-account")
+            await service.apply_realtime_notice("broker-account", notices[0])
+            await service.refresh_unresolved_orders("broker-account")
+            # Persisted stream totals also survive a service restart.
+            service = OrderService(store, gateway)
+            await service.apply_realtime_notice("broker-account", notices[1])
+            await service.apply_realtime_notice("broker-account", notices[0])
+            await service.refresh_unresolved_orders("broker-account")
+            row = store.order(submitted.id)
+            assert Decimal(row["filled_quantity"]) == 3
+            assert Decimal(row["average_fill_price"]) == 100000
+            # The stream was behind REST, so even a subsequent notice is not
+            # assumed to be an incremental fill. The next snapshot confirms it.
+            await service.apply_realtime_notice("broker-account", {
+                **base, "quantity": "2", "price": "120000", "time": "160104",
+            })
+            await service.refresh_unresolved_orders("broker-account")  # stale REST=3
+            assert Decimal(store.order(submitted.id)["filled_quantity"]) == 3
+            gateway.orders = (broker_order("broker-1", filled="5", average="108000"),)
+            await service.refresh_unresolved_orders("broker-account")
+            row = store.order(submitted.id)
+            assert Decimal(row["filled_quantity"]) == 5
+            assert Decimal(row["average_fill_price"]) == 108000
+            assert sum(Decimal(fill["quantity"]) for fill in store.fills(order_id=submitted.id)) == 5
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ("amend", "cancel"))
+def test_rejected_modification_notice_does_not_reject_uncertain_original(
+    tmp_path: Path, operation: str,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "child-rejection.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("child-rejection"), quantity=Decimal("10")),
+            )
+            store.update_order(
+                submitted.id, status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"uncertain_modification": operation},
+            )
+            await service.apply_realtime_notice("broker-account", {
+                "provider": "kis", "provider_order_id": "rejected-child",
+                "original_order_id": "broker-1", "execution_code": "1",
+                "rejected": "1", "time": "160100",
+            })
+            assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
+            gateway.orders = (broker_order("broker-1"),)
+            assert await service.open_orders(manifest=manifest()) == []
+            assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
+            gateway.orders = (replace(
+                broker_order("broker-1", filled="10", remaining="0"), status=OrderStatus.FILLED,
+            ),)
+            await service.refresh_unresolved_orders("broker-account")
+            assert store.order(submitted.id)["status"] == "FILLED"
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+def test_late_execution_cannot_mutate_terminal_cancelled_order(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "late-cancelled.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("late-cancelled"), quantity=Decimal("10")),
+            )
+            gateway.orders = (broker_order("broker-1", filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            store.update_order(submitted.id, status=OrderStatus.CANCELLED)
+            await service.apply_realtime_notice("broker-account", {
+                "provider": "kis", "provider_order_id": "broker-1", "quantity": "4",
+                "price": "90000", "time": "160100", "rejected": "0", "execution_code": "2",
+            })
+            row = store.order(submitted.id)
+            assert row["status"] == "CANCELLED"
+            assert Decimal(row["filled_quantity"]) == 3
+            assert sum(Decimal(fill["quantity"]) for fill in store.fills(order_id=submitted.id)) == 3
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("amended", (False, True))
+def test_missing_realtime_segment_waits_for_rest_without_fabricating_fill_price(
+    tmp_path: Path, amended: bool,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "missing-notice.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("missing-notice"), quantity=Decimal("10")),
+            )
+            provider_id = "broker-1"
+            if amended:
+                gateway.orders = (broker_order("broker-1", filled="3"),)
+                changed = await service.amend(
+                    strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                    order_id=submitted.id, quantity=None, order_type=OrderType.BEST_LIMIT,
+                    price=None, route=None,
+                )
+                provider_id = changed.provider_order_id or ""
+                gateway.orders += (broker_order(provider_id, filled="2", quantity="7"),)
+            else:
+                gateway.orders = (broker_order(provider_id, filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            before = store.order(submitted.id)
+            before_fills = store.fills(order_id=submitted.id)
+            notice = {
+                "provider": "kis", "provider_order_id": provider_id,
+                "original_order_id": "broker-1" if amended else "",
+                "quantity": "4", "price": "110000", "time": "160100",
+                "rejected": "0", "execution_code": "2",
+            }
+            await service.apply_realtime_notice("broker-account", notice)
+            service = OrderService(store, gateway)
+            await service.apply_realtime_notice("broker-account", {
+                **notice, "quantity": "1", "price": "120000", "time": "160101",
+            })
+            current = store.order(submitted.id)
+            assert current["filled_quantity"] == before["filled_quantity"]
+            assert current["average_fill_price"] == before["average_fill_price"]
+            assert store.fills(order_id=submitted.id) == before_fills
+            assert current["provider_metadata"]["realtime_fill_totals"][provider_id]["rest_only"] is True
+            if amended:
+                child = replace(
+                    broker_order(provider_id, filled="7", quantity="7", average=str(Decimal("740000") / 7)),
+                    status=OrderStatus.FILLED,
+                )
+                gateway.orders = (broker_order("broker-1", filled="3"), child)
+            else:
+                gateway.orders = (broker_order(provider_id, filled="8", average="103750"),)
+            await service.refresh_unresolved_orders("broker-account")
+            final = store.order(submitted.id)
+            assert Decimal(final["filled_quantity"]) == (10 if amended else 8)
+            assert abs(Decimal(final["average_fill_price"]) - (101000 if amended else 103750)) < Decimal("0.000001")
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+def test_uninterrupted_realtime_stream_keeps_advancing_without_waiting_for_rest(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "continuous-stream.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("continuous-stream"), quantity=Decimal("10")),
+            )
+            notice = {
+                "provider": "kis", "provider_order_id": "broker-1", "quantity": "3",
+                "price": "90000", "time": "160100", "rejected": "0", "execution_code": "2",
+            }
+            await service.apply_realtime_notice("broker-account", notice)
+            gateway.orders = (broker_order("broker-1", filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            await service.apply_realtime_notice("broker-account", {
+                **notice, "quantity": "4", "price": "110000", "time": "160101",
+            })
+            assert Decimal(store.order(submitted.id)["filled_quantity"]) == 7
+            assert sum(Decimal(fill["quantity"]) for fill in store.fills(order_id=submitted.id)) == 7
+        finally:
+            store.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("original_id", ("", "0", "0000000000"))
+def test_initial_order_rejection_with_empty_original_id_is_still_terminal(
+    tmp_path: Path, original_id: str,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "initial-rejection.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py", manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("initial-rejection"), quantity=Decimal("10")),
+            )
+            store.update_order(submitted.id, status=OrderStatus.UNKNOWN_RECONCILING)
+            await service.apply_realtime_notice("broker-account", {
+                "provider": "kis", "provider_order_id": "broker-1", "original_order_id": original_id,
+                "execution_code": "1", "rejected": "1", "time": "160100",
+            })
+            assert store.order(submitted.id)["status"] == "REJECTED"
         finally:
             store.close()
     asyncio.run(run())

@@ -454,11 +454,30 @@ class OrderService:
         # REST reconciler remains the final authority for cancellation states.
         if str(notice.get("execution_code") or "") != "2":
             if str(notice.get("rejected") or "") not in {"", "0", "N"}:
+                metadata = dict(row.get("provider_metadata") or {})
+                original_id = str(notice.get("original_order_id") or "").strip()
+                if original_id and set(original_id) == {"0"}:
+                    original_id = ""
+                modification_notice = (
+                    original_id not in {"", "0", provider_order_id}
+                    or provider_order_id != str(row.get("provider_order_id") or "")
+                    or provider_order_id in dict(metadata.get("amendment_fill_offsets") or {})
+                    or bool(metadata.get("uncertain_modification"))
+                    or bool(metadata.get("cancel_provider_order_id"))
+                    or row["status"] == OrderStatus.CANCEL_PENDING.value
+                )
                 try:
                     row = self._store.update_order(
                         str(row["id"]),
-                        status=OrderStatus.REJECTED,
-                        message="증권사 실시간 통보에서 주문 거절을 확인했습니다.",
+                        status=(
+                            OrderStatus(str(row["status"]))
+                            if modification_notice else OrderStatus.REJECTED
+                        ),
+                        message=(
+                            "정정·취소 요청 거절 통보를 받았습니다. 원주문 상태는 주문내역으로 확인합니다."
+                            if modification_notice
+                            else "증권사 실시간 통보에서 주문 거절을 확인했습니다."
+                        ),
                     )
                 except ValueError:
                     pass
@@ -475,46 +494,52 @@ class OrderService:
         provider_metadata = dict(row.get("provider_metadata") or {})
         offsets = dict(provider_metadata.get("amendment_fill_offsets") or {})
         previous_average = Decimal(str(row.get("average_fill_price") or "0"))
-        if offsets:
-            if provider_order_id != str(row.get("provider_order_id") or ""):
-                # A delayed parent or unidentified child cannot safely be
-                # combined with the current amended segment's realtime stream.
-                return None
-            # REST snapshots and realtime executions overlap. Accumulate the
-            # child stream independently, then compare original-order totals;
-            # adding a raw event to the REST total would count it twice.
-            realtime_totals = dict(provider_metadata.get("realtime_fill_totals") or {})
-            segment = dict(realtime_totals.get(provider_order_id) or {})
-            segment_quantity = Decimal(str(segment.get("quantity") or "0")) + quantity
-            segment_amount = Decimal(str(segment.get("amount") or "0")) + quantity * price
-            realtime_totals[provider_order_id] = {
-                "quantity": str(segment_quantity), "amount": str(segment_amount),
+        if provider_order_id != str(row.get("provider_order_id") or ""):
+            # A delayed parent or unidentified child cannot safely be combined
+            # with the current segment. REST reconciles all known segments.
+            return None
+        # Keep an independent cumulative realtime stream for original orders
+        # as well as amendment children. REST may already include this notice;
+        # adding it to the ledger's total would count the same execution twice.
+        realtime_totals = dict(provider_metadata.get("realtime_fill_totals") or {})
+        segment = dict(realtime_totals.get(provider_order_id) or {})
+        offset = dict(offsets.get(provider_order_id) or {})
+        base_quantity = Decimal(str(offset.get("quantity") or "0"))
+        base_amount = Decimal(str(offset.get("amount") or "0"))
+        observed_quantity = Decimal(str(segment.get("quantity") or "0"))
+        observed_amount = Decimal(str(segment.get("amount") or "0"))
+        # If REST has advanced beyond the observed stream, we cannot tell a
+        # delayed overlapping notice from a new fill after a missing notice.
+        # Keep this segment on authoritative snapshots, including after restart;
+        # guessing an offset can fabricate quantities and execution prices.
+        rest_only = (
+            bool(segment.get("rest_only"))
+            or base_quantity + observed_quantity != previous_quantity
+            or abs(base_amount + observed_amount - previous_quantity * previous_average) > Decimal("0.00000001")
+        )
+        segment_quantity = observed_quantity + quantity
+        segment_amount = observed_amount + quantity * price
+        realtime_totals[provider_order_id] = {
+            "quantity": str(segment_quantity), "amount": str(segment_amount),
+            "rest_only": rest_only,
+        }
+        provider_metadata["realtime_fill_totals"] = realtime_totals
+        cumulative_quantity = base_quantity + segment_quantity
+        if (
+            rest_only
+            or cumulative_quantity > requested_quantity
+            or cumulative_quantity <= previous_quantity
+            or OrderStatus(str(row["status"])) in {
+                OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.FILLED,
             }
-            provider_metadata["realtime_fill_totals"] = realtime_totals
-            offset = dict(offsets.get(provider_order_id) or {})
-            base_quantity = Decimal(str(offset.get("quantity") or "0"))
-            base_amount = Decimal(str(offset.get("amount") or "0"))
-            candidate_quantity = base_quantity + segment_quantity
-            if candidate_quantity > requested_quantity:
-                # Unknown segment semantics or a stale parent notification;
-                # leave financial totals to authoritative REST reconciliation.
-                return self._store.update_order(
-                    str(row["id"]), status=OrderStatus(str(row["status"])),
-                    provider_metadata=provider_metadata,
-                )
-            cumulative_quantity = candidate_quantity
-            cumulative_average = (base_amount + segment_amount) / cumulative_quantity
-            if cumulative_quantity <= previous_quantity:
-                return self._store.update_order(
-                    str(row["id"]), status=OrderStatus(str(row["status"])),
-                    provider_metadata=provider_metadata,
-                )
-        else:
-            cumulative_quantity = min(requested_quantity, previous_quantity + quantity)
-            cumulative_average = (
-                previous_quantity * previous_average
-                + (cumulative_quantity - previous_quantity) * price
-            ) / cumulative_quantity
+        ):
+            # A missing/reordered notice can leave the stream behind REST.
+            # Retain its independent total, without changing financial totals.
+            return self._store.update_order(
+                str(row["id"]), status=OrderStatus(str(row["status"])),
+                provider_metadata=provider_metadata,
+            )
+        cumulative_average = (base_amount + segment_amount) / cumulative_quantity
         actual_delta = cumulative_quantity - previous_quantity
         if actual_delta <= 0:
             return None
@@ -838,6 +863,14 @@ class OrderService:
             raise RouterError(
                 RouterErrorCode.INVALID_REQUEST,
                 "정정 수량은 현재 미체결 수량 이하여야 합니다.",
+            )
+        if amended_quantity != remaining:
+            # KIS partial amendments leave the unamended remainder working at
+            # its original price. Until split order legs can be tracked, never
+            # interpret a partial price amendment as reducing the total order.
+            raise RouterError(
+                RouterErrorCode.UNSUPPORTED_CAPABILITY,
+                "정정은 미체결 잔량 전체만 지원합니다. 수량을 줄이려면 먼저 일부 취소 후 남은 잔량을 정정하세요.",
             )
         normalized_route = route or OrderRoute(
             str(effective_request.get("route", "AUTO"))

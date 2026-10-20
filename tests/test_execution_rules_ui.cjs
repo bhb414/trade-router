@@ -67,7 +67,7 @@ function harness() {
     "addBlockExecutionFlow", "removeBlockExecutionFlow", "createComposerTreeAddRow", "buildComposerTreeModel",
     "executionMetricOptions", "executionValueOptions", "executionOperatorOptions", "newExecutionCondition",
     "executionConditionSummary", "executionActionOptions", "executionActionLabel",
-    "createExecutionConditionEditor", "updateExecutionCondition", "createExecutionActionEditor", "updateExecutionAction",
+    "createExecutionConditionEditor", "updateExecutionCondition", "createExecutionActionEditor", "updateExecutionAction", "createBlockRuleNodeEditor",
     "formulaControl", "conditionSelect", "bindBlockConditionControl", "commitBlockRuleMutation",
     "nextBlockRuleId", "newBlockOrderAction", "newBlockRuleCondition", "newBlockRuleLogic", "newBlockRuleRoot",
     "ensureBlockRuleTree", "blockRuleTree", "walkBlockRule", "findBlockRuleNode", "blockRuleNodeCount", "blockRuleConditionNodes",
@@ -114,6 +114,19 @@ test("opening an existing strategy adds no execution policy; adding/removing a f
   assert.deepEqual(plain(flow.execution_rule_tree.children[0].condition), { metric: "elapsed_seconds", operator: ">=", value: 30 });
   assert.equal(context.blockRuleContainsAction(flow.execution_rule_tree), false);
   assert.equal(context.state.blockSelectedNode, `execution-flow-${flow.id}-schedule`);
+  const executionEditor = context.createBlockRuleNodeEditor({
+    kind: "execution", flowId: flow.id, nodeId: flow.execution_rule_tree.id, isRoot: true,
+  }, false);
+  const executionHelp = executionEditor.children[0].children.find(child => child.tagName === "P").textContent;
+  assert.match(executionHelp, /아직 요청하지 않은 행동/);
+  assert.match(executionHelp, /다음 확인 때 다른 조건의 행동도 실행/);
+  for (const kind of ["buy", "sell"]) {
+    const editor = context.createBlockRuleNodeEditor({
+      kind, flowId: null, nodeId: settings[`${kind}_rule_tree`].id, isRoot: true,
+    }, false);
+    assert.equal(editor.children[0].children.find(child => child.tagName === "P").textContent,
+      "연결선의 AND·OR를 눌러 그 연결만 바꿉니다. 하위 계층을 먼저 판단하며, OR에서는 먼저 참인 경로의 행동을 실행합니다.");
+  }
   context.removeBlockExecutionFlow(flow.id);
   assert.deepEqual(plain(settings.execution_flows), []);
   const { execution_flows, ...unchanged } = settings;

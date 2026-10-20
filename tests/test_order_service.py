@@ -749,13 +749,13 @@ def test_order_events_amend_cancel_and_execution_costs(tmp_path: Path) -> None:
                 strategy_name="strategy.py",
                 manifest=manifest(max_order_amount="500000"),
                 order_id=submitted.id,
-                quantity=Decimal("2"),
+                quantity=Decimal("3"),
                 order_type=OrderType.LIMIT,
                 price=Decimal("99000"),
                 route=None,
             )
             assert amended.provider_order_id == "broker-1-amended"
-            assert amended.request.quantity == Decimal("2")
+            assert amended.request.quantity == Decimal("3")
             assert amended.request.order_type is OrderType.LIMIT
             assert amended.request.price == Decimal("99000")
             assert store.order_by_provider_id("broker-account", "broker-1")["id"] == submitted.id
@@ -768,11 +768,11 @@ def test_order_events_amend_cancel_and_execution_costs(tmp_path: Path) -> None:
                 route=None,
             )
             assert cancelled.status is OrderStatus.CANCEL_PENDING
-            assert cancelled.request.quantity == Decimal("2")
+            assert cancelled.request.quantity == Decimal("3")
             assert cancelled.request.order_type is OrderType.LIMIT
             assert cancelled.request.price == Decimal("99000")
             assert gateway.changes == [
-                ("amend", "broker-1", Decimal("2")),
+                ("amend", "broker-1", Decimal("3")),
                 ("cancel", "broker-1-amended", None),
             ]
 

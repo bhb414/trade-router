@@ -2545,7 +2545,9 @@ function createBlockRuleNodeEditor(reference, disabled) {
     });
     const help = document.createElement("p");
     help.className = "composer-inspector-hint";
-    help.textContent = "연결선의 AND·OR를 눌러 그 연결만 바꿉니다. 하위 계층을 먼저 판단하며, OR에서는 먼저 참인 경로의 행동을 실행합니다.";
+    help.textContent = reference.kind === "execution"
+      ? "연결선의 AND·OR를 눌러 바꿉니다. OR에서는 충족한 조건 중 아직 요청하지 않은 행동을 위에서부터 선택합니다. 다음 확인 때 다른 조건의 행동도 실행될 수 있습니다."
+      : "연결선의 AND·OR를 눌러 그 연결만 바꿉니다. 하위 계층을 먼저 판단하며, OR에서는 먼저 참인 경로의 행동을 실행합니다.";
     section.append(help);
     const adds = document.createElement("div");
     adds.className = "rule-node-add-actions";
