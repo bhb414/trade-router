@@ -2107,7 +2107,7 @@ const BLOCK_CONDITION_METRICS = [
   ["open", "시가"], ["high", "고가"], ["low", "저가"], ["close", "종가"],
   ["heikin_open", "하이킨아시 시가"], ["heikin_high", "하이킨아시 고가"],
   ["heikin_low", "하이킨아시 저가"], ["heikin_close", "하이킨아시 종가"],
-  ["volume", "거래량"], ["obv", "OBV"], ["bollinger_upper", "볼린저 상단"],
+  ["volume", "거래량"], ["obv", "OBV"], ["atr", "ATR"], ["bollinger_upper", "볼린저 상단"],
   ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
   ["average_price", "평균 매수가"], ["profit_rate", "실시간 수익률(평균가 대비 %)"],
 ];
@@ -2117,9 +2117,222 @@ const BLOCK_CONDITION_OPERATORS = [
   ["CROSS_UP", "상향돌파"], ["CROSS_DOWN", "하향돌파"],
 ];
 
+const BLOCK_EXPRESSION_OPERATORS = [
+  ["ADD", "+"], ["SUBTRACT", "−"], ["MULTIPLY", "×"], ["DIVIDE", "÷"],
+];
+
+const BLOCK_EXPRESSION_METRICS = [
+  ["constant", "숫자"],
+  ...BLOCK_CONDITION_METRICS.filter(([key]) => key !== "obv"),
+];
+
+function blockSourceMaxHistory(interval = "3m") {
+  if (!String(interval).endsWith("m")) return 400;
+  const minutes = Math.max(1, Number.parseInt(String(interval), 10) || 1);
+  return Math.floor(1440 / minutes);
+}
+
+function blockAtrMaxPeriod(interval = "3m") {
+  return Math.max(1, Math.min(400, blockSourceMaxHistory(interval) - 1));
+}
+
+function clampBlockAtrPeriod(value, interval = "3m") {
+  const maximum = blockAtrMaxPeriod(interval);
+  return Math.min(maximum, Math.max(1, Number.parseInt(value, 10) || Math.min(14, maximum)));
+}
+
+function conditionSideExpression(condition, side) {
+  const expression = condition?.[`${side}_expression`];
+  return expression && typeof expression === "object" ? expression : null;
+}
+
+function walkConditionExpression(expression, visitor) {
+  if (!expression || typeof expression !== "object") return;
+  visitor(expression);
+  if (expression.kind === "binary") {
+    walkConditionExpression(expression.left, visitor);
+    walkConditionExpression(expression.right, visitor);
+  }
+}
+
+function expressionContainsMetric(expression, metric) {
+  let found = false;
+  walkConditionExpression(expression, node => {
+    if (node.kind === "metric" && node.metric === metric) found = true;
+  });
+  return found;
+}
+
+function expressionDepth(expression) {
+  if (!expression || expression.kind !== "binary") return 0;
+  return 1 + Math.max(expressionDepth(expression.left), expressionDepth(expression.right));
+}
+
+function expressionNodeCount(expression) {
+  if (!expression || expression.kind !== "binary") return expression ? 1 : 0;
+  return 1 + expressionNodeCount(expression.left) + expressionNodeCount(expression.right);
+}
+
+function expressionNodeAt(expression, path) {
+  return path.reduce((node, key) => node?.kind === "binary" ? node[key] : null, expression);
+}
+
+function replaceExpressionNode(expression, path, replacement) {
+  if (!path.length) return replacement;
+  const parent = expressionNodeAt(expression, path.slice(0, -1));
+  if (parent?.kind === "binary") parent[path.at(-1)] = replacement;
+  return expression;
+}
+
+function expressionMetricLeaf(metric = "close", source = {}) {
+  const barInterval = source.bar_interval || "3m";
+  return {
+    kind: "metric",
+    metric,
+    offset: Math.max(0, Number.parseInt(source.offset, 10) || 0),
+    bar_interval: barInterval,
+    bar_data_mode: source.bar_data_mode || "COMPLETE_ONLY",
+    bollinger_period: Math.max(2, Number.parseInt(source.bollinger_period, 10) || 55),
+    bollinger_stddev: String(source.bollinger_stddev ?? "1.04"),
+    atr_period: clampBlockAtrPeriod(source.atr_period, barInterval),
+  };
+}
+
+function legacyOperandExpression(condition, side) {
+  const metric = condition?.[side] || "close";
+  if (metric === "value") return { kind: "constant", value: String(condition?.value ?? "0") };
+  return expressionMetricLeaf(metric, {
+    offset: condition?.[`${side}_offset`],
+    bar_interval: condition?.[`${side}_bar_interval`],
+    bar_data_mode: condition?.[`${side}_bar_data_mode`],
+    bollinger_period: condition?.[`${side}_bollinger_period`],
+    bollinger_stddev: condition?.[`${side}_bollinger_stddev`],
+    atr_period: condition?.[`${side}_atr_period`],
+  });
+}
+
+function displayedExpressionOffset(expression) {
+  const offset = Math.max(0, Number.parseInt(expression?.offset, 10) || 0);
+  return (expression?.bar_data_mode || "COMPLETE_ONLY") === "COMPLETE_ONLY" ? offset + 1 : offset;
+}
+
+function expressionBarPosition(expression) {
+  const displayed = displayedExpressionOffset(expression);
+  if ((expression?.bar_data_mode || "COMPLETE_ONLY") === "COMPLETE_ONLY") return `${displayed}봉 전 완성봉`;
+  return displayed === 0 ? "현재 진행봉" : `${displayed}봉 전 (진행봉 포함)`;
+}
+
+function expressionIntervalLabel(interval = "3m") {
+  return interval === "1d" ? "일봉" : `${String(interval).replace("m", "")}분봉`;
+}
+
+function conditionExpressionSummary(expression) {
+  if (!expression || typeof expression !== "object") return "값 미설정";
+  if (expression.kind === "constant") return String(expression.value ?? "0");
+  if (expression.kind === "binary") {
+    const operator = new Map(BLOCK_EXPRESSION_OPERATORS).get(expression.operator) || expression.operator || "+";
+    return `(${conditionExpressionSummary(expression.left)} ${operator} ${conditionExpressionSummary(expression.right)})`;
+  }
+  const label = new Map(BLOCK_CONDITION_METRICS).get(expression.metric) || expression.metric || "지표";
+  if (expression.metric === "average_price" || expression.metric === "profit_rate") return label;
+  const interval = expressionIntervalLabel(expression.bar_interval);
+  const position = expressionBarPosition(expression);
+  if (expression.metric === "atr") return `ATR(${expression.atr_period || 14}, ${interval}, ${position})`;
+  if (String(expression.metric).startsWith("bollinger_")) {
+    return `${label}(${expression.bollinger_period || 55}, ${expression.bollinger_stddev || "1.04"}, ${interval}, ${position})`;
+  }
+  return `${label}(${interval}, ${position})`;
+}
+
 function isLiveProfitCondition(condition) {
-  const metrics = new Set([condition?.left, condition?.right]);
-  return metrics.has("profit_rate") && [...metrics].every(metric => ["profit_rate", "value"].includes(metric));
+  const metrics = [];
+  let hasOtherValue = false;
+  for (const side of ["left", "right"]) {
+    const expression = conditionSideExpression(condition, side);
+    if (!expression) {
+      const metric = condition?.[side];
+      if (metric && metric !== "value") metrics.push(metric);
+      continue;
+    }
+    walkConditionExpression(expression, node => {
+      if (node.kind === "metric") metrics.push(node.metric);
+      else if (node.kind !== "constant" && node.kind !== "binary") hasOtherValue = true;
+    });
+  }
+  return !hasOtherValue && metrics.includes("profit_rate") && metrics.every(metric => metric === "profit_rate");
+}
+
+function hasBarMetricCondition(condition) {
+  for (const side of ["left", "right"]) {
+    const expression = conditionSideExpression(condition, side);
+    if (expression) {
+      let found = false;
+      walkConditionExpression(expression, node => {
+        if (node.kind === "metric" && !["average_price", "profit_rate"].includes(node.metric)) found = true;
+      });
+      if (found) return true;
+      continue;
+    }
+    const metric = condition?.[side];
+    if (metric && !["value", "average_price", "profit_rate"].includes(metric)) return true;
+  }
+  return false;
+}
+
+function conditionMetricSources(condition) {
+  const sources = [];
+  for (const side of ["left", "right"]) {
+    const expression = conditionSideExpression(condition, side);
+    if (expression) {
+      walkConditionExpression(expression, node => {
+        if (node.kind === "metric") sources.push({
+          metric: node.metric,
+          interval: node.bar_interval || "3m",
+          mode: node.bar_data_mode || "COMPLETE_ONLY",
+        });
+      });
+      continue;
+    }
+    const metric = condition?.[side];
+    if (!metric || metric === "value") continue;
+    sources.push({
+      metric,
+      interval: condition?.[`${side}_bar_interval`] || "3m",
+      mode: condition?.[`${side}_bar_data_mode`] || "COMPLETE_ONLY",
+    });
+  }
+  return sources;
+}
+
+function conditionCanUseCross(condition) {
+  const sources = conditionMetricSources(condition);
+  if (sources.some(source => source.metric === "profit_rate")) return false;
+  const barSources = sources.filter(source => !["average_price", "profit_rate"].includes(source.metric));
+  if (!barSources.length) return false;
+  return new Set(barSources.map(source => `${source.interval}:${source.mode}`)).size === 1;
+}
+
+function conditionOperatorOptions(condition) {
+  if (conditionCanUseCross(condition)) return BLOCK_CONDITION_OPERATORS;
+  const ordinary = BLOCK_CONDITION_OPERATORS.filter(([key]) => !["CROSS_UP", "CROSS_DOWN"].includes(key));
+  const current = BLOCK_CONDITION_OPERATORS.find(([key]) => key === condition?.operator);
+  return current && ["CROSS_UP", "CROSS_DOWN"].includes(current[0])
+    ? [...ordinary, [current[0], `${current[1]} (현재 설정 · 변경 필요)`, true]]
+    : ordinary;
+}
+
+function normalizeConditionAtrPeriods(condition) {
+  for (const side of ["left", "right"]) {
+    const interval = condition?.[`${side}_bar_interval`] || "3m";
+    condition[`${side}_atr_period`] = clampBlockAtrPeriod(condition[`${side}_atr_period`], interval);
+    const expression = conditionSideExpression(condition, side);
+    walkConditionExpression(expression, node => {
+      if (node.kind !== "metric" || node.metric !== "atr") return;
+      node.bar_interval ||= "3m";
+      node.atr_period = clampBlockAtrPeriod(node.atr_period, node.bar_interval);
+    });
+  }
+  return condition;
 }
 
 function displayedConditionOffset(condition, side) {
@@ -2145,10 +2358,21 @@ function blockConditionTiming(condition) {
   if (isLiveProfitCondition(condition)) return "실시간 현재가";
   const labels = [];
   for (const side of ["left", "right"]) {
+    const expression = conditionSideExpression(condition, side);
+    if (expression) {
+      walkConditionExpression(expression, node => {
+        if (node.kind !== "metric") return;
+        if (node.metric === "profit_rate") labels.push("실시간 현재가");
+        else if (node.metric !== "average_price") {
+          labels.push(`${expressionIntervalLabel(node.bar_interval)} ${expressionBarPosition(node)}`);
+        }
+      });
+      continue;
+    }
     const metric = condition?.[side];
     if (!metric || metric === "value" || metric === "average_price" || metric === "profit_rate") continue;
     const interval = condition[`${side}_bar_interval`] || "3m";
-    const intervalLabel = interval === "1d" ? "일봉" : `${interval.replace("m", "")}분봉`;
+    const intervalLabel = expressionIntervalLabel(interval);
     labels.push(`${intervalLabel} ${blockConditionBarPosition(condition, side)}`);
   }
   return [...new Set(labels)].join(" · ") || "계좌 값";
@@ -2177,10 +2401,11 @@ function bindBlockConditionControl(control, onChange) {
 function conditionSelect(items, value, disabled, onChange) {
   const select = document.createElement("select");
   select.className = "block-condition-control";
-  for (const [key, label] of items) {
+  for (const [key, label, optionDisabled = false] of items) {
     const option = document.createElement("option");
     option.value = key;
     option.textContent = label;
+    option.disabled = optionDisabled;
     select.append(option);
   }
   select.value = value;
@@ -2199,13 +2424,22 @@ function updateBlockCondition(kind, groupIndex, conditionIndex, key, value, flow
   const rows = blockConditionGroups(kind, flowId)[groupIndex]?.conditions;
   if (!Array.isArray(rows) || !rows[conditionIndex]) return;
   const condition = rows[conditionIndex];
-  const normalized = [
-    "left_offset", "right_offset", "left_bollinger_period", "right_bollinger_period",
-  ].includes(key)
-    ? Math.max(0, Number.parseInt(value, 10) || 0)
+  const atrSide = key.match(/^(left|right)_atr_period$/)?.[1];
+  const normalized = atrSide
+    ? clampBlockAtrPeriod(value, condition[`${atrSide}_bar_interval`] || "3m")
+    : [
+      "left_offset", "right_offset", "left_bollinger_period", "right_bollinger_period",
+    ].includes(key)
+      ? Math.max(0, Number.parseInt(value, 10) || 0)
     : ["value", "left_bollinger_stddev", "right_bollinger_stddev"].includes(key)
       ? String(value || "0") : value;
   condition[key] = normalized;
+  const intervalSide = key.match(/^(left|right)_bar_interval$/)?.[1];
+  if (intervalSide) {
+    condition[`${intervalSide}_atr_period`] = clampBlockAtrPeriod(
+      condition[`${intervalSide}_atr_period`], normalized,
+    );
+  }
   if (["left", "right"].includes(key)) {
     const other = key === "left" ? "right" : "left";
     if (normalized === "obv") {
@@ -2219,6 +2453,11 @@ function updateBlockCondition(kind, groupIndex, conditionIndex, key, value, flow
     } else if (condition[other] === "obv") {
       condition[other] = key === "left" ? "value" : "close";
     }
+    if (normalized === "atr") {
+      condition[`${key}_atr_period`] = clampBlockAtrPeriod(
+        condition[`${key}_atr_period`], condition[`${key}_bar_interval`] || "3m",
+      );
+    }
   }
   if (condition.left === "obv" && condition.right === "obv") {
     for (const suffix of ["bar_interval", "bar_data_mode"]) {
@@ -2230,14 +2469,49 @@ function updateBlockCondition(kind, groupIndex, conditionIndex, key, value, flow
   if (render) renderStrategyBlocks();
 }
 
+function mutateBlockExpression(kind, groupIndex, conditionIndex, side, path, mutator, flowId = null, render = true) {
+  const rows = blockConditionGroups(kind, flowId)[groupIndex]?.conditions;
+  const condition = rows?.[conditionIndex];
+  if (!condition) return;
+  const key = `${side}_expression`;
+  const root = conditionSideExpression(condition, side);
+  if (!root) return;
+  const node = expressionNodeAt(root, path);
+  if (!node) return;
+  const replacement = mutator(node, root);
+  if (replacement && replacement !== node) condition[key] = replaceExpressionNode(root, path, replacement);
+  setDirty(true);
+  if (render) renderStrategyBlocks();
+}
+
+function enableBlockExpression(kind, groupIndex, conditionIndex, side, flowId = null) {
+  const rows = blockConditionGroups(kind, flowId)[groupIndex]?.conditions;
+  const condition = rows?.[conditionIndex];
+  if (!condition) return;
+  condition[`${side}_expression`] = legacyOperandExpression(condition, side);
+  setDirty(true);
+  renderStrategyBlocks();
+}
+
+function disableBlockExpression(kind, groupIndex, conditionIndex, side, flowId = null) {
+  const rows = blockConditionGroups(kind, flowId)[groupIndex]?.conditions;
+  const condition = rows?.[conditionIndex];
+  if (!condition) return;
+  delete condition[`${side}_expression`];
+  setDirty(true);
+  renderStrategyBlocks();
+}
+
 function newBlockTradeCondition(kind) {
   return {
     left: "close", operator: kind === "buy" ? "GT" : "LT",
     right: "bollinger_upper", value: "0", left_offset: 0, right_offset: 0,
     left_bar_interval: "3m", left_bar_data_mode: "COMPLETE_ONLY",
     left_bollinger_period: 55, left_bollinger_stddev: "1.04",
+    left_atr_period: 14,
     right_bar_interval: "3m", right_bar_data_mode: "COMPLETE_ONLY",
     right_bollinger_period: 55, right_bollinger_stddev: "1.04",
+    right_atr_period: 14,
   };
 }
 
@@ -2276,21 +2550,228 @@ function removeConditionGroup(kind, groupIndex, flowId = null) {
 
 const BLOCK_BAR_INTERVALS = ["1m", "3m", "5m", "10m", "15m", "30m", "60m", "120m", "1d"];
 
+function expressionField(labelText, control) {
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  label.append(control);
+  return label;
+}
+
+function expressionInput({ type = "number", value, min = null, max = null, step = null, disabled, onChange }) {
+  const input = document.createElement("input");
+  input.type = type;
+  input.value = value;
+  if (min != null) input.min = String(min);
+  if (max != null) input.max = String(max);
+  if (step != null) input.step = String(step);
+  input.disabled = disabled;
+  bindBlockConditionControl(input, onChange);
+  return input;
+}
+
+function expressionMetricOptions(kind, currentMetric = null) {
+  const options = kind === "buy"
+    ? BLOCK_EXPRESSION_METRICS.filter(([key]) => !["average_price", "profit_rate"].includes(key))
+    : BLOCK_EXPRESSION_METRICS;
+  return currentMetric === "obv" ? [...options, ["obv", "OBV"]] : options;
+}
+
+function createExpressionNodeEditor(kind, groupIndex, conditionIndex, side, expression, path, disabled, flowId, rootExpression) {
+  const box = document.createElement("div");
+  box.style.cssText = "grid-column:1/-1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:7px;border:1px solid #d8dee8;border-radius:6px;background:#fff";
+  const title = document.createElement("strong");
+  title.style.cssText = "grid-column:1/-1;color:#566377;font-size:9px";
+  title.textContent = expression.kind === "binary" ? "계산" : "값";
+  box.append(title);
+
+  const mutate = (mutator, render = true) => mutateBlockExpression(
+    kind, groupIndex, conditionIndex, side, path, mutator, flowId, render,
+  );
+
+  if (expression.kind === "binary") {
+    box.append(createExpressionNodeEditor(
+      kind, groupIndex, conditionIndex, side, expression.left, [...path, "left"], disabled, flowId, rootExpression,
+    ));
+    const operator = conditionSelect(BLOCK_EXPRESSION_OPERATORS, expression.operator || "ADD", disabled, (value, render) => {
+      mutate(node => { node.operator = value; }, render);
+    });
+    const operatorField = expressionField("연산", operator);
+    operatorField.style.gridColumn = "1 / -1";
+    box.append(operatorField);
+    box.append(createExpressionNodeEditor(
+      kind, groupIndex, conditionIndex, side, expression.right, [...path, "right"], disabled, flowId, rootExpression,
+    ));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button quiet compact danger-text";
+    remove.style.gridColumn = "1 / -1";
+    remove.textContent = "이 계산 제거 · 왼쪽 값 유지";
+    remove.disabled = disabled;
+    remove.addEventListener("click", () => mutate(node => structuredClone(node.left)));
+    box.append(remove);
+    const extend = document.createElement("button");
+    extend.type = "button";
+    extend.className = "button quiet compact";
+    extend.style.gridColumn = "1 / -1";
+    extend.textContent = "+ 이 계산 전체에 연산 추가";
+    extend.disabled = disabled || expressionContainsMetric(rootExpression, "obv")
+      || expressionDepth(rootExpression) >= 4 || expressionNodeCount(rootExpression) >= 31;
+    extend.addEventListener("click", () => mutate(node => ({
+      kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
+    })));
+    box.append(extend);
+    return box;
+  }
+
+  const selectedKind = expression.kind === "constant" ? "constant" : expression.metric;
+  const metric = conditionSelect(
+    expressionMetricOptions(kind, expression.metric), selectedKind, disabled || expression.metric === "obv", (value, render) => {
+    mutate(node => value === "constant"
+      ? { kind: "constant", value: "0" }
+      : expressionMetricLeaf(value, node.kind === "metric" ? node : {}), render);
+    },
+  );
+  const metricField = expressionField("값 종류", metric);
+  metricField.style.gridColumn = "1 / -1";
+  box.append(metricField);
+
+  if (expression.kind === "constant") {
+    const value = expressionInput({ value: expression.value ?? "0", step: "any", disabled,
+      onChange: (next, render) => mutate(node => { node.value = String(next || "0"); }, render) });
+    const valueField = expressionField("숫자", value);
+    valueField.style.gridColumn = "1 / -1";
+    box.append(valueField);
+  } else if (["average_price", "profit_rate"].includes(expression.metric)) {
+    const hint = document.createElement("span");
+    hint.className = "block-condition-operand-hint";
+    hint.textContent = expression.metric === "average_price"
+      ? "계좌의 평균 매수가를 사용합니다."
+      : "실시간 현재가와 평균 매수가로 계산하며 수수료·세금은 포함하지 않습니다.";
+    box.append(hint);
+  } else {
+    const interval = document.createElement("select");
+    BLOCK_BAR_INTERVALS.forEach(value => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value === "1d" ? "일봉" : value;
+      interval.append(option);
+    });
+    interval.value = expression.bar_interval || "3m";
+    interval.disabled = disabled;
+    bindBlockConditionControl(interval, (value, render) => mutate(node => {
+      node.bar_interval = value;
+      if (node.metric === "atr") node.atr_period = clampBlockAtrPeriod(node.atr_period, value);
+    }, render));
+
+    const mode = document.createElement("select");
+    [["COMPLETE_ONLY", "완성봉만"], ["INCLUDE_CURRENT", "진행 중 봉 포함"]].forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      mode.append(option);
+    });
+    mode.value = expression.bar_data_mode || "COMPLETE_ONLY";
+    mode.disabled = disabled;
+    bindBlockConditionControl(mode, (value, render) => mutate(node => { node.bar_data_mode = value; }, render));
+
+    const barDataMode = expression.bar_data_mode || "COMPLETE_ONLY";
+    const offset = expressionInput({ value: displayedExpressionOffset(expression),
+      min: barDataMode === "COMPLETE_ONLY" ? 1 : 0,
+      max: barDataMode === "COMPLETE_ONLY" ? 201 : 200,
+      disabled,
+      onChange: (value, render) => mutate(node => {
+        node.offset = storedConditionOffset(value, node.bar_data_mode || "COMPLETE_ONLY");
+      }, render) });
+    box.append(expressionField("봉 주기", interval), expressionField("봉 상태", mode), expressionField("봉 위치", offset));
+
+    if (expression.metric === "atr") {
+      const maximum = blockAtrMaxPeriod(expression.bar_interval);
+      const period = expressionInput({ value: clampBlockAtrPeriod(expression.atr_period, expression.bar_interval), min: 1, max: maximum, disabled,
+        onChange: (value, render) => mutate(node => {
+          node.atr_period = clampBlockAtrPeriod(value, node.bar_interval);
+          period.value = String(node.atr_period);
+        }, render) });
+      box.append(expressionField("ATR 기간", period));
+      const hint = document.createElement("span");
+      hint.className = "block-condition-operand-hint";
+      hint.textContent = "ATR은 실제 고가·저가·종가의 True Range를 Wilder 방식으로 평활합니다.";
+      box.append(hint);
+    }
+    if (String(expression.metric).startsWith("bollinger_")) {
+      const period = expressionInput({ value: expression.bollinger_period || 55, min: 2, max: 2000, disabled,
+        onChange: (value, render) => mutate(node => { node.bollinger_period = Math.max(2, Number.parseInt(value, 10) || 55); }, render) });
+      const deviation = expressionInput({ value: expression.bollinger_stddev ?? "1.04", min: .01, step: "any", disabled,
+        onChange: (value, render) => mutate(node => { node.bollinger_stddev = String(value || "1.04"); }, render) });
+      box.append(expressionField("볼린저 기간", period), expressionField("표준편차", deviation));
+    }
+    const offsetHint = document.createElement("span");
+    offsetHint.className = "block-condition-operand-hint";
+    offsetHint.textContent = barDataMode === "COMPLETE_ONLY"
+      ? "1봉 전이 가장 최근 완성봉입니다."
+      : "0봉 전이 현재 진행봉입니다.";
+    box.append(offsetHint);
+  }
+
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "button quiet compact";
+  add.style.gridColumn = "1 / -1";
+  add.textContent = "+ 이 값에 계산 추가";
+  add.disabled = disabled || expressionContainsMetric(rootExpression, "obv")
+    || expressionDepth(rootExpression) >= 4 || expressionNodeCount(rootExpression) >= 31;
+  add.addEventListener("click", () => mutate(node => ({
+    kind: "binary", operator: "ADD", left: structuredClone(node), right: { kind: "constant", value: "0" },
+  })));
+  box.append(add);
+  return box;
+}
+
+function appendExpressionModeAction(panel, { enabled, disabled, onClick }) {
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "button quiet compact";
+  action.style.cssText = "grid-column:1/-1;justify-self:start";
+  action.textContent = enabled ? "단순 값으로 되돌리기" : "+ 계산식 만들기";
+  action.disabled = disabled;
+  action.addEventListener("click", onClick);
+  panel.append(action);
+}
+
 function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, condition, disabled, flowId = null) {
   const panel = document.createElement("div");
   panel.className = "block-condition-operand";
+  const expression = conditionSideExpression(condition, side);
   const metric = condition[side];
   const title = document.createElement("strong");
-  title.textContent = metric === "profit_rate"
+  title.textContent = expression
+    ? `${side === "left" ? "왼쪽" : "오른쪽"} 계산식`
+    : metric === "profit_rate"
     ? "실시간 계산"
     : metric === "obv"
       ? "OBV 계산"
+    : metric === "atr"
+      ? "ATR 계산"
     : metric === "average_price"
       ? "계좌 값"
       : side === "right" && metric === "value"
         ? "비교 기준"
         : side === "left" ? "왼쪽 값 설정" : "오른쪽 값 설정";
   panel.append(title);
+  appendExpressionModeAction(panel, {
+    enabled: Boolean(expression), disabled: disabled || (!expression && metric === "obv"),
+    onClick: () => expression
+      ? disableBlockExpression(kind, groupIndex, conditionIndex, side, flowId)
+      : enableBlockExpression(kind, groupIndex, conditionIndex, side, flowId),
+  });
+  if (expression) {
+    const summary = document.createElement("span");
+    summary.className = "block-condition-operand-hint";
+    summary.textContent = conditionExpressionSummary(expression);
+    panel.append(summary, createExpressionNodeEditor(
+      kind, groupIndex, conditionIndex, side, expression, [], disabled, flowId, expression,
+    ));
+    return panel;
+  }
   if (side === "right" && metric === "value") {
     const row = document.createElement("label");
     row.textContent = "비교값";
@@ -2370,6 +2851,28 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
     obvHint.textContent = "OBV는 실제 종가 방향에 따라 거래량을 누적합니다. 양쪽 봉 주기와 봉 상태는 자동으로 같게 맞추며, 처음 선택하면 1봉 전과 11봉 전을 비교합니다.";
     panel.append(obvHint);
   }
+  if (metric === "atr") {
+    const periodRow = document.createElement("label");
+    periodRow.textContent = "ATR 기간";
+    const period = document.createElement("input");
+    period.type = "number";
+    period.min = "1";
+    period.max = String(blockAtrMaxPeriod(condition[`${side}_bar_interval`] || "3m"));
+    period.value = clampBlockAtrPeriod(
+      condition[`${side}_atr_period`], condition[`${side}_bar_interval`] || "3m",
+    );
+    period.disabled = disabled;
+    bindBlockConditionControl(period, (value, render) => {
+      const normalized = clampBlockAtrPeriod(value, condition[`${side}_bar_interval`] || "3m");
+      period.value = String(normalized);
+      updateBlockCondition(kind, groupIndex, conditionIndex, `${side}_atr_period`, normalized, flowId, render);
+    });
+    periodRow.append(period);
+    const atrHint = document.createElement("span");
+    atrHint.className = "block-condition-operand-hint";
+    atrHint.textContent = "ATR은 실제 고가·저가·종가의 True Range를 Wilder 방식으로 평활합니다.";
+    panel.append(periodRow, atrHint);
+  }
   if (metric.startsWith("bollinger_")) {
     const periodRow = document.createElement("label");
     periodRow.textContent = "볼린저 기간";
@@ -2407,20 +2910,35 @@ function createConditionEditor(kind, groupIndex, disabled, flowId = null) {
   const rightMetrics = [...metrics, ["value", "직접 값"]];
   const evaluationHint = document.createElement("p");
   evaluationHint.className = "block-condition-evaluation-hint";
-  evaluationHint.textContent = "위에서부터 확인하며 하나가 충족되면 다음 AND 조건 블록으로 진행합니다.";
+  evaluationHint.textContent = "위에서부터 확인하며 하나가 충족되면 다음 AND 조건 블록으로 진행합니다. 계산식은 선택한 값과 +, −, ×, ÷만 안전하게 조합합니다. 예: ((ATR(14) ÷ 종가) × 100) ≤ 3.0. 0으로 나눈 결과는 조건 불충족입니다.";
   wrap.append(evaluationHint);
   rows.forEach((condition, index) => {
     const row = document.createElement("div");
     row.className = "block-condition-row";
     const top = document.createElement("div");
     top.className = "block-condition-expression";
+    const operandControl = (side, options) => {
+      const expression = conditionSideExpression(condition, side);
+      if (!expression) return conditionSelect(options, condition[side], disabled, (value, render) => updateBlockCondition(
+        kind, groupIndex, index, side, value, flowId, render,
+      ));
+      const summary = document.createElement("div");
+      summary.className = "block-condition-control";
+      summary.style.cssText = "height:auto;min-height:28px;display:flex;align-items:center;overflow-wrap:anywhere;line-height:1.35;background:#f4f7fb;color:#344054";
+      summary.textContent = conditionExpressionSummary(expression);
+      summary.title = summary.textContent;
+      return summary;
+    };
     top.append(
-      conditionSelect(metrics, condition.left, disabled, (value, render) => updateBlockCondition(kind, groupIndex, index, "left", value, flowId, render)),
-      conditionSelect(BLOCK_CONDITION_OPERATORS, condition.operator, disabled, (value, render) => updateBlockCondition(kind, groupIndex, index, "operator", value, flowId, render)),
-      conditionSelect(rightMetrics, condition.right, disabled, (value, render) => updateBlockCondition(kind, groupIndex, index, "right", value, flowId, render)),
+      operandControl("left", metrics),
+      conditionSelect(conditionOperatorOptions(condition), condition.operator, disabled, (value, render) => updateBlockCondition(kind, groupIndex, index, "operator", value, flowId, render)),
+      operandControl("right", rightMetrics),
     );
     const detail = document.createElement("div");
     detail.className = "block-condition-operands";
+    if (conditionSideExpression(condition, "left") || conditionSideExpression(condition, "right")) {
+      detail.style.gridTemplateColumns = "minmax(0, 1fr)";
+    }
     detail.append(
       createConditionOperandEditor(kind, groupIndex, index, "left", condition, disabled, flowId),
       createConditionOperandEditor(kind, groupIndex, index, "right", condition, disabled, flowId),
@@ -2613,10 +3131,12 @@ function normalizeManagedBlockSettings(settings) {
         left_bar_data_mode: condition.left_bar_data_mode || common.bar_data_mode,
         left_bollinger_period: Number(condition.left_bollinger_period || common.bollinger_period),
         left_bollinger_stddev: String(condition.left_bollinger_stddev || common.bollinger_stddev),
+        left_atr_period: Number(condition.left_atr_period || 14),
         right_bar_interval: condition.right_bar_interval || common.bar_interval,
         right_bar_data_mode: condition.right_bar_data_mode || common.bar_data_mode,
         right_bollinger_period: Number(condition.right_bollinger_period || common.bollinger_period),
         right_bollinger_stddev: String(condition.right_bollinger_stddev || common.bollinger_stddev),
+        right_atr_period: Number(condition.right_atr_period || 14),
       }));
       delete group.bar_interval;
       delete group.bar_data_mode;
@@ -2641,9 +3161,16 @@ function normalizeManagedBlockSettings(settings) {
         right_bar_interval: condition.right_bar_interval || group.bar_interval || settings.bar_interval || "3m",
         left_bar_data_mode: condition.left_bar_data_mode || group.bar_data_mode || settings.bar_data_mode || "COMPLETE_ONLY",
         right_bar_data_mode: condition.right_bar_data_mode || group.bar_data_mode || settings.bar_data_mode || "COMPLETE_ONLY",
+        left_atr_period: Number(condition.left_atr_period || 14),
+        right_atr_period: Number(condition.right_atr_period || 14),
       }));
     });
   });
+  [
+    ...(settings.buy_condition_groups || []),
+    ...(settings.sell_condition_groups || []),
+    ...settings.buy_flows.flatMap(flow => flow.buy_condition_groups || []),
+  ].forEach(group => (group.conditions || []).forEach(normalizeConditionAtrPeriods));
   settings.buy_order_type ||= "MARKET";
   settings.sell_order_type ||= "MARKET";
   return settings;
@@ -3174,13 +3701,16 @@ function scheduleConditionSummary(group) {
   const operators = new Map(BLOCK_CONDITION_OPERATORS);
   const rows = group.conditions || [];
   const operand = (row, side) => {
+    const expression = conditionSideExpression(row, side);
+    if (expression) return conditionExpressionSummary(expression);
     const metric = row[side];
     if (side === "right" && metric === "value") return row.value;
     const label = labels.get(metric) || metric;
-    if (metric !== "obv") return label;
+    if (!["obv", "atr"].includes(metric)) return label;
     const interval = row[`${side}_bar_interval`] || "3m";
-    const intervalLabel = interval === "1d" ? "일봉" : `${interval.replace("m", "")}분봉`;
-    return `${label}(${intervalLabel} · ${blockConditionBarPosition(row, side)})`;
+    const intervalLabel = expressionIntervalLabel(interval);
+    const parameters = metric === "atr" ? `${row[`${side}_atr_period`] || 14} · ` : "";
+    return `${label}(${parameters}${intervalLabel} · ${blockConditionBarPosition(row, side)})`;
   };
   const snippets = rows.slice(0, 2).map(row => `${operand(row, "left")} ${operators.get(row.operator) || row.operator} ${operand(row, "right")}`);
   return `${snippets.join(" 또는 ")}${rows.length > 2 ? ` 외 ${rows.length - 2}개` : ""}`;
@@ -3334,9 +3864,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
   const sellGroups = blockConditionGroups("sell");
   const sellConditions = sellGroups.flatMap(group => group.conditions || []);
   const hasLiveSellConditions = sellConditions.some(isLiveProfitCondition);
-  const hasBarSellConditions = sellConditions.some(condition =>
-    [condition.left, condition.right].some(metric => metric && !["value", "average_price", "profit_rate"].includes(metric))
-  );
+  const hasBarSellConditions = sellConditions.some(hasBarMetricCondition);
   const sellScheduleMeta = hasLiveSellConditions && hasBarSellConditions ? "실시간 · 봉 시점" : hasLiveSellConditions ? "실시간" : "봉 시점";
   const sellScheduleActions = [
     ...(hasLiveSellConditions ? ["수익률 · 실시간 현재가"] : []),

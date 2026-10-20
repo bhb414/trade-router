@@ -4,7 +4,7 @@ import ast
 import json
 from datetime import time
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -57,6 +57,120 @@ def _normalize_managed_bar_interval(value: str) -> str:
     return f"{minutes}m"
 
 
+BlockMetricName = Literal[
+    "open", "high", "low", "close", "volume",
+    "heikin_open", "heikin_high", "heikin_low", "heikin_close",
+    "bollinger_upper", "bollinger_middle", "bollinger_lower",
+    "obv", "atr",
+    "average_price", "profit_rate",
+]
+
+_BLOCK_BAR_METRICS = frozenset({
+    "open", "high", "low", "close", "volume",
+    "heikin_open", "heikin_high", "heikin_low", "heikin_close",
+    "bollinger_upper", "bollinger_middle", "bollinger_lower",
+    "obv", "atr",
+})
+
+
+class BlockMetricExpression(BaseModel):
+    """A typed metric leaf in a condition expression.
+
+    ATR uses Wilder's true range smoothing.  ``atr_period`` is the Wilder
+    period; the runtime seeds the series with a simple average of the first
+    period true ranges and applies Wilder's recursive average thereafter.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["metric"] = "metric"
+    metric: BlockMetricName = "close"
+    offset: int = Field(default=0, ge=0, le=200)
+    bar_interval: str = Field(default="3m", max_length=16)
+    bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
+    bollinger_period: int = Field(default=55, ge=2, le=2_000)
+    bollinger_stddev: Decimal = Field(
+        default=Decimal("1.04"), gt=0, le=Decimal("20"), allow_inf_nan=False,
+    )
+    atr_period: int = Field(default=14, ge=1, le=400)
+
+    _validate_interval = field_validator("bar_interval")(_normalize_managed_bar_interval)
+
+
+class BlockConstantExpression(BaseModel):
+    """A finite numeric constant in a condition expression."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["constant"] = "constant"
+    value: Decimal = Field(
+        default=Decimal("0"),
+        ge=Decimal("-1000000000000000000"),
+        le=Decimal("1000000000000000000"),
+        allow_inf_nan=False,
+    )
+
+
+class BlockBinaryExpression(BaseModel):
+    """A safe arithmetic node.  It is interpreted without ``eval``."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["binary"] = "binary"
+    operator: Literal["ADD", "SUBTRACT", "MULTIPLY", "DIVIDE"] = "ADD"
+    left: "BlockConditionExpression"
+    right: "BlockConditionExpression"
+
+
+BlockConditionExpression = Annotated[
+    BlockMetricExpression | BlockConstantExpression | BlockBinaryExpression,
+    Field(discriminator="kind"),
+]
+BlockBinaryExpression.model_rebuild(
+    _types_namespace={"BlockConditionExpression": BlockConditionExpression},
+)
+
+
+def _expression_nodes(
+    expression: BlockConditionExpression,
+    *,
+    depth: int = 0,
+) -> tuple[int, int, list[BlockMetricExpression]]:
+    """Return node count, maximum depth, and metric leaves."""
+
+    if not isinstance(expression, BlockBinaryExpression):
+        metrics = [expression] if isinstance(expression, BlockMetricExpression) else []
+        return 1, depth, metrics
+    left_count, left_depth, left_metrics = _expression_nodes(expression.left, depth=depth + 1)
+    right_count, right_depth, right_metrics = _expression_nodes(expression.right, depth=depth + 1)
+    return (
+        1 + left_count + right_count,
+        max(depth, left_depth, right_depth),
+        [*left_metrics, *right_metrics],
+    )
+
+
+def _condition_metric_leaves(condition: "BlockTradeCondition") -> list[BlockMetricExpression]:
+    """Return effective metric leaves, adapting legacy side fields."""
+
+    metrics: list[BlockMetricExpression] = []
+    for side in ("left", "right"):
+        expression = getattr(condition, f"{side}_expression")
+        if expression is not None:
+            metrics.extend(_expression_nodes(expression)[2])
+            continue
+        metric = getattr(condition, side)
+        if metric == "value":
+            continue
+        metrics.append(BlockMetricExpression(
+            metric=metric,
+            offset=getattr(condition, f"{side}_offset"),
+            bar_interval=getattr(condition, f"{side}_bar_interval"),
+            bar_data_mode=getattr(condition, f"{side}_bar_data_mode"),
+            bollinger_period=getattr(condition, f"{side}_bollinger_period"),
+            bollinger_stddev=getattr(condition, f"{side}_bollinger_stddev"),
+            atr_period=getattr(condition, f"{side}_atr_period"),
+        ))
+    return metrics
+
+
 class BlockTradeCondition(BaseModel):
     """One broker-neutral comparison used by a managed block strategy."""
 
@@ -65,7 +179,7 @@ class BlockTradeCondition(BaseModel):
         "open", "high", "low", "close", "volume",
         "heikin_open", "heikin_high", "heikin_low", "heikin_close",
         "bollinger_upper", "bollinger_middle", "bollinger_lower",
-        "obv",
+        "obv", "atr",
         "average_price", "profit_rate",
     ] = "close"
     operator: Literal["LT", "LTE", "GT", "GTE", "EQ", "CROSS_UP", "CROSS_DOWN"] = "LT"
@@ -73,7 +187,7 @@ class BlockTradeCondition(BaseModel):
         "open", "high", "low", "close", "volume",
         "heikin_open", "heikin_high", "heikin_low", "heikin_close",
         "bollinger_upper", "bollinger_middle", "bollinger_lower",
-        "obv",
+        "obv", "atr",
         "average_price", "profit_rate", "value",
     ] = "bollinger_upper"
     value: Decimal = Decimal("0")
@@ -87,23 +201,83 @@ class BlockTradeCondition(BaseModel):
     right_bar_data_mode: Literal["COMPLETE_ONLY", "INCLUDE_CURRENT"] = "COMPLETE_ONLY"
     right_bollinger_period: int = Field(default=55, ge=2, le=2_000)
     right_bollinger_stddev: Decimal = Field(default=Decimal("1.04"), gt=0, le=Decimal("20"))
+    left_atr_period: int = Field(default=14, ge=1, le=400)
+    right_atr_period: int = Field(default=14, ge=1, le=400)
+    left_expression: BlockConditionExpression | None = None
+    right_expression: BlockConditionExpression | None = None
 
     _validate_intervals = field_validator(
         "left_bar_interval", "right_bar_interval",
     )(_normalize_managed_bar_interval)
 
     @model_validator(mode="after")
-    def validate_obv_comparison(self) -> "BlockTradeCondition":
-        if "obv" not in {self.left, self.right}:
+    def validate_expressions(self) -> "BlockTradeCondition":
+        expressions = [
+            expression
+            for expression in (self.left_expression, self.right_expression)
+            if expression is not None
+        ]
+        for expression in expressions:
+            node_count, depth, _ = _expression_nodes(expression)
+            if depth > 4:
+                raise ValueError("조건 수식은 최대 4단계까지 중첩할 수 있습니다.")
+            if node_count > 31:
+                raise ValueError("조건 수식은 최대 31개 항목까지 사용할 수 있습니다.")
+
+        # OBV is anchored at zero at the beginning of a bounded history
+        # window.  Only a direct same-series, different-offset comparison has
+        # an anchor-independent meaning, so preserve that safety rule for the
+        # expression schema as well as the legacy fields.
+        metrics = _condition_metric_leaves(self)
+        if self.operator in {"CROSS_UP", "CROSS_DOWN"}:
+            if any(metric.metric == "profit_rate" for metric in metrics):
+                raise ValueError("교차 조건에서는 실시간 수익률을 사용할 수 없습니다.")
+            bar_metrics = [
+                metric for metric in metrics if metric.metric in _BLOCK_BAR_METRICS
+            ]
+            if not bar_metrics:
+                raise ValueError("교차 조건에는 봉 지표가 하나 이상 필요합니다.")
+            bar_series = {
+                (metric.bar_interval, metric.bar_data_mode)
+                for metric in bar_metrics
+            }
+            if len(bar_series) != 1:
+                raise ValueError(
+                    "교차 조건의 모든 봉 지표는 같은 봉 주기와 봉 상태를 사용해야 합니다."
+                )
+        if not any(metric.metric == "obv" for metric in metrics):
             return self
-        if self.left != "obv" or self.right != "obv":
-            raise ValueError("OBV는 기준점에 따라 절대값이 달라지므로 다른 시점의 OBV와 비교해야 합니다.")
+
+        def obv_source(side: str) -> BlockMetricExpression | None:
+            expression = getattr(self, f"{side}_expression")
+            if expression is not None:
+                return (
+                    expression
+                    if isinstance(expression, BlockMetricExpression) and expression.metric == "obv"
+                    else None
+                )
+            if getattr(self, side) != "obv":
+                return None
+            return BlockMetricExpression(
+                metric="obv",
+                offset=getattr(self, f"{side}_offset"),
+                bar_interval=getattr(self, f"{side}_bar_interval"),
+                bar_data_mode=getattr(self, f"{side}_bar_data_mode"),
+                bollinger_period=getattr(self, f"{side}_bollinger_period"),
+                bollinger_stddev=getattr(self, f"{side}_bollinger_stddev"),
+                atr_period=getattr(self, f"{side}_atr_period"),
+            )
+
+        left_source = obv_source("left")
+        right_source = obv_source("right")
+        if left_source is None or right_source is None:
+            raise ValueError("OBV는 기준점과 무관한 직접 시점 비교에만 사용할 수 있습니다.")
         if (
-            self.left_bar_interval != self.right_bar_interval
-            or self.left_bar_data_mode != self.right_bar_data_mode
+            left_source.bar_interval != right_source.bar_interval
+            or left_source.bar_data_mode != right_source.bar_data_mode
         ):
             raise ValueError("OBV 비교의 양쪽은 같은 봉 주기와 봉 상태를 사용해야 합니다.")
-        if self.left_offset == self.right_offset:
+        if left_source.offset == right_source.offset:
             raise ValueError("OBV 비교의 양쪽은 서로 다른 봉 위치를 사용해야 합니다.")
         return self
 
@@ -354,7 +528,10 @@ class ConditionBollingerBlockSettings(BaseModel):
         )]
         for group in all_buy_groups:
             for condition in group.conditions:
-                if condition.left in position_only_metrics or condition.right in position_only_metrics:
+                if any(
+                    metric.metric in position_only_metrics
+                    for metric in _condition_metric_leaves(condition)
+                ):
                     raise ValueError(
                         "매수 조건에서는 보유 후에만 생기는 평균 매수가·수익률을 사용할 수 없습니다."
                     )
@@ -363,18 +540,29 @@ class ConditionBollingerBlockSettings(BaseModel):
             raise ValueError("매수·매도 조건 블록 ID는 서로 달라야 합니다.")
         for group in (*all_buy_groups, *self.sell_condition_groups):
             for condition in group.conditions:
-                for side in ("left", "right"):
-                    metric = getattr(condition, side)
-                    if metric in {"value", "average_price", "profit_rate"}:
+                for source in _condition_metric_leaves(condition):
+                    metric = source.metric
+                    if metric in {"average_price", "profit_rate"}:
                         continue
-                    offset = getattr(condition, f"{side}_offset")
+                    offset = source.offset
                     if condition.operator in {"CROSS_UP", "CROSS_DOWN"}:
                         offset += 1
-                    period = getattr(condition, f"{side}_bollinger_period")
-                    required_bars = offset + (
-                        period if metric.startswith("bollinger_") else 1
-                    )
-                    interval = getattr(condition, f"{side}_bar_interval")
+                    if metric.startswith("bollinger_"):
+                        period = source.bollinger_period
+                    elif metric == "atr":
+                        # One primer bar supplies the previous close for the
+                        # first true range. The rolling warm-up window is
+                        # independent of the target offset, matching the chart.
+                        period = source.atr_period + 1
+                    elif metric.startswith("heikin_"):
+                        period = 24
+                    else:
+                        period = 1
+                    interval = source.bar_interval
+                    max_history = 400 if interval == "1d" else 1_440 // int(interval[:-1])
+                    if metric == "atr" and period <= max_history:
+                        period += min(100, max_history - period)
+                    required_bars = period + offset
                     if interval == "1d":
                         if required_bars > 400:
                             raise ValueError(
@@ -537,8 +725,8 @@ _CONDITION_BOLLINGER_SOURCE = '''"""Trade Router가 관리하는 종목 데이�
 
 import asyncio
 import json
-from datetime import datetime, time
-from decimal import Decimal
+from datetime import datetime, time, timedelta
+from decimal import Decimal, DecimalException
 from zoneinfo import ZoneInfo
 
 from trade_router import OrderStatus, RankingKind, RiskLimits, RouterError, ScheduleKind, Strategy, StrategyConfig, Venue
@@ -615,14 +803,40 @@ BAR_METRICS = {
     "open", "high", "low", "close", "volume",
     "heikin_open", "heikin_high", "heikin_low", "heikin_close",
     "bollinger_upper", "bollinger_middle", "bollinger_lower",
-    "obv",
+    "obv", "atr",
 }
+
+
+def _expression_metric_leaves(expression):
+    if not expression:
+        return ()
+    if expression.get("kind") == "metric":
+        return (expression,)
+    if expression.get("kind") != "binary":
+        return ()
+    return (
+        *_expression_metric_leaves(expression.get("left")),
+        *_expression_metric_leaves(expression.get("right")),
+    )
+
+
+def _condition_metric_names(condition):
+    names = []
+    for side in ("left", "right"):
+        expression = condition.get(f"{side}_expression")
+        if expression:
+            names.extend(item["metric"] for item in _expression_metric_leaves(expression))
+        else:
+            names.append(condition.get(side))
+    return tuple(name for name in names if name)
+
+
 NEEDS_BARS = any(
-    condition.get(side) in BAR_METRICS
+    metric in BAR_METRICS
     for groups in (*[flow["buy_condition_groups"] for flow in BUY_FLOWS], SELL_CONDITION_GROUPS)
     for group in groups
     for condition in group["conditions"]
-    for side in ("left", "right")
+    for metric in _condition_metric_names(condition)
 )
 DISCOVERY_CAPABILITIES = tuple(dict.fromkeys(
     {"HTS_CONDITION": "conditions", "RANKING": "rankings"}.get(flow["target_source"])
@@ -777,8 +991,35 @@ class ManagedBlockStrategy(Strategy):
             "bar_data_mode": condition[f"{side}_bar_data_mode"],
             "bollinger_period": int(condition[f"{side}_bollinger_period"]),
             "bollinger_stddev": Decimal(str(condition[f"{side}_bollinger_stddev"])),
+            "atr_period": int(condition.get(f"{side}_atr_period", 14)),
             "offset": int(condition.get(f"{side}_offset", 0)),
         }
+
+    @staticmethod
+    def _expression_source(expression):
+        return {
+            "metric": expression["metric"],
+            "bar_interval": expression.get("bar_interval", "3m"),
+            "bar_data_mode": expression.get("bar_data_mode", "COMPLETE_ONLY"),
+            "bollinger_period": int(expression.get("bollinger_period", 55)),
+            "bollinger_stddev": Decimal(str(expression.get("bollinger_stddev", "1.04"))),
+            "atr_period": int(expression.get("atr_period", 14)),
+            "offset": int(expression.get("offset", 0)),
+        }
+
+    @classmethod
+    def _condition_sources(cls, condition):
+        sources = []
+        for side in ("left", "right"):
+            expression = condition.get(f"{side}_expression")
+            if expression:
+                sources.extend(
+                    cls._expression_source(item)
+                    for item in _expression_metric_leaves(expression)
+                )
+            elif not (side == "right" and condition.get("right") == "value"):
+                sources.append(cls._condition_source(condition, side))
+        return sources
 
     @staticmethod
     def _source_uses_bars(source):
@@ -788,6 +1029,12 @@ class ManagedBlockStrategy(Strategy):
     def _source_key(source):
         return source["bar_interval"], source["bar_data_mode"] == "COMPLETE_ONLY"
 
+    @staticmethod
+    def _max_source_history(source):
+        if source["bar_interval"] == "1d":
+            return 400
+        return 1440 // int(source["bar_interval"][:-1])
+
     @classmethod
     def _required_source_bars(cls, source, *, crossing=False):
         if not cls._source_uses_bars(source):
@@ -795,6 +1042,14 @@ class ManagedBlockStrategy(Strategy):
         offset = source["offset"] + (1 if crossing else 0)
         if source["metric"].startswith("bollinger_"):
             period = source["bollinger_period"]
+        elif source["metric"] == "atr":
+            # A primer bar supplies the previous close for the first true
+            # range. The fixed rolling window does not shrink when evaluating
+            # an older offset or the previous point of a crossing condition.
+            base = source["atr_period"] + 1
+            maximum = cls._max_source_history(source)
+            window = base + min(100, maximum - base) if base <= maximum else base
+            return window + offset
         elif source["metric"].startswith("heikin_"):
             # The recursive Heikin-Ashi open converges quickly.  A fixed warm-up
             # keeps comparisons stable without forcing a full-session download.
@@ -807,10 +1062,7 @@ class ManagedBlockStrategy(Strategy):
     def _condition_requests(cls, condition):
         requests = {}
         crossing = condition["operator"] in {"CROSS_UP", "CROSS_DOWN"}
-        for side in ("left", "right"):
-            if side == "right" and condition["right"] == "value":
-                continue
-            source = cls._condition_source(condition, side)
+        for source in cls._condition_sources(condition):
             required = cls._required_source_bars(source, crossing=crossing)
             if required:
                 key = cls._source_key(source)
@@ -872,6 +1124,40 @@ class ManagedBlockStrategy(Strategy):
             previous_close = bar.close
         return values
 
+    @staticmethod
+    def _atr_values(bars, period):
+        """Return Wilder ATR values aligned to ``bars``.
+
+        The first bar primes the previous close. Each later true range is the
+        maximum of ``high-low``, ``abs(high-previous close)``, and
+        ``abs(low-previous close)``. The first ATR is the SMA of the first
+        ``period`` true ranges; subsequent values use Wilder's recursive
+        ``(previous ATR * (period - 1) + TR) / period`` smoothing.
+        """
+        period = int(period)
+        if period < 1:
+            return [None for _ in bars]
+        true_ranges = [None]
+        for index in range(1, len(bars)):
+            bar = bars[index]
+            previous_close = bars[index - 1].close
+            true_ranges.append(max(
+                bar.high - bar.low,
+                abs(bar.high - previous_close),
+                abs(bar.low - previous_close),
+            ))
+        values = [None for _ in bars]
+        if len(bars) < period + 1:
+            return values
+        current = sum(true_ranges[1:period + 1], Decimal("0")) / Decimal(period)
+        values[period] = current
+        for index in range(period + 1, len(true_ranges)):
+            current = (
+                current * Decimal(period - 1) + true_ranges[index]
+            ) / Decimal(period)
+            values[index] = current
+        return values
+
     def _indicator_value(self, metric, bars, offset, average_price, source, current_price=None):
         if metric == "average_price":
             return average_price if average_price and average_price > 0 else None
@@ -898,6 +1184,9 @@ class ManagedBlockStrategy(Strategy):
         if metric == "obv":
             values = self._obv_values(bars)
             return values[index] if index < len(values) else None
+        if metric == "atr":
+            values = self._atr_values(bars, source["atr_period"])
+            return values[index] if index < len(values) else None
         if metric in {"bollinger_upper", "bollinger_middle", "bollinger_lower"}:
             values = self._bollinger_values(bars, offset, source)
             if values is None:
@@ -907,7 +1196,7 @@ class ManagedBlockStrategy(Strategy):
 
     def _condition_operand_value(
         self, condition, side, bars_by_request, average_price, extra_offset=0,
-        current_price=None,
+        current_price=None, crossing=False,
     ):
         if side == "right" and condition["right"] == "value":
             return Decimal(str(condition.get("value", "0")))
@@ -915,6 +1204,10 @@ class ManagedBlockStrategy(Strategy):
         bars = ()
         if self._source_uses_bars(source):
             bars = bars_by_request.get(self._source_key(source), ())
+            if source["metric"] in {"atr"} or source["metric"].startswith("heikin_"):
+                value_source = {**source, "offset": source["offset"] + extra_offset}
+                required = self._required_source_bars(value_source)
+                bars = bars[-required:]
         return self._indicator_value(
             source["metric"],
             bars,
@@ -924,22 +1217,83 @@ class ManagedBlockStrategy(Strategy):
             current_price,
         )
 
+    def _expression_value(
+        self, expression, bars_by_request, average_price, extra_offset=0,
+        current_price=None, crossing=False,
+    ):
+        kind = expression.get("kind")
+        if kind == "constant":
+            value = Decimal(str(expression.get("value", "0")))
+            return value if value.is_finite() else None
+        if kind == "metric":
+            source = self._expression_source(expression)
+            bars = ()
+            if self._source_uses_bars(source):
+                bars = bars_by_request.get(self._source_key(source), ())
+                if source["metric"] in {"atr"} or source["metric"].startswith("heikin_"):
+                    value_source = {**source, "offset": source["offset"] + extra_offset}
+                    required = self._required_source_bars(value_source)
+                    bars = bars[-required:]
+            return self._indicator_value(
+                source["metric"],
+                bars,
+                source["offset"] + extra_offset,
+                average_price,
+                source,
+                current_price,
+            )
+        if kind != "binary":
+            return None
+        left = self._expression_value(
+            expression["left"], bars_by_request, average_price,
+            extra_offset, current_price, crossing,
+        )
+        right = self._expression_value(
+            expression["right"], bars_by_request, average_price,
+            extra_offset, current_price, crossing,
+        )
+        if left is None or right is None:
+            return None
+        try:
+            operator = expression["operator"]
+            if operator == "ADD":
+                result = left + right
+            elif operator == "SUBTRACT":
+                result = left - right
+            elif operator == "MULTIPLY":
+                result = left * right
+            elif operator == "DIVIDE":
+                if right == 0:
+                    return None
+                result = left / right
+            else:
+                return None
+        except (DecimalException, ArithmeticError):
+            return None
+        return result if result.is_finite() else None
+
     def _condition_values(
         self, condition, bars_by_request, average_price, extra_offset=0,
-        current_price=None,
+        current_price=None, crossing=False,
     ):
-        return (
-            self._condition_operand_value(
-                condition, "left", bars_by_request, average_price, extra_offset, current_price,
-            ),
-            self._condition_operand_value(
-                condition, "right", bars_by_request, average_price, extra_offset, current_price,
-            ),
-        )
+        values = []
+        for side in ("left", "right"):
+            expression = condition.get(f"{side}_expression")
+            if expression:
+                values.append(self._expression_value(
+                    expression, bars_by_request, average_price, extra_offset, current_price, crossing,
+                ))
+            else:
+                values.append(self._condition_operand_value(
+                    condition, side, bars_by_request, average_price, extra_offset, current_price, crossing,
+                ))
+        return tuple(values)
 
     def _condition_matches(self, condition, bars_by_request, average_price, current_price=None):
+        crossing = condition["operator"] in {"CROSS_UP", "CROSS_DOWN"}
         left, right = self._condition_values(
             condition, bars_by_request, average_price, current_price=current_price,
+            crossing=crossing,
         )
         if left is None or right is None:
             return False
@@ -955,7 +1309,7 @@ class ManagedBlockStrategy(Strategy):
         if operator == "EQ":
             return left == right
         previous_left, previous_right = self._condition_values(
-            condition, bars_by_request, average_price, 1, current_price,
+            condition, bars_by_request, average_price, 1, current_price, crossing,
         )
         if previous_left is None or previous_right is None:
             return False
@@ -965,6 +1319,61 @@ class ManagedBlockStrategy(Strategy):
             return previous_left >= previous_right and left < right
         return False
 
+    @staticmethod
+    async def _condition_history(ctx, code, key, required, existing=()):
+        """Fetch one condition series without exceeding the router's page limit."""
+        interval, complete_only = key
+        seed = tuple(
+            bar for bar in existing
+            if not complete_only or getattr(bar, "complete", True)
+        )
+        if any(not hasattr(bar, "open_time") for bar in seed):
+            # Production Bar objects always have open_time. A custom adapter
+            # without it cannot expose a stable cursor for another page.
+            return seed[-required:]
+
+        collected = {
+            bar.open_time: bar
+            for bar in seed
+        }
+        if len(collected) >= required:
+            return tuple(
+                bar for _, bar in sorted(collected.items(), key=lambda item: item[0])
+            )[-required:]
+        end = (
+            min(bar.open_time for bar in seed) - timedelta(microseconds=1)
+            if seed else None
+        )
+        while len(collected) < required:
+            page_count = min(400, required - len(collected))
+            page = tuple(await ctx.market.bars(
+                code,
+                interval,
+                count=page_count,
+                venue=Venue(MARKET_VENUE),
+                complete_only=complete_only,
+                end=end,
+            ))
+            if not page:
+                break
+            eligible = tuple(
+                bar for bar in page
+                if not complete_only or getattr(bar, "complete", True)
+            )
+            if any(not hasattr(bar, "open_time") for bar in page):
+                # Keep simple test/custom adapters compatible, but do not try
+                # to paginate without a stable time cursor.
+                return tuple((*collected.values(), *eligible))[-required:]
+            for bar in eligible:
+                collected.setdefault(bar.open_time, bar)
+            next_end = min(bar.open_time for bar in page) - timedelta(microseconds=1)
+            if end is not None and next_end >= end:
+                break
+            end = next_end
+        return tuple(
+            bar for _, bar in sorted(collected.items(), key=lambda item: item[0])
+        )[-required:]
+
     async def _condition_groups_result(
         self, ctx, code, groups, *, average_price=None, current_price=None, side,
     ):
@@ -972,10 +1381,9 @@ class ManagedBlockStrategy(Strategy):
         fetched_counts = {}
         matched_groups = []
         needs_current_price = any(
-            condition.get(source_side) == "profit_rate"
+            "profit_rate" in _condition_metric_names(condition)
             for group in groups
             for condition in group["conditions"]
-            for source_side in ("left", "right")
         )
         if needs_current_price and current_price is None:
             try:
@@ -996,12 +1404,9 @@ class ManagedBlockStrategy(Strategy):
                     if fetched_counts.get(key, 0) >= required:
                         continue
                     try:
-                        bars_by_request[key] = await ctx.market.bars(
-                            code,
-                            key[0],
-                            count=required,
-                            venue=Venue(MARKET_VENUE),
-                            complete_only=key[1],
+                        bars_by_request[key] = await self._condition_history(
+                            ctx, code, key, required,
+                            existing=bars_by_request.get(key, ()),
                         )
                         fetched_counts[key] = required
                     except RouterError as exc:
@@ -1018,14 +1423,37 @@ class ManagedBlockStrategy(Strategy):
             matched_groups.append(matched)
         return True, matched_groups
 
-    @staticmethod
-    def _condition_summary(condition):
+    @classmethod
+    def _expression_summary(cls, expression):
+        if expression.get("kind") == "constant":
+            return str(expression.get("value", "0"))
+        if expression.get("kind") == "metric":
+            metric = expression.get("metric", "?")
+            if metric == "atr":
+                return f"ATR({expression.get('atr_period', 14)})"
+            return str(metric)
+        operators = {"ADD": "+", "SUBTRACT": "-", "MULTIPLY": "×", "DIVIDE": "÷"}
+        left = cls._expression_summary(expression.get("left", {}))
+        right = cls._expression_summary(expression.get("right", {}))
+        return f"({left} {operators.get(expression.get('operator'), '?')} {right})"
+
+    @classmethod
+    def _condition_summary(cls, condition):
         operators = {
             "LT": "<", "LTE": "≤", "GT": ">", "GTE": "≥", "EQ": "=",
             "CROSS_UP": "상향돌파", "CROSS_DOWN": "하향돌파",
         }
-        right = condition["value"] if condition["right"] == "value" else condition["right"]
-        return f"{condition['left']} {operators.get(condition['operator'], condition['operator'])} {right}"
+        left = (
+            cls._expression_summary(condition["left_expression"])
+            if condition.get("left_expression")
+            else condition["left"]
+        )
+        right = (
+            cls._expression_summary(condition["right_expression"])
+            if condition.get("right_expression")
+            else condition["value"] if condition["right"] == "value" else condition["right"]
+        )
+        return f"{left} {operators.get(condition['operator'], condition['operator'])} {right}"
 
     @staticmethod
     async def _current_price(ctx, code):
@@ -1040,36 +1468,19 @@ class ManagedBlockStrategy(Strategy):
 
     @staticmethod
     def _is_live_profit_condition(condition):
-        metrics = {
-            condition.get("left"),
-            condition.get("right"),
-        }
-        return "profit_rate" in metrics and metrics <= {"profit_rate", "value"}
+        metrics = set(_condition_metric_names(condition))
+        return (
+            condition.get("operator") not in {"CROSS_UP", "CROSS_DOWN"}
+            and "profit_rate" in metrics
+            and metrics <= {"profit_rate", "value"}
+        )
 
     def _live_profit_match(self, condition, current_price, average_price):
         if not average_price or average_price <= 0:
             return False
-        profit_rate = (current_price / average_price - Decimal("1")) * Decimal("100")
-
-        def operand(side):
-            metric = condition.get(side)
-            if side == "right" and metric == "value":
-                return Decimal(str(condition.get("value", "0")))
-            if metric == "profit_rate":
-                return profit_rate
-            return None
-
-        left = operand("left")
-        right = operand("right")
-        if left is None or right is None:
-            return False
-        return {
-            "LT": left < right,
-            "LTE": left <= right,
-            "GT": left > right,
-            "GTE": left >= right,
-            "EQ": left == right,
-        }.get(condition["operator"], False)
+        return self._condition_matches(
+            condition, {}, average_price, current_price=current_price,
+        )
 
     def _matched_live_profit_condition(self, current_price, average_price):
         for group in SELL_CONDITION_GROUPS:
@@ -1177,19 +1588,17 @@ class ManagedBlockStrategy(Strategy):
     async def on_start(self, ctx):
         self._ensure_live_state()
         buy_sources = [
-            self._condition_source(condition, side)
+            source
             for flow in BUY_FLOWS
             for group in flow["buy_condition_groups"]
             for condition in group["conditions"]
-            for side in ("left", "right")
-            if not (side == "right" and condition["right"] == "value")
+            for source in self._condition_sources(condition)
         ]
         sell_sources = [
-            self._condition_source(condition, side)
+            source
             for group in SELL_CONDITION_GROUPS
             for condition in group["conditions"]
-            for side in ("left", "right")
-            if not (side == "right" and condition["right"] == "value")
+            for source in self._condition_sources(condition)
         ]
         buy_source_text = ", ".join(dict.fromkeys(
             f"{item['bar_interval']}·{'완성봉' if item['bar_data_mode'] == 'COMPLETE_ONLY' else '현재봉 포함'}"

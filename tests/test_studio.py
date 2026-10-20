@@ -176,6 +176,66 @@ def test_managed_block_compiles_generic_comparisons() -> None:
     assert requests[("3m", True)] == 56
 
 
+def test_managed_block_validates_crossing_series_and_operands() -> None:
+    invalid_cases = (
+        (
+            {
+                "left": "close", "left_bar_interval": "1m",
+                "operator": "CROSS_UP",
+                "right": "bollinger_upper", "right_bar_interval": "3m",
+            },
+            "같은 봉 주기와 봉 상태",
+        ),
+        (
+            {
+                "operator": "CROSS_DOWN",
+                "left_expression": {
+                    "kind": "binary", "operator": "ADD",
+                    "left": {
+                        "kind": "metric", "metric": "close",
+                        "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+                    },
+                    "right": {"kind": "constant", "value": "1"},
+                },
+                "right_expression": {
+                    "kind": "metric", "metric": "close",
+                    "bar_interval": "3m", "bar_data_mode": "INCLUDE_CURRENT",
+                },
+            },
+            "같은 봉 주기와 봉 상태",
+        ),
+        (
+            {
+                "left": "profit_rate", "operator": "CROSS_UP", "right": "close",
+            },
+            "실시간 수익률",
+        ),
+        (
+            {
+                "left": "average_price", "operator": "CROSS_UP",
+                "right": "value", "value": "100",
+            },
+            "봉 지표가 하나 이상",
+        ),
+    )
+    for payload, expected_message in invalid_cases:
+        try:
+            BlockTradeCondition.model_validate(payload)
+        except ValueError as exc:
+            assert expected_message in str(exc)
+        else:
+            raise AssertionError(f"Invalid crossing condition was accepted: {payload}")
+
+    close_constant = BlockTradeCondition(
+        left="close", operator="CROSS_UP", right="value", value=Decimal("100"),
+    )
+    close_average_price = BlockTradeCondition(
+        left="close", operator="CROSS_DOWN", right="average_price",
+    )
+    assert close_constant.operator == "CROSS_UP"
+    assert close_average_price.operator == "CROSS_DOWN"
+
+
 def test_managed_block_suppresses_market_quote_rejections_for_the_day() -> None:
     source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
     namespace: dict[str, object] = {}
@@ -468,6 +528,429 @@ def test_managed_block_rejects_obv_comparisons_with_an_unstable_baseline() -> No
             pass
         else:
             raise AssertionError("OBV must compare two offsets from the same bar series.")
+    try:
+        BlockTradeCondition(
+            left_expression={"kind": "constant", "value": "0"},
+            right="obv", right_offset=10,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("An expression must not bypass OBV baseline validation.")
+
+    mixed = BlockTradeCondition(
+        left_expression={
+            "kind": "metric", "metric": "obv", "offset": 0,
+            "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+        },
+        right="obv", right_offset=10,
+        right_bar_interval="3m", right_bar_data_mode="COMPLETE_ONLY",
+    )
+    assert mixed.left_expression.metric == "obv"
+
+
+def test_managed_block_calculates_wilder_atr_from_true_ranges() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    bars = [
+        SimpleNamespace(high=Decimal(high), low=Decimal(low), close=Decimal(close))
+        for high, low, close in (
+            ("11", "9", "10"),   # primer close
+            ("13", "10", "12"), # TR 3
+            ("14", "11", "13"), # TR 3
+            ("18", "12", "17"), # TR 6 -> seed ATR 4
+            ("17", "15", "16"), # TR 2 -> Wilder ATR 10/3
+        )
+    ]
+
+    values = strategy._atr_values(bars, 3)
+
+    assert values[:3] == [None, None, None]
+    assert values[3] == Decimal("4")
+    assert values[4] == Decimal("10") / Decimal("3")
+
+
+def test_managed_block_evaluates_atr_formula_with_deterministic_history() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    bars = [
+        SimpleNamespace(
+            open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+            close=Decimal("100"), volume=Decimal("1000"),
+        )
+        for _ in range(115)
+    ]
+    metric_common = {
+        "kind": "metric", "offset": 0, "bar_interval": "3m",
+        "bar_data_mode": "COMPLETE_ONLY", "bollinger_period": 55,
+        "bollinger_stddev": "1.04", "atr_period": 14,
+    }
+    condition = BlockTradeCondition.model_validate({
+        "operator": "LT",
+        "left_expression": {
+            "kind": "binary", "operator": "MULTIPLY",
+            "left": {
+                "kind": "binary", "operator": "DIVIDE",
+                "left": {**metric_common, "metric": "atr"},
+                "right": {**metric_common, "metric": "close"},
+            },
+            "right": {"kind": "constant", "value": "100"},
+        },
+        "right_expression": {"kind": "constant", "value": "3"},
+    }).model_dump(mode="json")
+
+    assert strategy._condition_requests(condition) == {("3m", True): 115}
+    assert strategy._condition_values(condition, {("3m", True): bars}, None) == (
+        Decimal("2"), Decimal("3"),
+    )
+    assert strategy._condition_matches(condition, {("3m", True): bars}, None) is True
+
+
+def test_managed_block_atr_uses_same_fixed_window_for_offsets_and_crossing() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+
+    bars = []
+    previous_close = Decimal("100")
+    for index in range(140):
+        open_value = previous_close + Decimal(
+            2 if index % 5 == 0 else -1 if index % 3 == 0 else 0
+        )
+        close = Decimal(100 + ((index * 7) % 31) - 15)
+        bars.append(SimpleNamespace(
+            open=open_value,
+            high=max(open_value, close) + Decimal(1 + index % 4),
+            low=min(open_value, close) - Decimal(1 + index % 3),
+            close=close,
+            volume=Decimal(1_000 + index * 13),
+        ))
+        previous_close = close
+
+    def chart_rolling_wilder_atr(target_index: int, window: int, period: int) -> Decimal:
+        visible = bars[max(0, target_index - window + 1):target_index + 1]
+        true_ranges = []
+        for index in range(1, len(visible)):
+            bar = visible[index]
+            prior_close = visible[index - 1].close
+            true_ranges.append(max(
+                bar.high - bar.low,
+                abs(bar.high - prior_close),
+                abs(bar.low - prior_close),
+            ))
+        current = sum(true_ranges[:period], Decimal("0")) / Decimal(period)
+        for true_range in true_ranges[period:]:
+            current = (
+                current * Decimal(period - 1) + true_range
+            ) / Decimal(period)
+        return current
+
+    current_condition = BlockTradeCondition(
+        left="atr", left_atr_period=14, operator="GT",
+        right="value", value=Decimal("0"),
+    ).model_dump(mode="json")
+    offset_condition = BlockTradeCondition(
+        left="atr", left_atr_period=14, left_offset=1, operator="GT",
+        right="value", value=Decimal("0"),
+    ).model_dump(mode="json")
+    crossing_condition = BlockTradeCondition(
+        left="atr", left_atr_period=14, operator="CROSS_UP", right="close",
+    ).model_dump(mode="json")
+
+    assert strategy._condition_requests(current_condition) == {("3m", True): 115}
+    assert strategy._condition_requests(offset_condition) == {("3m", True): 116}
+    assert strategy._condition_requests(crossing_condition) == {("3m", True): 116}
+
+    current_value, _ = strategy._condition_values(
+        current_condition, {("3m", True): bars[-115:]}, None,
+    )
+    offset_value, _ = strategy._condition_values(
+        offset_condition, {("3m", True): bars[-116:]}, None,
+    )
+    crossing_current, _ = strategy._condition_values(
+        crossing_condition, {("3m", True): bars[-116:]}, None, crossing=True,
+    )
+    crossing_previous, _ = strategy._condition_values(
+        crossing_condition, {("3m", True): bars[-116:]}, None,
+        extra_offset=1, crossing=True,
+    )
+
+    expected_current = chart_rolling_wilder_atr(139, 115, 14)
+    expected_previous = chart_rolling_wilder_atr(138, 115, 14)
+    assert current_value == expected_current
+    assert offset_value == expected_previous
+    assert crossing_current == expected_current
+    assert crossing_previous == expected_previous
+
+
+def test_managed_block_rejects_atr_offset_or_cross_beyond_fixed_window_cap() -> None:
+    conditions = (
+        {
+            "left_expression": {
+                "kind": "metric", "metric": "atr", "atr_period": 14,
+                "offset": 1, "bar_interval": "15m",
+                "bar_data_mode": "COMPLETE_ONLY",
+            },
+            "operator": "GT",
+            "right_expression": {"kind": "constant", "value": "0"},
+        },
+        {
+            "left_expression": {
+                "kind": "metric", "metric": "atr", "atr_period": 14,
+                "bar_interval": "15m", "bar_data_mode": "COMPLETE_ONLY",
+            },
+            "operator": "CROSS_UP",
+            "right_expression": {"kind": "constant", "value": "0"},
+        },
+    )
+    for condition in conditions:
+        payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+        payload["buy_condition_groups"] = [{
+            "id": "atr-history-cap", "conditions": [condition],
+        }]
+        try:
+            ConditionBollingerBlockSettings.model_validate(payload)
+        except ValueError as exc:
+            assert "1회 조회 범위를 초과" in str(exc)
+        else:
+            raise AssertionError("ATR offset/crossing must not shrink its fixed warm-up window.")
+
+
+def test_managed_block_pages_atr_400_history_with_complete_bar_boundary() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    start = datetime(2026, 10, 19, 9, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    history = [
+        SimpleNamespace(
+            open_time=start + timedelta(minutes=index),
+            open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+            close=Decimal("100"), volume=Decimal("1000"), complete=index < 501,
+        )
+        for index in range(502)
+    ]
+    condition = BlockTradeCondition.model_validate({
+        "operator": "LT",
+        "left_expression": {
+            "kind": "metric", "metric": "atr", "atr_period": 400,
+            "bar_interval": "1m", "bar_data_mode": "COMPLETE_ONLY",
+        },
+        "right_expression": {"kind": "constant", "value": "3"},
+    }).model_dump(mode="json")
+    groups = ({"id": "atr-400", "conditions": [condition]},)
+
+    class Market:
+        def __init__(self):
+            self.calls = []
+
+        async def bars(self, code, interval, **kwargs):
+            self.calls.append({"code": code, "interval": interval, **kwargs})
+            end = kwargs.get("end")
+            available = [
+                bar for bar in history
+                if end is None or bar.open_time <= end
+            ]
+            page = available[-kwargs["count"]:]
+            if kwargs["complete_only"]:
+                page = [bar for bar in page if bar.complete]
+            return tuple(page)
+
+    market = Market()
+    context = SimpleNamespace(
+        market=market,
+        log=SimpleNamespace(warning=lambda message: None),
+    )
+    evaluated_bars = {}
+    original_match = strategy._condition_matches
+
+    def capture_match(condition, bars_by_request, average_price, current_price=None):
+        evaluated_bars.update(bars_by_request)
+        return original_match(condition, bars_by_request, average_price, current_price)
+
+    strategy._condition_matches = capture_match
+
+    passed, matched = asyncio.run(
+        strategy._condition_groups_result(context, "005930", groups, side="매수")
+    )
+
+    assert strategy._condition_requests(condition) == {("1m", True): 501}
+    assert passed is True
+    assert len(matched) == 1
+    assert [call["count"] for call in market.calls] == [400, 102]
+    assert all(call["count"] <= 400 for call in market.calls)
+    assert market.calls[0]["end"] is None
+    assert market.calls[1]["end"] == history[102].open_time - timedelta(microseconds=1)
+    evaluated = evaluated_bars[("1m", True)]
+    assert len(evaluated) == 501
+    assert all(bar.complete for bar in evaluated)
+    assert [bar.open_time for bar in evaluated] == sorted(
+        {bar.open_time for bar in evaluated}
+    )
+
+
+def test_managed_block_supports_legacy_atr_side_fields() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    condition = BlockTradeCondition(
+        left="atr", left_atr_period=14,
+        operator="LT", right="value", value=Decimal("3"),
+    ).model_dump(mode="json")
+
+    assert strategy._condition_requests(condition) == {("3m", True): 115}
+
+
+def test_managed_block_formula_metrics_enable_bar_capability() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = [{
+        "id": "atr-bars",
+        "conditions": [{
+            "left_expression": {
+                "kind": "metric", "metric": "atr", "atr_period": 14,
+                "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+            },
+            "operator": "LT",
+            "right_expression": {"kind": "constant", "value": "3"},
+        }],
+    }]
+    payload["sell_condition_groups"] = [{
+        "id": "profit-only",
+        "conditions": [{
+            "left": "profit_rate", "operator": "GTE",
+            "right": "value", "value": "3",
+        }],
+    }]
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
+    namespace: dict[str, object] = {}
+    exec(compile(render_block_strategy(settings), "<managed-block>", "exec"), namespace)
+
+    assert namespace["NEEDS_BARS"] is True
+    assert "bars" in namespace["REQUIRED_CAPABILITIES"]
+
+
+def test_managed_block_atr_formula_round_trips_through_the_compiler() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = [{
+        "id": "atr-percent",
+        "conditions": [{
+            "operator": "LT",
+            "left_expression": {
+                "kind": "binary", "operator": "DIVIDE",
+                "left": {
+                    "kind": "metric", "metric": "atr", "atr_period": 14,
+                    "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+                },
+                "right": {
+                    "kind": "metric", "metric": "close",
+                    "bar_interval": "3m", "bar_data_mode": "COMPLETE_ONLY",
+                },
+            },
+            "right_expression": {"kind": "constant", "value": "0.03"},
+        }],
+    }]
+    settings = ConditionBollingerBlockSettings.model_validate(payload)
+
+    restored = block_package_from_source("ATR 수식", render_block_strategy(settings))
+    condition = restored.settings.buy_condition_groups[0].conditions[0]
+
+    assert condition.left_expression.kind == "binary"
+    assert condition.left_expression.operator == "DIVIDE"
+    assert condition.left_expression.left.metric == "atr"
+    assert condition.left_expression.left.atr_period == 14
+    assert condition.right_expression.value == Decimal("0.03")
+
+
+def test_managed_block_rejects_unsafe_or_unbounded_expressions() -> None:
+    expression: dict[str, object] = {"kind": "constant", "value": "1"}
+    for _ in range(5):
+        expression = {
+            "kind": "binary", "operator": "ADD",
+            "left": expression,
+            "right": {"kind": "constant", "value": "1"},
+        }
+    for invalid in (
+        expression,
+        {"kind": "constant", "value": "NaN"},
+        {
+            "kind": "binary", "operator": "POWER",
+            "left": {"kind": "constant", "value": "2"},
+            "right": {"kind": "constant", "value": "8"},
+        },
+    ):
+        try:
+            BlockTradeCondition(
+                left_expression=invalid,
+                right_expression={"kind": "constant", "value": "0"},
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Unsafe or unbounded formulas must be rejected.")
+
+
+def test_managed_block_division_by_zero_is_a_safe_no_match() -> None:
+    source = render_block_strategy(DEFAULT_CONDITION_BOLLINGER_SETTINGS)
+    namespace: dict[str, object] = {}
+    exec(compile(source, "<managed-block>", "exec"), namespace)
+    strategy = namespace["ManagedBlockStrategy"]()
+    condition = BlockTradeCondition.model_validate({
+        "operator": "GT",
+        "left_expression": {
+            "kind": "binary", "operator": "DIVIDE",
+            "left": {"kind": "constant", "value": "10"},
+            "right": {"kind": "constant", "value": "0"},
+        },
+        "right_expression": {"kind": "constant", "value": "1"},
+    }).model_dump(mode="json")
+
+    assert strategy._condition_values(condition, {}, None) == (None, Decimal("1"))
+    assert strategy._condition_matches(condition, {}, None) is False
+
+
+def test_managed_block_validates_formula_metrics_in_strategy_context() -> None:
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = [{
+        "id": "invalid-position-formula",
+        "conditions": [{
+            "left_expression": {
+                "kind": "binary", "operator": "ADD",
+                "left": {"kind": "metric", "metric": "profit_rate"},
+                "right": {"kind": "constant", "value": "1"},
+            },
+            "right_expression": {"kind": "constant", "value": "3"},
+        }],
+    }]
+    try:
+        ConditionBollingerBlockSettings.model_validate(payload)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Buy formulas must reject position-only metrics recursively.")
+
+    payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
+    payload["buy_condition_groups"] = [{
+        "id": "too-much-history",
+        "conditions": [{
+            "left_expression": {
+                "kind": "metric", "metric": "atr", "atr_period": 14,
+                "bar_interval": "120m", "bar_data_mode": "COMPLETE_ONLY",
+            },
+            "right_expression": {"kind": "constant", "value": "3"},
+        }],
+    }]
+    try:
+        ConditionBollingerBlockSettings.model_validate(payload)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("ATR formulas must respect the provider history bound.")
 
 
 def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> None:
@@ -479,7 +962,8 @@ def test_managed_block_routes_quotes_and_bars_through_the_selected_market() -> N
     assert 'ORDER_ROUTE = "NXT"' in source
     assert "ctx.market.quote(code, venue=Venue(MARKET_VENUE))" in source
     assert 'BAR_DATA_MODE = "COMPLETE_ONLY"' in source
-    assert "complete_only=key[1]" in source
+    assert "complete_only=complete_only" in source
+    assert "end=end" in source
     assert 'condition[f"{side}_bar_interval"]' in source
     assert "route=order_route" in source
 

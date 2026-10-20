@@ -2,6 +2,7 @@
   "use strict";
 
   const STORAGE_KEY = "trade-router.chart-settings.v1";
+  const ATR_WARMUP_BARS = 100;
   const palette = ["#2f67d8", "#e59028", "#7c4dba", "#16856f", "#d24b5f", "#5c6f82"];
   const state = {
     code: "",
@@ -14,6 +15,8 @@
     fallbackTimer: null,
     searchTimer: null,
     searchRequest: 0,
+    loadGeneration: 0,
+    loadedGeneration: null,
     searchIndex: -1,
     resizeObserver: null,
     manualClose: true,
@@ -23,6 +26,7 @@
     crosshair: null,
     drag: null,
     historyLoading: false,
+    historyLoadingGeneration: null,
     noMoreHistory: false,
     historyRetryAt: 0,
     indicators: [
@@ -75,11 +79,14 @@
       if (saved.interval) el.interval.value = saved.interval;
       if (saved.chartType) el.type.value = saved.chartType;
       if (Array.isArray(saved.indicators) && saved.indicators.length <= 8) {
+        const interval = saved.interval || el.interval.value || "3m";
         state.indicators = saved.indicators.map((item, index) => ({
           id: item.id || crypto.randomUUID(),
           type: item.type || "SMA",
           placement: item.placement === "PANEL" ? "PANEL" : "SERIES",
-          period: Math.max(2, Number(item.period) || 20),
+          period: item.type === "ATR"
+            ? clampAtrPeriod(item.period, interval)
+            : Math.max(2, Number(item.period) || 20),
           deviation: Math.max(.1, Number(item.deviation) || 2),
           fast: Math.max(2, Number(item.fast) || 12),
           slow: Math.max(3, Number(item.slow) || 26),
@@ -138,6 +145,78 @@
     return result;
   }
 
+  function sourceMaxHistory(interval) {
+    if (!String(interval).endsWith("m")) return 400;
+    const minutes = Math.max(1, Number.parseInt(String(interval), 10) || 1);
+    return Math.floor(1440 / minutes);
+  }
+
+  function atrMaxPeriod(interval = el.interval?.value) {
+    return Math.max(1, Math.min(400, sourceMaxHistory(interval) - 1));
+  }
+
+  function clampAtrPeriod(value, interval = el.interval?.value) {
+    const maximum = atrMaxPeriod(interval);
+    return Math.min(maximum, Math.max(1, Math.floor(Number(value) || Math.min(14, maximum))));
+  }
+
+  function clampAtrIndicators(interval = el.interval?.value) {
+    state.indicators.forEach(indicator => {
+      if (indicator.type === "ATR") indicator.period = clampAtrPeriod(indicator.period, interval);
+    });
+  }
+
+  function requiredAtrHistory(interval = el.interval?.value) {
+    const periods = state.indicators
+      .filter(indicator => indicator.type === "ATR")
+      .map(indicator => clampAtrPeriod(indicator.period, interval));
+    if (!periods.length) return 0;
+    return Math.min(sourceMaxHistory(interval), Math.max(...periods) + 1 + ATR_WARMUP_BARS);
+  }
+
+  function trueRangeAt(rows, index) {
+    const row = rows[index];
+    const previousClose = rows[index - 1].close;
+    return Math.max(
+      row.high - row.low,
+      Math.abs(row.high - previousClose),
+      Math.abs(row.low - previousClose),
+    );
+  }
+
+  function wilderAtr(rows, period, maxHistory) {
+    const values = Array(rows.length).fill(null);
+    const historyLimit = Math.max(1, Math.floor(Number(maxHistory) || rows.length));
+    const length = Math.min(
+      Math.max(1, Math.min(400, historyLimit - 1)),
+      Math.max(1, Math.floor(Number(period) || 14)),
+    );
+    if (length + 1 > historyLimit || rows.length < length + 1) return values;
+    const warmup = Math.min(ATR_WARMUP_BARS, historyLimit - length - 1);
+    const windowSize = length + 1 + warmup;
+    const trueRanges = Array(rows.length).fill(null);
+    for (let index = 1; index < rows.length; index += 1) {
+      trueRanges[index] = trueRangeAt(rows, index);
+    }
+    for (let target = length; target < rows.length; target += 1) {
+      // A target uses one primer close, `length` seed true ranges and at
+      // most 100 later true ranges. Early chart points grow toward that
+      // fixed window; once full, older bars cannot change the result.
+      const start = Math.max(0, target - windowSize + 1);
+      if (target - start < length) continue;
+      let current = 0;
+      for (let index = start + 1; index <= start + length; index += 1) {
+        current += trueRanges[index];
+      }
+      current /= length;
+      for (let index = start + length + 1; index <= target; index += 1) {
+        current = (current * (length - 1) + trueRanges[index]) / length;
+      }
+      values[target] = current;
+    }
+    return values;
+  }
+
   function indicatorSeries(indicator, rows, rawRows = rows) {
     const closes = rows.map(row => row.close);
     if (indicator.type === "SMA") return [{ name: `SMA ${indicator.period}`, values: sma(closes, indicator.period), color: indicator.color }];
@@ -171,6 +250,12 @@
         values[index] = values[index - 1] + direction * rawRows[index].volume;
       }
       return [{ name: "OBV", values, color: indicator.color }];
+    }
+    if (indicator.type === "ATR") {
+      // ATR is a volatility measure of the actual traded OHLC. It must not
+      // change when the chart is displayed with transformed Heikin-Ashi bars.
+      const maxHistory = sourceMaxHistory(el.interval?.value);
+      return [{ name: `ATR ${indicator.period} · 진행봉 포함`, values: wilderAtr(rawRows, indicator.period, maxHistory), color: indicator.color }];
     }
     if (indicator.type === "RSI") {
       const values = Array(rows.length).fill(null);
@@ -418,7 +503,10 @@
     let panelY = pricePanel.y + pricePanel.h + gap;
     panelIndicators.forEach(indicator => {
       const panel = { x: left, y: panelY, w: pricePanel.w, h: panelHeight };
-      drawSeriesPanel(ctx, indicatorSeries(indicator, rows, state.bars), panel, start, end, xAt, indicatorLabel(indicator));
+      const label = indicator.type === "ATR"
+        ? `${indicatorLabel(indicator)} · 진행봉 포함`
+        : indicatorLabel(indicator);
+      drawSeriesPanel(ctx, indicatorSeries(indicator, rows, state.bars), panel, start, end, xAt, label);
       panelY += panelHeight + gap;
     });
 
@@ -447,6 +535,7 @@
     if (indicator.type === "MACD") return `MACD (${indicator.fast}, ${indicator.slow}, ${indicator.signal})`;
     if (indicator.type === "VOLUME") return "거래량";
     if (indicator.type === "OBV") return "OBV";
+    if (indicator.type === "ATR") return `ATR (${indicator.period})`;
     return `${indicator.type} (${indicator.period})`;
   }
 
@@ -456,18 +545,25 @@
       ? [["fast", "단기", 2], ["slow", "장기", 3], ["signal", "시그널", 2]]
       : ["VOLUME", "OBV"].includes(indicator.type)
         ? []
-        : [["period", "기간", 2], ...(indicator.type === "BOLLINGER" ? [["deviation", "표준편차", .1]] : [])];
+        : [["period", "기간", indicator.type === "ATR" ? 1 : 2], ...(indicator.type === "BOLLINGER" ? [["deviation", "표준편차", .1]] : [])];
     definitions.forEach(([key, label, min]) => {
       const wrapper = document.createElement("label");
       wrapper.textContent = label;
       const input = document.createElement("input");
       input.type = "number";
       input.min = String(min);
+      if (indicator.type === "ATR" && key === "period") {
+        indicator.period = clampAtrPeriod(indicator.period);
+        input.max = String(atrMaxPeriod());
+      }
       input.step = key === "deviation" ? "0.1" : "1";
-      input.value = String(indicator[key] ?? (key === "deviation" ? 2 : 20));
+      input.value = String(indicator[key] ?? (key === "deviation" ? 2 : indicator.type === "ATR" ? 14 : 20));
       input.addEventListener("change", () => {
-        indicator[key] = Math.max(min, Number(input.value) || min);
+        const value = Math.max(min, Number(input.value) || min);
+        indicator[key] = indicator.type === "ATR" && key === "period" ? clampAtrPeriod(value) : value;
+        input.value = String(indicator[key]);
         saveSettings(); drawChart();
+        if (indicator.type === "ATR" && key === "period") void ensureAtrHistory();
       });
       wrapper.append(input);
       container.append(wrapper);
@@ -480,7 +576,7 @@
       const row = document.createElement("div");
       row.className = "chart-indicator-row";
       const type = document.createElement("select");
-      for (const [value, label] of [["SMA", "단순이동평균"], ["EMA", "지수이동평균"], ["BOLLINGER", "볼린저밴드"], ["VOLUME", "거래량"], ["OBV", "OBV"], ["RSI", "RSI"], ["MACD", "MACD"]]) {
+      for (const [value, label] of [["SMA", "단순이동평균"], ["EMA", "지수이동평균"], ["BOLLINGER", "볼린저밴드"], ["VOLUME", "거래량"], ["OBV", "OBV"], ["ATR", "ATR"], ["RSI", "RSI"], ["MACD", "MACD"]]) {
         type.add(new Option(label, value));
       }
       type.value = indicator.type;
@@ -497,11 +593,14 @@
       remove.type = "button"; remove.className = "chart-indicator-remove"; remove.textContent = "삭제";
       type.addEventListener("change", () => {
         indicator.type = type.value;
-        if (indicator.type === "OBV") {
+        if (["OBV", "ATR"].includes(indicator.type)) {
           indicator.placement = "PANEL";
           placement.value = "PANEL";
         }
+        if (indicator.type === "ATR") indicator.period = 14;
+        if (indicator.type === "ATR") indicator.period = clampAtrPeriod(indicator.period);
         renderIndicatorParameters(indicator, parameters); saveSettings(); drawChart();
+        if (indicator.type === "ATR") void ensureAtrHistory();
       });
       placement.addEventListener("change", () => { indicator.placement = placement.value; saveSettings(); drawChart(); });
       color.addEventListener("input", () => { indicator.color = color.value; saveSettings(); drawChart(); });
@@ -511,7 +610,7 @@
     });
     const names = {
       SMA: "이동평균", EMA: "지수이동평균", BOLLINGER: "볼린저밴드",
-      VOLUME: "거래량", OBV: "OBV", RSI: "RSI", MACD: "MACD",
+      VOLUME: "거래량", OBV: "OBV", ATR: "ATR(진행봉 포함)", RSI: "RSI", MACD: "MACD",
     };
     el.indicatorSummary.textContent = state.indicators.length
       ? state.indicators.map(item => names[item.type] || item.type).join(" · ")
@@ -608,10 +707,13 @@
     else setLiveState("조회됨", "idle");
   }
 
-  async function loadOlderBars() {
-    if (state.historyLoading || state.noMoreHistory || !state.bars.length || !state.source) return;
-    if (Date.now() < state.historyRetryAt) return;
+  async function loadOlderBars(requestedCount = 180, generation = state.loadGeneration) {
+    if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return 0;
+    if (state.historyLoading && state.historyLoadingGeneration === generation) return 0;
+    if (state.noMoreHistory || !state.code || !state.bars.length || !state.source) return 0;
+    if (Date.now() < state.historyRetryAt) return 0;
     state.historyLoading = true;
+    state.historyLoadingGeneration = generation;
     setLiveState("이전 봉 조회 중", "connecting");
     try {
       const earliest = new Date(state.bars[0].open_time).getTime() - 1;
@@ -620,21 +722,44 @@
         interval: el.interval.value,
         venue: el.venue.value,
         source: state.source.id,
-        count: "180",
+        count: String(Math.min(400, Math.max(20, Math.floor(Number(requestedCount) || 180)))),
         end: new Date(earliest).toISOString(),
       });
       const payload = await request(`/api/chart/bars?${query}`);
+      if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return 0;
       const received = (payload.bars || []).map(barNumbers);
       const added = mergeOlderBars(received);
       if (!added) state.noMoreHistory = true;
       drawChart();
       restoreStreamState();
+      return added;
     } catch (_) {
+      if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return 0;
       state.historyRetryAt = Date.now() + 5000;
       setLiveState("이전 봉 조회 실패", "error");
-      setTimeout(restoreStreamState, 1500);
+      setTimeout(() => {
+        if (generation === state.loadGeneration && state.loadedGeneration === generation) restoreStreamState();
+      }, 1500);
+      return 0;
     } finally {
-      state.historyLoading = false;
+      if (state.historyLoadingGeneration === generation) {
+        state.historyLoading = false;
+        state.historyLoadingGeneration = null;
+      }
+    }
+  }
+
+  async function ensureAtrHistory(generation = state.loadGeneration) {
+    while (true) {
+      if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
+      const target = requiredAtrHistory();
+      if (!target || !state.code || !state.source || state.noMoreHistory || state.bars.length >= target) return;
+      if (state.historyLoading && state.historyLoadingGeneration === generation) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        continue;
+      }
+      const added = await loadOlderBars(target - state.bars.length, generation);
+      if (!added) break;
     }
   }
 
@@ -683,7 +808,19 @@
     const followingLatest = state.viewEnd == null || state.viewEnd >= state.bars.length;
     if (start > lastStart) {
       state.bars.push({ ...last, open_time: new Date(start).toISOString(), close_time: new Date(start).toISOString(), open: price, high: price, low: price, close: price, volume: 0, complete: false });
-      if (state.bars.length > 400) state.bars.shift();
+      const removed = Math.max(0, state.bars.length - Math.max(400, requiredAtrHistory()));
+      if (removed) {
+        state.bars.splice(0, removed);
+        if (!followingLatest && state.viewEnd != null) state.viewEnd = Math.max(0, state.viewEnd - removed);
+        if (state.crosshair) {
+          state.crosshair.index -= removed;
+          if (state.crosshair.index < 0) {
+            state.crosshair = null;
+            el.tooltip.hidden = true;
+          }
+        }
+        if (state.drag) state.drag.startEnd = Math.max(0, state.drag.startEnd - removed);
+      }
       if (followingLatest) state.viewEnd = state.bars.length;
     } else if (start === lastStart) {
       last.high = Math.max(last.high, price);
@@ -700,28 +837,32 @@
     if (state.fallbackTimer) { clearInterval(state.fallbackTimer); state.fallbackTimer = null; }
   }
 
-  function startFallback() {
+  function startFallback(generation = state.loadGeneration) {
+    if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
     if (state.manualClose || state.fallbackTimer || !state.code || !state.source) return;
     setLiveState("REST 보완 · 10초", "fallback");
     const poll = async () => {
       try {
         const payload = await request(`/api/chart/quote?code=${encodeURIComponent(state.code)}&venue=${el.venue.value}&source=${encodeURIComponent(state.source.id)}`);
+        if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
         applyQuote(payload.quote);
       } catch (_) { /* the central request router will retry on the next tick */ }
     };
     state.fallbackTimer = setInterval(poll, 10_000);
   }
 
-  function startRealtime() {
+  function startRealtime(generation = state.loadGeneration) {
+    if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
     stopRealtime();
     state.manualClose = false;
-    if (!state.source?.realtime) { startFallback(); return; }
+    if (!state.source?.realtime) { startFallback(generation); return; }
     setLiveState("실시간 연결 중", "connecting");
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${protocol}//${location.host}/api/chart/stream?code=${encodeURIComponent(state.code)}&venue=${el.venue.value}&source=${encodeURIComponent(state.source.id)}`;
     const socket = new WebSocket(url);
     state.socket = socket;
     socket.onmessage = event => {
+      if (generation !== state.loadGeneration || state.loadedGeneration !== generation || state.socket !== socket) return;
       const payload = JSON.parse(event.data);
       if (payload.event_type === "subscribed") setLiveState("실시간", "live");
       else if (payload.event_type === "quote") applyQuote(payload.quote);
@@ -730,27 +871,35 @@
         socket.close();
       }
     };
-    socket.onerror = () => setLiveState("실시간 연결 실패", "error");
+    socket.onerror = () => {
+      if (generation === state.loadGeneration && state.loadedGeneration === generation && state.socket === socket) {
+        setLiveState("실시간 연결 실패", "error");
+      }
+    };
     socket.onclose = () => {
       if (state.socket === socket) state.socket = null;
-      if (!state.manualClose) startFallback();
+      if (!state.manualClose && generation === state.loadGeneration) startFallback(generation);
     };
   }
 
   async function loadChart() {
+    const generation = ++state.loadGeneration;
+    state.loadedGeneration = null;
     state.searchRequest += 1;
     clearTimeout(state.searchTimer);
     showSearchResults([]);
     const typedCode = el.search.value.match(/(?:^|·\s*)([A-Z0-9]{6,24})\s*$/i)?.[1];
     if (!state.code && typedCode) state.code = typedCode.toUpperCase();
-    if (!state.code) { await searchInstruments(); return; }
     stopRealtime();
+    if (!state.code) { await searchInstruments(); return; }
     setLiveState("조회 중", "connecting");
     el.empty.hidden = false; el.empty.textContent = "봉과 현재가를 조회하고 있습니다.";
     saveSettings();
     try {
-      const query = new URLSearchParams({ code: state.code, interval: el.interval.value, venue: el.venue.value, source: el.source.value, count: "180" });
+      const initialCount = Math.min(400, Math.max(180, requiredAtrHistory()));
+      const query = new URLSearchParams({ code: state.code, interval: el.interval.value, venue: el.venue.value, source: el.source.value, count: String(initialCount) });
       const payload = await request(`/api/chart/data?${query}`);
+      if (generation !== state.loadGeneration) return;
       state.source = payload.source;
       state.name = payload.instrument?.name || state.name;
       if (state.name) el.search.value = `${state.name} · ${state.code}`;
@@ -761,10 +910,15 @@
       state.noMoreHistory = false;
       state.historyRetryAt = 0;
       state.quote = payload.quote;
+      state.loadedGeneration = generation;
       el.empty.hidden = Boolean(state.bars.length);
       if (!state.bars.length) { el.empty.hidden = false; el.empty.textContent = "표시할 봉이 없습니다."; }
-      renderQuote(); drawChart(); startRealtime();
+      await ensureAtrHistory(generation);
+      if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
+      renderQuote(); drawChart(); startRealtime(generation);
     } catch (error) {
+      if (generation !== state.loadGeneration) return;
+      state.loadedGeneration = null;
       state.bars = [];
       el.empty.hidden = false; el.empty.textContent = error.message;
       setLiveState("조회 실패", "error");
@@ -774,10 +928,15 @@
 
   async function open(options = {}) {
     el.modal.hidden = false;
+    const openGeneration = state.loadGeneration;
     const preferred = options.source || restoreSettings();
     renderIndicators();
     try { await loadSources(preferred); }
-    catch (error) { setLiveState("API 없음", "error"); el.empty.textContent = error.message; }
+    catch (error) {
+      if (openGeneration !== state.loadGeneration || el.modal.hidden) return;
+      setLiveState("API 없음", "error"); el.empty.textContent = error.message;
+    }
+    if (openGeneration !== state.loadGeneration || el.modal.hidden) return;
     if (options.code) {
       state.code = String(options.code).trim().toUpperCase();
       state.name = String(options.name || "").trim();
@@ -785,6 +944,7 @@
       await loadChart();
     } else {
       state.code = ""; state.name = ""; state.bars = []; state.quote = null;
+      state.loadedGeneration = null;
       state.viewCount = null; state.viewEnd = null; state.crosshair = null; state.noMoreHistory = false;
       el.search.value = ""; el.title.textContent = "종목 차트";
       el.empty.hidden = false; el.empty.textContent = "종목을 선택하면 차트를 표시합니다.";
@@ -793,6 +953,10 @@
   }
 
   function close() {
+    state.loadGeneration += 1;
+    state.loadedGeneration = null;
+    state.searchRequest += 1;
+    clearTimeout(state.searchTimer);
     stopRealtime();
     showSearchResults([]);
     el.indicatorModal.hidden = true;
@@ -848,7 +1012,13 @@
         if (selected) selected.click(); else loadChart();
       }
     });
-    [el.source, el.venue, el.interval].forEach(control => control.addEventListener("change", () => { saveSettings(); if (state.code) loadChart(); }));
+    [el.source, el.venue].forEach(control => control.addEventListener("change", () => { saveSettings(); if (state.code) loadChart(); }));
+    el.interval.addEventListener("change", () => {
+      clampAtrIndicators();
+      renderIndicators();
+      saveSettings();
+      if (state.code) loadChart();
+    });
     el.type.addEventListener("change", () => { saveSettings(); drawChart(); });
     el.canvas.addEventListener("pointerdown", event => {
       if (!state.geometry || event.button !== 0) return;
