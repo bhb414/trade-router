@@ -15,6 +15,7 @@ from trade_router_studio.realtime import (
     RealtimeHub,
     _handle_kis_control_message,
     _parse_kis_market_message,
+    _parse_kis_market_messages,
     _parse_namuh_market_message,
 )
 
@@ -90,6 +91,41 @@ def test_kis_quote_and_orderbook_frames_are_normalized() -> None:
     assert notice["event_type"] == "account_notice"
     assert notice["notice"]["provider_order_id"] == "broker-1"
     assert notice["notice"]["quantity"] == "1"
+
+
+def test_kis_multi_record_quote_and_orderbook_frames_are_all_normalized() -> None:
+    first_quote = ["005930", "093001", "73000"] + ["0"] * 44
+    second_quote = ["000660", "093002", "180000"] + ["0"] * 44
+    quotes = _parse_kis_market_messages(
+        "0|H0STCNT0|2|" + "^".join(first_quote + second_quote),
+        generation=9,
+    )
+    assert [(event["code"], event["quote"]["price"]) for event in quotes] == [
+        ("005930", "73000"),
+        ("000660", "180000"),
+    ]
+
+    def orderbook_row(code: str, base: int) -> list[str]:
+        values = [code, "093003", "0"]
+        values += [str(base + 100 + value * 100) for value in range(10)]
+        values += [str(base - 100 - value * 100) for value in range(10)]
+        values += [str(10 + value) for value in range(10)]
+        values += [str(20 + value) for value in range(10)]
+        return values + ["0"] * (63 - len(values))
+
+    orderbooks = _parse_kis_market_messages(
+        "0|H0STASP0|2|"
+        + "^".join(
+            orderbook_row("005930", 73000)
+            + orderbook_row("000660", 180000)
+        ),
+        generation=10,
+    )
+    assert [event["code"] for event in orderbooks] == ["005930", "000660"]
+    assert orderbooks[1]["orderbook"]["bids"][0] == {
+        "price": "179900",
+        "quantity": "20",
+    }
 
 
 def test_strategy_event_bus_isolated_queues_and_bounded_drop() -> None:
@@ -201,8 +237,11 @@ def test_realtime_hub_reconnects_resubscribes_and_fans_out() -> None:
             consumers.remove(consumer_id)
             return not consumers
 
-    quote_values = ["005930", "093001", "73000"] + ["0"] * 44
-    quote_frame = "0|H0STCNT0|1|" + "^".join(quote_values)
+    first_quote_values = ["005930", "093001", "73000"] + ["0"] * 44
+    second_quote_values = ["005930", "093002", "73100"] + ["0"] * 44
+    quote_frame = "0|H0STCNT0|2|" + "^".join(
+        first_quote_values + second_quote_values
+    )
 
     class FakeSocket:
         def __init__(self, *, disconnect_after_quote: bool) -> None:
@@ -271,6 +310,13 @@ def test_realtime_hub_reconnects_resubscribes_and_fans_out() -> None:
             assert first_event is not None and second_event is not None
             assert first_event["quote"]["connection_generation"] == 1
             assert second_event["source_alias"] == "secondary"
+
+            first_same_frame = await bus.next_event("first.py", timeout=1)
+            second_same_frame = await bus.next_event("second.py", timeout=1)
+            assert first_same_frame is not None and second_same_frame is not None
+            assert first_same_frame["quote"]["price"] == "73100"
+            assert first_same_frame["quote"]["connection_generation"] == 1
+            assert second_same_frame["quote"]["price"] == "73100"
 
             reconnected = await bus.next_event("first.py", timeout=5)
             assert reconnected is not None

@@ -414,21 +414,24 @@ class RealtimeHub:
                             if tr_id and key and iv:
                                 encryption[tr_id] = (key, iv)
                             continue
-                        event = (
-                            _parse_kis_market_message(
+                        if provider == "kis":
+                            events = _parse_kis_market_messages(
                                 message,
                                 generation=generation,
                                 encryption=encryption,
                             )
-                            if provider == "kis"
-                            else _parse_namuh_market_message(
+                        else:
+                            event = _parse_namuh_market_message(
                                 message, generation=generation
                             )
-                        )
-                        if event is None:
+                            events = [event] if event is not None else []
+                        if not events:
                             continue
-                        self._states[connection_id]["last_received_at"] = event["received_at"]
-                        await self._dispatch(connection_id, event)
+                        for event in events:
+                            self._states[connection_id]["last_received_at"] = event[
+                                "received_at"
+                            ]
+                            await self._dispatch(connection_id, event)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -596,9 +599,25 @@ def _parse_kis_market_message(
     generation: int,
     encryption: dict[str, tuple[str, str]] | None = None,
 ) -> dict[str, Any] | None:
+    """Parse the first event in a KIS frame for backwards compatibility."""
+    events = _parse_kis_market_messages(
+        message,
+        generation=generation,
+        encryption=encryption,
+    )
+    return events[0] if events else None
+
+
+def _parse_kis_market_messages(
+    message: str,
+    *,
+    generation: int,
+    encryption: dict[str, tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse every market event carried by one KIS WebSocket frame."""
     parts = message.split("|", 3)
     if len(parts) != 4 or parts[0] not in {"0", "1"}:
-        return None
+        return []
     tr_id = parts[1]
     try:
         count = max(1, int(parts[2]))
@@ -609,89 +628,113 @@ def _parse_kis_market_message(
     if tr_id in {"H0STCNI0", "H0STCNI9"}:
         secret = (encryption or {}).get(tr_id)
         if parts[0] != "1" or secret is None:
-            return None
+            return []
         decrypted = _aes_decrypt(parts[3], key=secret[0], iv=secret[1])
         row = decrypted.split("^")
         if len(row) < 26:
-            return None
-        return {
-            "event_type": "account_notice",
-            "tr_id": tr_id,
-            "code": row[8],
-            "notice": {
-                "provider": "kis",
-                "provider_order_id": row[2],
-                "original_order_id": row[3],
-                "side_code": row[4],
-                "change_code": row[5],
-                "order_kind": row[6],
+            return []
+        return [
+            {
+                "event_type": "account_notice",
+                "tr_id": tr_id,
                 "code": row[8],
-                "quantity": row[9],
-                "price": row[10],
-                "time": row[11],
-                "rejected": row[12],
-                "execution_code": row[13],
-                "accepted": row[14],
-                "branch": row[15],
-                "ordered_quantity": row[16],
-                "route_code": row[19],
+                "notice": {
+                    "provider": "kis",
+                    "provider_order_id": row[2],
+                    "original_order_id": row[3],
+                    "side_code": row[4],
+                    "change_code": row[5],
+                    "order_kind": row[6],
+                    "code": row[8],
+                    "quantity": row[9],
+                    "price": row[10],
+                    "time": row[11],
+                    "rejected": row[12],
+                    "execution_code": row[13],
+                    "accepted": row[14],
+                    "branch": row[15],
+                    "ordered_quantity": row[16],
+                    "route_code": row[19],
+                },
+                "received_at": received_at.isoformat(),
             },
-            "received_at": received_at.isoformat(),
-        }
+        ]
     if tr_id in _QUOTE_TR_IDS.values():
         width = _QUOTE_FIELD_COUNT
-        row = values[:width] if count else values
-        if len(row) < 3:
-            return None
-        price = _positive_decimal(row[2])
-        if price is None:
-            return None
         venue = _venue_for_tr(tr_id)
-        market_time = _market_datetime(row[1], received_at)
-        return {
-            "event_type": "quote",
-            "tr_id": tr_id,
-            "code": row[0],
-            "quote": {
-                "instrument": {"code": row[0], "country": "KR", "asset": "EQUITY"},
-                "price": str(price),
-                "venue": venue.value,
-                "provider": "kis",
-                "market_time": market_time.isoformat(),
-                "received_at": received_at.isoformat(),
-                "correlation_id": f"ws-{generation}-{uuid4().hex}",
-                "delayed": False,
-                "stale": False,
-                "connection_generation": generation,
-            },
-            "received_at": received_at.isoformat(),
-        }
+        events: list[dict[str, Any]] = []
+        available = (len(values) + width - 1) // width
+        for index in range(min(count, available)):
+            row = values[index * width : (index + 1) * width]
+            if len(row) < 3:
+                continue
+            price = _positive_decimal(row[2])
+            if price is None:
+                continue
+            market_time = _market_datetime(row[1], received_at)
+            events.append(
+                {
+                    "event_type": "quote",
+                    "tr_id": tr_id,
+                    "code": row[0],
+                    "quote": {
+                        "instrument": {
+                            "code": row[0],
+                            "country": "KR",
+                            "asset": "EQUITY",
+                        },
+                        "price": str(price),
+                        "venue": venue.value,
+                        "provider": "kis",
+                        "market_time": market_time.isoformat(),
+                        "received_at": received_at.isoformat(),
+                        "correlation_id": f"ws-{generation}-{uuid4().hex}",
+                        "delayed": False,
+                        "stale": False,
+                        "connection_generation": generation,
+                    },
+                    "received_at": received_at.isoformat(),
+                }
+            )
+        return events
     if tr_id in _ORDERBOOK_TR_IDS.values():
         width = _ORDERBOOK_FIELD_COUNTS[tr_id]
-        row = values[:width] if count else values
-        if len(row) < 43:
-            return None
-        asks = _levels(row[3:13], row[23:33])
-        bids = _levels(row[13:23], row[33:43])
-        return {
-            "event_type": "orderbook",
-            "tr_id": tr_id,
-            "code": row[0],
-            "orderbook": {
-                "instrument": {"code": row[0], "country": "KR", "asset": "EQUITY"},
-                "asks": asks,
-                "bids": bids,
-                "venue": _venue_for_tr(tr_id).value,
-                "provider": "kis",
-                "market_time": _market_datetime(row[1], received_at).isoformat(),
-                "received_at": received_at.isoformat(),
-                "correlation_id": f"ws-{generation}-{uuid4().hex}",
-                "stale": False,
-                "connection_generation": generation,
-            },
-            "received_at": received_at.isoformat(),
-        }
-    return None
+        events = []
+        available = (len(values) + width - 1) // width
+        for index in range(min(count, available)):
+            row = values[index * width : (index + 1) * width]
+            if len(row) < 43:
+                continue
+            asks = _levels(row[3:13], row[23:33])
+            bids = _levels(row[13:23], row[33:43])
+            events.append(
+                {
+                    "event_type": "orderbook",
+                    "tr_id": tr_id,
+                    "code": row[0],
+                    "orderbook": {
+                        "instrument": {
+                            "code": row[0],
+                            "country": "KR",
+                            "asset": "EQUITY",
+                        },
+                        "asks": asks,
+                        "bids": bids,
+                        "venue": _venue_for_tr(tr_id).value,
+                        "provider": "kis",
+                        "market_time": _market_datetime(
+                            row[1], received_at
+                        ).isoformat(),
+                        "received_at": received_at.isoformat(),
+                        "correlation_id": f"ws-{generation}-{uuid4().hex}",
+                        "stale": False,
+                        "connection_generation": generation,
+                    },
+                    "received_at": received_at.isoformat(),
+                }
+            )
+        return events
+    return []
 
 
 def _parse_namuh_market_message(
