@@ -200,14 +200,18 @@ class OrderService:
                 broker_order,
                 open_provider_ids=open_provider_ids,
             )
-            filled_quantity = Decimal(
-                str(getattr(broker_order, "filled_quantity", "0"))
+            filled_quantity, average_fill_price = _broker_cumulative_fill(
+                row, broker_order, by_provider_id
             )
-            average_fill_price = getattr(
-                broker_order,
-                "average_fill_price",
-                None,
+            if filled_quantity < Decimal(str(row.get("filled_quantity") or "0")):
+                still_unknown.append(row["id"])
+                continue
+            target_status = _preserve_pending_status(
+                row, target_status, filled_quantity,
+                Decimal(str(getattr(broker_order, "remaining_quantity", "0"))),
             )
+            if target_status is OrderStatus.UNKNOWN_RECONCILING:
+                still_unknown.append(row["id"])
             try:
                 self._record_fill_delta(
                     row,
@@ -310,16 +314,20 @@ class OrderService:
                     broker_order,
                     open_provider_ids=open_provider_ids,
                 )
-                filled_quantity = Decimal(
-                    str(getattr(broker_order, "filled_quantity", "0"))
-                )
-                average_fill_price = getattr(
-                    broker_order,
-                    "average_fill_price",
-                    None,
+                filled_quantity, average_fill_price = _broker_cumulative_fill(
+                    row, broker_order, by_provider_id
                 )
                 previous_filled = Decimal(str(row.get("filled_quantity", "0")))
                 previous_average = Decimal(str(row.get("average_fill_price") or "0"))
+                if filled_quantity < previous_filled:
+                    continue
+                target_status = _preserve_pending_status(
+                    row, target_status, filled_quantity,
+                    Decimal(str(getattr(broker_order, "remaining_quantity", "0"))),
+                )
+                provider_metadata = _reconciled_provider_metadata(
+                    row, broker_order, filled_quantity
+                )
                 if (
                     row["status"] == target_status.value
                     and Decimal(str(row.get("filled_quantity", "0")))
@@ -330,6 +338,7 @@ class OrderService:
                         or str(row.get("average_fill_price"))
                         == str(average_fill_price)
                     )
+                    and provider_metadata == dict(row.get("provider_metadata") or {})
                 ):
                     continue
                 message = _tracked_order_message(
@@ -352,9 +361,6 @@ class OrderService:
                         ),
                     )
                     totals = self._cost_totals(str(row["id"]))
-                    provider_metadata = _reconciled_provider_metadata(
-                        row, broker_order, filled_quantity
-                    )
                     changed = self._store.update_order(
                         str(row["id"]),
                         status=target_status,
@@ -387,6 +393,32 @@ class OrderService:
                     )
                 updated.append(changed)
             return updated
+
+    async def open_orders(self, *, manifest: StrategyManifest) -> list[Order]:
+        """Expose only confirmed actionable orders belonging to this strategy."""
+        account_alias = manifest.trading_account
+        await self.refresh_unresolved_orders(account_alias)
+        async with self._account_lock(account_alias):
+            rows = self._store.orders(
+                strategy_id=manifest.strategy_id,
+                account_alias=account_alias,
+                statuses=(OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED),
+                limit=1000,
+            )
+            if not rows:
+                return []
+            broker_open = await self._gateway.account_orders(account_alias, state="open")
+            confirmed_ids = {
+                str(getattr(order, "provider_order_id", ""))
+                for order in broker_open
+                if getattr(order, "remaining_quantity", Decimal("0")) > 0
+            }
+            return [
+                order for row in rows
+                if str(row.get("provider_order_id") or "") in confirmed_ids
+                for order in (_order_from_row(row),)
+                if order.request.quantity > order.filled_quantity
+            ]
 
     async def apply_realtime_notice(
         self, account_alias: str, notice: dict[str, Any]
@@ -440,14 +472,52 @@ class OrderService:
         requested_quantity = Decimal(
             str(_effective_request_payload(row).get("quantity") or "0")
         )
-        cumulative_quantity = min(requested_quantity, previous_quantity + quantity)
+        provider_metadata = dict(row.get("provider_metadata") or {})
+        offsets = dict(provider_metadata.get("amendment_fill_offsets") or {})
+        previous_average = Decimal(str(row.get("average_fill_price") or "0"))
+        if offsets:
+            if provider_order_id != str(row.get("provider_order_id") or ""):
+                # A delayed parent or unidentified child cannot safely be
+                # combined with the current amended segment's realtime stream.
+                return None
+            # REST snapshots and realtime executions overlap. Accumulate the
+            # child stream independently, then compare original-order totals;
+            # adding a raw event to the REST total would count it twice.
+            realtime_totals = dict(provider_metadata.get("realtime_fill_totals") or {})
+            segment = dict(realtime_totals.get(provider_order_id) or {})
+            segment_quantity = Decimal(str(segment.get("quantity") or "0")) + quantity
+            segment_amount = Decimal(str(segment.get("amount") or "0")) + quantity * price
+            realtime_totals[provider_order_id] = {
+                "quantity": str(segment_quantity), "amount": str(segment_amount),
+            }
+            provider_metadata["realtime_fill_totals"] = realtime_totals
+            offset = dict(offsets.get(provider_order_id) or {})
+            base_quantity = Decimal(str(offset.get("quantity") or "0"))
+            base_amount = Decimal(str(offset.get("amount") or "0"))
+            candidate_quantity = base_quantity + segment_quantity
+            if candidate_quantity > requested_quantity:
+                # Unknown segment semantics or a stale parent notification;
+                # leave financial totals to authoritative REST reconciliation.
+                return self._store.update_order(
+                    str(row["id"]), status=OrderStatus(str(row["status"])),
+                    provider_metadata=provider_metadata,
+                )
+            cumulative_quantity = candidate_quantity
+            cumulative_average = (base_amount + segment_amount) / cumulative_quantity
+            if cumulative_quantity <= previous_quantity:
+                return self._store.update_order(
+                    str(row["id"]), status=OrderStatus(str(row["status"])),
+                    provider_metadata=provider_metadata,
+                )
+        else:
+            cumulative_quantity = min(requested_quantity, previous_quantity + quantity)
+            cumulative_average = (
+                previous_quantity * previous_average
+                + (cumulative_quantity - previous_quantity) * price
+            ) / cumulative_quantity
         actual_delta = cumulative_quantity - previous_quantity
         if actual_delta <= 0:
             return None
-        previous_average = Decimal(str(row.get("average_fill_price") or "0"))
-        cumulative_average = (
-            previous_quantity * previous_average + actual_delta * price
-        ) / cumulative_quantity
         fill = self._record_fill_delta(
             row,
             previous_quantity=previous_quantity,
@@ -461,6 +531,7 @@ class OrderService:
             if cumulative_quantity >= requested_quantity
             else OrderStatus.PARTIALLY_FILLED
         )
+        status = _preserve_pending_status(row, status, cumulative_quantity)
         changed = self._store.update_order(
             str(row["id"]),
             status=status,
@@ -469,6 +540,7 @@ class OrderService:
             commission=totals["commission"],
             tax=totals["tax"],
             costs_complete=totals["costs_complete"],
+            provider_metadata=provider_metadata,
             message=_tracked_order_message(
                 status,
                 filled_quantity=cumulative_quantity,
@@ -717,6 +789,7 @@ class OrderService:
         price: Decimal | None,
         route: OrderRoute | None,
     ) -> Order:
+        await self.refresh_unresolved_orders(manifest.trading_account)
         async with self._account_lock(manifest.trading_account):
             return await self._amend(
                 strategy_name=strategy_name,
@@ -747,7 +820,7 @@ class OrderService:
                 RouterErrorCode.UNSUPPORTED_CAPABILITY,
                 "이 증권사 연결은 주문 정정을 지원하지 않습니다.",
             )
-        if order_type is OrderType.LIMIT and price is None:
+        if order_type is OrderType.LIMIT and (price is None or price <= 0):
             raise RouterError(
                 RouterErrorCode.INVALID_REQUEST,
                 "지정가 정정에는 가격이 필요합니다.",
@@ -770,6 +843,11 @@ class OrderService:
             str(effective_request.get("route", "AUTO"))
         )
         _require_order_capability(capabilities, normalized_route)
+        if str(effective_request.get("side")) == OrderSide.BUY.value:
+            await self._preflight_buy_amendment(
+                manifest, row, quantity=amended_quantity,
+                order_type=order_type, price=price, route=normalized_route,
+            )
         try:
             acknowledgement = await self._gateway.amend_order(
                 manifest.trading_account,
@@ -785,6 +863,7 @@ class OrderService:
             changed = self._store.update_order(
                 order_id,
                 status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "amend"},
                 message=exc.message,
             )
             self._reconciled_accounts.discard(manifest.trading_account)
@@ -794,6 +873,7 @@ class OrderService:
             changed = self._store.update_order(
                 order_id,
                 status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "amend"},
                 message="정정 응답을 확인하지 못해 주문내역 조정이 필요합니다.",
             )
             self._reconciled_accounts.discard(manifest.trading_account)
@@ -801,6 +881,16 @@ class OrderService:
             return _order_from_row(changed)
         provider_metadata = dict(row.get("provider_metadata") or {})
         provider_metadata.update(acknowledgement.provider_options)
+        if acknowledgement.provider_order_id != row.get("provider_order_id"):
+            offsets = dict(provider_metadata.get("amendment_fill_offsets") or {})
+            previous_filled = Decimal(str(row.get("filled_quantity") or "0"))
+            offsets[acknowledgement.provider_order_id] = {
+                "quantity": str(previous_filled),
+                "amount": str(previous_filled * Decimal(str(row.get("average_fill_price") or "0"))),
+                "requested_quantity": str(amended_quantity),
+                "previous_provider_order_id": str(row.get("provider_order_id") or ""),
+            }
+            provider_metadata["amendment_fill_offsets"] = offsets
         provider_metadata["effective_request"] = {
             "quantity": str(
                 Decimal(str(row.get("filled_quantity") or "0")) + amended_quantity
@@ -824,6 +914,44 @@ class OrderService:
         )
         await self._publish_order(changed, strategy_name=strategy_name)
         return _order_from_row(changed)
+
+    async def _preflight_buy_amendment(
+        self, manifest: StrategyManifest, row: dict[str, Any], *,
+        quantity: Decimal, order_type: OrderType, price: Decimal | None,
+        route: OrderRoute,
+    ) -> None:
+        original = dict(row["request"])
+        effective = _effective_request_payload(row)
+        filled = Decimal(str(row.get("filled_quantity") or "0"))
+        original_quantity = Decimal(str(original.get("quantity") or "0"))
+        reserved = Decimal(str(original.get("reserved_amount") or "0"))
+        remaining = Decimal(str(effective["quantity"])) - filled
+        filled_amount = filled * Decimal(str(row.get("average_fill_price") or "0"))
+        # Keep the original per-share allocation and total order budget. A
+        # reprice must reduce quantity when the conservative unit price rises.
+        remaining_budget = min(
+            max(Decimal("0"), reserved - filled_amount),
+            reserved * remaining / original_quantity if original_quantity > 0 else Decimal("0"),
+        )
+        power = await self._gateway.buying_power(
+            manifest.trading_account, str(effective["code"]),
+            order_type=order_type, price=price, route=route,
+        )
+        unit_price = max(power.calculation_price, price or Decimal("0"))
+        if not unit_price.is_finite() or unit_price <= 0:
+            raise RouterError(RouterErrorCode.INVALID_REQUEST, "정정 주문 계산단가를 확인할 수 없습니다.")
+        amount = quantity * unit_price
+        if amount > remaining_budget:
+            raise RouterError(
+                RouterErrorCode.RISK_LIMIT_EXCEEDED,
+                "정정 주문 금액이 기존 미체결 주문의 예산을 초과합니다.",
+                details={"requested": str(amount), "remaining_budget": str(remaining_budget)},
+            )
+        account_limits = self._gateway.account_risk_limits(manifest.trading_account)
+        for limits in (manifest.risk_limits, account_limits):
+            limit = _optional_decimal(limits.get("max_order_amount"))
+            if limit is not None and filled_amount + amount > limit:
+                raise RouterError(RouterErrorCode.RISK_LIMIT_EXCEEDED, "정정 주문이 1회 주문 금액 한도를 초과합니다.")
 
     async def cancel(
         self,
@@ -896,6 +1024,7 @@ class OrderService:
                 unknown = self._store.update_order(
                     order_id,
                     status=OrderStatus.UNKNOWN_RECONCILING,
+                    provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "cancel"},
                     message=exc.message,
                 )
                 self._reconciled_accounts.discard(manifest.trading_account)
@@ -912,6 +1041,7 @@ class OrderService:
             unknown = self._store.update_order(
                 order_id,
                 status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "cancel"},
                 message="취소 응답을 확인하지 못해 주문내역 조정이 필요합니다.",
             )
             self._reconciled_accounts.discard(manifest.trading_account)
@@ -919,10 +1049,16 @@ class OrderService:
             return _order_from_row(unknown)
         provider_metadata = dict(row.get("provider_metadata") or {})
         provider_metadata.update(acknowledgement.provider_options)
+        # KIS normalizes cancellation child rows into the cancelled original
+        # row. Keep querying that original while retaining the receipt for audit.
+        provider_metadata["cancel_provider_order_id"] = acknowledgement.provider_order_id
+        provider_metadata["pending_cancel_expected_total"] = str(
+            Decimal(str(effective_request["quantity"])) - (quantity if quantity is not None else remaining)
+        )
         changed = self._store.update_order(
             order_id,
             status=OrderStatus.CANCEL_PENDING,
-            provider_order_id=acknowledgement.provider_order_id,
+            provider_order_id=str(row["provider_order_id"]),
             provider_metadata=provider_metadata,
             message=acknowledgement.message or "주문 취소가 접수되었습니다.",
         )
@@ -1257,6 +1393,59 @@ def _effective_request_payload(row: dict[str, object]) -> dict[str, object]:
         if key in effective:
             original[key] = effective[key]
     return original
+
+
+def _broker_cumulative_fill(
+    row: dict[str, object], broker_order: object, by_provider_id: dict[str, object],
+    visited: frozenset[str] = frozenset(),
+) -> tuple[Decimal, Decimal | None]:
+    """Convert an amended broker segment's fills to original-order totals."""
+    quantity = Decimal(str(getattr(broker_order, "filled_quantity", "0")))
+    average = getattr(broker_order, "average_fill_price", None)
+    average = Decimal(str(average)) if average is not None else None
+    provider_id = str(getattr(broker_order, "provider_order_id", ""))
+    metadata = dict(row.get("provider_metadata") or {})
+    offsets = dict(metadata.get("amendment_fill_offsets") or {})
+    offset = offsets.get(provider_id)
+    if not isinstance(offset, dict) or provider_id in visited:
+        return quantity, average
+    # Some brokers return original-order cumulative snapshots after amendment.
+    # Those already include earlier fills and must not receive the offset twice.
+    if Decimal(str(getattr(broker_order, "requested_quantity", "0"))) > Decimal(
+        str(offset.get("requested_quantity") or "0")
+    ):
+        return quantity, average
+    base_quantity = Decimal(str(offset.get("quantity") or "0"))
+    base_amount = Decimal(str(offset.get("amount") or "0"))
+    previous_id = str(offset.get("previous_provider_order_id") or "")
+    previous = by_provider_id.get(previous_id)
+    if previous is not None and previous_id not in visited | {provider_id}:
+        prior_quantity, prior_average = _broker_cumulative_fill(
+            row, previous, by_provider_id, visited | {provider_id}
+        )
+        if prior_quantity > base_quantity and prior_average is not None:
+            base_quantity = prior_quantity
+            base_amount = prior_quantity * prior_average
+    total_quantity = base_quantity + quantity
+    total_amount = base_amount + quantity * (average or Decimal("0"))
+    return total_quantity, total_amount / total_quantity if total_quantity > 0 else average
+
+
+def _preserve_pending_status(
+    row: dict[str, object], status: OrderStatus, filled_quantity: Decimal,
+    remaining_quantity: Decimal | None = None,
+) -> OrderStatus:
+    if status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
+        metadata = dict(row.get("provider_metadata") or {})
+        if row["status"] == OrderStatus.UNKNOWN_RECONCILING.value and metadata.get("uncertain_modification"):
+            return OrderStatus.UNKNOWN_RECONCILING
+        if row["status"] == OrderStatus.CANCEL_PENDING.value:
+            expected = metadata.get("pending_cancel_expected_total")
+            if remaining_quantity is None or expected is None or filled_quantity + remaining_quantity > Decimal(str(expected)):
+                return OrderStatus.CANCEL_PENDING
+        if filled_quantity > 0:
+            return OrderStatus.PARTIALLY_FILLED
+    return status
 
 
 def _reconciled_provider_metadata(

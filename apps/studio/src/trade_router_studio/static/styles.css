@@ -2329,6 +2329,15 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 }
 .rule-action-editor select,
 .rule-editor-section select { width: 100%; height: 34px; }
+.execution-condition-editor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.execution-condition-editor > .wide,
+.execution-condition-help { grid-column: 1 / -1; }
+.execution-condition-editor input { width: 100%; min-width: 0; height: 34px; }
+.composer-logic-pill.execution {
+  border-color: #acd1dd;
+  background: #edf7fa;
+  color: #22667c;
+}
 
 .condition-formula-editor { min-width: 0; display: grid; gap: 9px; }
 .condition-formula-hint {
@@ -2806,6 +2815,14 @@ button.composer-tree-add-row { cursor: pointer; }
 .composer-tree-logic[data-tone="close"] {
   border-color: #a9aeba;
   background: #596273;
+  color: #fff;
+}
+.composer-tree-badge.execution,
+.composer-tree-logic.execution,
+.composer-tree-badge[data-tone="execution"],
+.composer-tree-logic[data-tone="execution"] {
+  border-color: #7aabbc;
+  background: #32758c;
   color: #fff;
 }
 .composer-tree-badge.shared,

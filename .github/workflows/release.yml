@@ -26,7 +26,7 @@ jobs:
           node-version: "24"
 
       - name: Test condition editor
-        run: node --test tests/test_condition_formula.cjs tests/test_rule_connections.cjs tests/test_rule_pointer_drag.cjs tests/test_rule_block_menu.cjs tests/test_best_limit_ui.cjs
+        run: node --test tests/test_condition_formula.cjs tests/test_rule_connections.cjs tests/test_rule_pointer_drag.cjs tests/test_rule_block_menu.cjs tests/test_best_limit_ui.cjs tests/test_execution_rules_ui.cjs
 
       - name: Install and test
         shell: pwsh

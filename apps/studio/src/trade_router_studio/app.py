@@ -2459,6 +2459,19 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         )
         return _order_payload(order)
 
+    @app.get("/api/v1/orders/open")
+    async def open_strategy_orders(
+        session: StrategySession = Depends(require_strategy_session),
+    ) -> dict[str, object]:
+        manifest = sessions.manifest(session.strategy_name)
+        if manifest is None:
+            raise HTTPException(status_code=409, detail="전략 실행 설정을 먼저 등록하세요.")
+        try:
+            orders = await order_engine().open_orders(manifest=manifest)
+        except RouterError as exc:
+            raise HTTPException(status_code=502, detail=exc.as_dict()) from exc
+        return {"orders": [_order_payload(order) for order in orders]}
+
     @app.post("/api/v1/orders/{order_id}/amend")
     async def amend_strategy_order(
         order_id: str,
@@ -2479,7 +2492,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 route=body.route,
             )
         except RouterError as exc:
-            status_code = 403 if exc.code is RouterErrorCode.ORDER_PERMISSION_REQUIRED else 422 if exc.code in {RouterErrorCode.INVALID_REQUEST, RouterErrorCode.UNSUPPORTED_CAPABILITY, RouterErrorCode.ORDER_REJECTED} else 502
+            status_code = 403 if exc.code is RouterErrorCode.ORDER_PERMISSION_REQUIRED else 422 if exc.code in {RouterErrorCode.INVALID_REQUEST, RouterErrorCode.UNSUPPORTED_CAPABILITY, RouterErrorCode.ORDER_REJECTED, RouterErrorCode.RISK_LIMIT_EXCEEDED} else 502
             raise HTTPException(status_code=status_code, detail=exc.as_dict()) from exc
         return _order_payload(order)
 

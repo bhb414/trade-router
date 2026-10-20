@@ -9,6 +9,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .execution_models import BlockExecutionFlow
+
 
 BLOCK_PACKAGE_KIND = "trade-router-block-strategy"
 BAR_OBSERVER_TEMPLATE = "bar-observer-v1"
@@ -629,6 +631,7 @@ class ConditionBollingerBlockSettings(BaseModel):
     sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
     sell_rule_tree: BlockLogicNode | None = None
     sell_flows: list[BlockSellFlow] = Field(default_factory=list, max_length=8)
+    execution_flows: list[BlockExecutionFlow] = Field(default_factory=list, max_length=8)
     buy_order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"] = "MARKET"
     sell_order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"] = "MARKET"
     buy_scan_seconds: int = Field(ge=1, le=86_400)
@@ -765,6 +768,9 @@ class ConditionBollingerBlockSettings(BaseModel):
         sell_flow_identifiers = [flow.id for flow in self.sell_flows]
         if len(sell_flow_identifiers) != len(set(sell_flow_identifiers)):
             raise ValueError("매도 흐름 ID는 서로 달라야 합니다.")
+        execution_ids = [flow.id for flow in self.execution_flows]
+        if len(execution_ids) != len(set(execution_ids)):
+            raise ValueError("체결 흐름 ID는 서로 달라야 합니다.")
         if not self.sell_flows and self.sell_rule_tree is None:
             raise ValueError("매도 조건 계층이나 매도 흐름이 필요합니다.")
         _validate_rule_tree(self.buy_rule_tree, side="BUY")
@@ -1016,6 +1022,7 @@ from decimal import Decimal, DecimalException
 from zoneinfo import ZoneInfo
 
 from trade_router import OrderStatus, RankingKind, RiskLimits, RouterError, ScheduleKind, Strategy, StrategyConfig, Venue
+from trade_router_studio.execution_rules import ExecutionRuleManager
 
 BLOCK_TEMPLATE = __BLOCK_TEMPLATE__
 BLOCK_LAYOUT_JSON = __BLOCK_LAYOUT_JSON__
@@ -1052,6 +1059,7 @@ BUY_FLOWS_JSON = __BUY_FLOWS_JSON__
 SELL_CONDITION_GROUPS_JSON = __SELL_CONDITION_GROUPS_JSON__
 SELL_RULE_TREE_JSON = __SELL_RULE_TREE_JSON__
 SELL_FLOWS_JSON = __SELL_FLOWS_JSON__
+EXECUTION_FLOWS_JSON = __EXECUTION_FLOWS_JSON__
 BUY_ORDER_TYPE = __BUY_ORDER_TYPE__
 SELL_ORDER_TYPE = __SELL_ORDER_TYPE__
 BUY_SCAN_SECONDS = __BUY_SCAN_SECONDS__
@@ -1087,6 +1095,7 @@ RAW_BUY_FLOWS = CONFIGURED_BUY_FLOWS or ({
     "buy_condition_groups": BUY_CONDITION_GROUPS, "buy_rule_tree": BUY_RULE_TREE,
 },)
 CONFIGURED_SELL_FLOWS = tuple(json.loads(SELL_FLOWS_JSON))
+EXECUTION_FLOWS = tuple(json.loads(EXECUTION_FLOWS_JSON))
 RAW_SELL_FLOWS = CONFIGURED_SELL_FLOWS or ({
     "id": "default", "name": "매도 흐름",
     "sell_scan_seconds": BUY_SCAN_SECONDS,
@@ -2366,6 +2375,27 @@ class ManagedBlockStrategy(Strategy):
 
     async def on_start(self, ctx):
         self._ensure_live_state()
+        self._execution_rule_manager = ExecutionRuleManager(
+            EXECUTION_FLOWS,
+            session_is_open=lambda order, now: self._order_type_session_is_open(
+                now, order.request.route.value, "BEST_LIMIT"
+            ),
+        )
+        self._execution_flow_schedules = {}
+        for flow in EXECUTION_FLOWS:
+            schedule_id = f"execution-manage-{flow['id']}"
+            self._execution_flow_schedules[schedule_id] = flow["id"]
+            ctx.scheduler.every(
+                seconds=flow["execution_scan_seconds"],
+                schedule_id=schedule_id,
+                between=(flow["execution_start_time"], flow["execution_end_time"]),
+                aligned=True,
+            )
+            ctx.log.info(
+                f"체결 흐름 {flow['name']}: {flow['execution_start_time']} 이상 · "
+                f"{flow['execution_end_time']} 미만 / {flow['execution_scan_seconds']}초마다 · "
+                "전략 소유 미체결 주문만 관리 · 행동별 원주문당 1회"
+            )
         buy_sources = [
             source
             for flow in BUY_FLOWS
@@ -2510,6 +2540,10 @@ class ManagedBlockStrategy(Strategy):
         return tracked
 
     async def on_timer(self, ctx, event):
+        execution_flow_id = getattr(self, "_execution_flow_schedules", {}).get(event.schedule_id)
+        if execution_flow_id is not None:
+            await self._execution_rule_manager.tick(ctx, execution_flow_id)
+            return
         sell_flow = getattr(self, "_sell_flow_schedules", {}).get(event.schedule_id)
         if sell_flow is not None:
             await self.on_bar(ctx, event)
@@ -3159,6 +3193,7 @@ def _render_condition_bollinger(
         "__SELL_CONDITION_GROUPS_JSON__": _json_literal(settings.sell_condition_groups),
         "__SELL_RULE_TREE_JSON__": _json_literal(settings.sell_rule_tree),
         "__SELL_FLOWS_JSON__": _json_literal(settings.sell_flows),
+        "__EXECUTION_FLOWS_JSON__": _json_literal(settings.execution_flows),
         "__BUY_ORDER_TYPE__": _literal(settings.buy_order_type),
         "__SELL_ORDER_TYPE__": _literal(settings.sell_order_type),
         "__BUY_SCAN_SECONDS__": str(settings.buy_scan_seconds),
@@ -3236,7 +3271,7 @@ def _constants_from_source(source: str) -> tuple[ast.Module, dict[str, object]]:
         if not isinstance(target, ast.Name):
             continue
         value = _literal_value(node.value, constants)
-        if value is not None:
+        if value is not None or target.id == "EXECUTION_FLOWS_JSON":
             constants[target.id] = value
     return tree, constants
 
@@ -3292,6 +3327,16 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
     sell_rule_tree_json = constants.get("SELL_RULE_TREE_JSON")
     buy_flows_json = constants.get("BUY_FLOWS_JSON")
     sell_flows_json = constants.get("SELL_FLOWS_JSON")
+    execution_flows_json = constants.get("EXECUTION_FLOWS_JSON")
+    if "EXECUTION_FLOWS_JSON" not in constants:
+        required["execution_flows"] = []
+    else:
+        if not isinstance(execution_flows_json, str):
+            raise ValueError("체결 흐름 설정을 읽을 수 없습니다.")
+        try:
+            required["execution_flows"] = json.loads(execution_flows_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("체결 흐름 설정을 읽을 수 없습니다.") from exc
     # Missing means a pre-flow strategy; malformed explicit flow data must not
     # silently fall back to the legacy discovery source and trade differently.
     if buy_flows_json is None:

@@ -489,6 +489,9 @@ class SyncOrderClient:
     def amend(self, *args: object, **kwargs: object) -> Any:
         return self._router._call(self._router._async.orders.amend(*args, **kwargs))
 
+    def open_orders(self) -> list[Order]:
+        return self._router._call(self._router._async.orders.open_orders())
+
     def cancel(self, *args: object, **kwargs: object) -> Any:
         return self._router._call(self._router._async.orders.cancel(*args, **kwargs))
 
@@ -1010,6 +1013,11 @@ class AccountClient:
 class OrderClient:
     def __init__(self, router: AsyncTradeRouter) -> None:
         self._router = router
+
+    async def open_orders(self) -> list[Order]:
+        """Reconcile and return actionable orders owned by this strategy/account."""
+        payload = await self._router._get("/api/v1/orders/open", {})
+        return [_order_from_payload(item) for item in payload.get("orders", [])]
 
     async def market_buy(
         self,
