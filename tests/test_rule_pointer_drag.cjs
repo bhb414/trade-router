@@ -42,7 +42,9 @@ function element() {
       contains: value => classes.has(value),
     },
     closest(selector) {
-      return selector === "[data-rule-drop-target]" && this.dataset.ruleDropTarget ? this : null;
+      if (selector === "[data-rule-drop-target]" && this.dataset.ruleDropTarget) return this;
+      if (selector.startsWith(".") && this.classList.contains(selector.slice(1))) return this;
+      return this.parentNode?.closest(selector) || null;
     },
     getBoundingClientRect() { return this.bounds; },
     setAttribute(name, value) { this.attributes[name] = value; },
@@ -90,9 +92,9 @@ function fixture({ disabled = false } = {}) {
   const window = eventTarget();
   const fixture = { running: false, hit: destination, moves: [], notices: [], plan: { tree: {}, error: "" } };
   const nodes = [sourceNode, destination];
-  canvas.querySelectorAll = selector => nodes.filter(node => (
-    selector.split(",").some(name => node.classList.contains(name.trim().slice(1)))
-  ));
+  canvas.querySelectorAll = selector => nodes.filter(node => selector === ".composer-rule-insertion[data-rule-drop-target]"
+    ? node.classList.contains("composer-rule-insertion") && node.dataset.ruleDropTarget
+    : selector.split(",").some(name => node.classList.contains(name.trim().slice(1))));
   canvas.contains = node => nodes.includes(node);
   const state = { selected: "strategy-a", blockRuleDragClickUntil: 0 };
   const context = vm.createContext({
@@ -117,7 +119,15 @@ function fixture({ disabled = false } = {}) {
     stopPropagation() { this.stopped = true; },
     ...extra,
   });
-  return { ...fixture, backing: fixture, sourceNode, destination, canvas, body, state, window, context, pointer };
+  const seam = ({ top = 210, height = 12, left = 20, width = 400, nodeId = "B", mode = "before", disabled = false } = {}) => {
+    const slot = element();
+    slot.classList.add("composer-rule-insertion");
+    slot.bounds = { left, top, width, height };
+    context.bindComposerRuleDropTarget(slot, { kind: "buy", flowId: "flow-a", nodeId }, mode, disabled);
+    nodes.push(slot);
+    return slot;
+  };
+  return { ...fixture, backing: fixture, sourceNode, destination, canvas, body, state, window, context, pointer, seam, nodes };
 }
 function listenerCount(window) {
   return [...window.listeners.values()].reduce((total, callbacks) => total + callbacks.size, 0);
@@ -265,4 +275,92 @@ test("disabled and running strategies cannot start or finish a move", () => {
   running.window.dispatch("pointerup", running.pointer(20, 180));
   assert.equal(running.moves.length, 0);
   assert.equal(listenerCount(running.window), 0);
+});
+
+test("drag gaps and zero-height edge seams show the marker used for the exact committed target at every zoom", () => {
+  for (const zoom of [.5, 1, 1.75]) {
+    for (const [mode, nodeId, height] of [["before", "first", 0], ["before", "middle", 12], ["after", "last", 0], ["inside", "empty", 24]]) {
+      const f = fixture();
+      const top = 300 * zoom;
+      const seam = f.seam({ top, height: height * zoom, left: 40 * zoom, width: 600 * zoom, mode, nodeId });
+      const x = 180 * zoom;
+      const y = top + height * zoom / 2;
+      f.sourceNode.dispatch("pointerdown", f.pointer(10, 10));
+      f.window.dispatch("pointermove", f.pointer(x, y));
+      assert.equal(seam.classList.contains(`rule-drop-${mode}`), true, `${zoom}: ${mode}`);
+      assert.equal(f.destination.classList.contains("rule-drop-before"), false);
+      f.window.dispatch("pointerup", f.pointer(x, y));
+      assert.deepEqual(f.moves, [["buy", "flow-a", "A", nodeId, mode, false]]);
+      assert.equal(seam.classList.contains(`rule-drop-${mode}`), false);
+    }
+  }
+});
+
+test("card upper and lower halves resolve to their surrounding seams instead of a competing card marker", () => {
+  for (const [y, mode] of [[120, "before"], [180, "after"]]) {
+    const f = fixture();
+    f.destination.classList.add("composer-rule-draggable");
+    const branch = element();
+    branch.classList.add("composer-rule-branch");
+    branch.append(f.destination);
+    const before = f.seam({ top: 90, height: 0, nodeId: "B", mode: "before" });
+    const after = f.seam({ top: 230, height: 0, nodeId: "B", mode: "after" });
+    branch.previousElementSibling = before;
+    branch.nextElementSibling = after;
+    f.sourceNode.dispatch("pointerdown", f.pointer(10, 10));
+    f.window.dispatch("pointermove", f.pointer(100, y));
+    assert.equal((mode === "before" ? before : after).classList.contains(`rule-drop-${mode}`), true);
+    assert.equal(f.destination.classList.contains(`rule-drop-${mode}`), false);
+    f.window.dispatch("pointerup", f.pointer(100, y));
+    assert.deepEqual(f.moves, [["buy", "flow-a", "A", "B", mode, false]]);
+  }
+});
+
+test("nested seams choose the deepest target under the pointer and the outer gutter keeps the parent target", () => {
+  for (const [x, expected] of [[180, "nested-first"], [45, "outer-first"]]) {
+    const f = fixture();
+    const outer = f.seam({ top: 250, left: 40, width: 500, height: 0, nodeId: "outer-first" });
+    const inner = f.seam({ top: 250, left: 80, width: 460, height: 0, nodeId: "nested-first" });
+    f.sourceNode.dispatch("pointerdown", f.pointer(10, 10));
+    f.window.dispatch("pointermove", f.pointer(x, 250));
+    assert.equal((expected === "nested-first" ? inner : outer).classList.contains("rule-drop-before"), true);
+    assert.equal((expected === "nested-first" ? outer : inner).classList.contains("rule-drop-before"), false);
+    f.window.dispatch("pointerup", f.pointer(x, 250));
+    assert.deepEqual(f.moves, [["buy", "flow-a", "A", expected, "before", false]]);
+  }
+});
+
+test("outside the canvas or over the inspector never drops onto a seam behind it", () => {
+  for (const blocked of ["outside", "inspector"]) {
+    const f = fixture();
+    const seam = f.seam({ top: 250, height: 0 });
+    const overlay = element();
+    if (blocked === "inspector") {
+      overlay.classList.add("composer-inspector");
+      f.nodes.push(overlay);
+    }
+    f.backing.hit = overlay;
+    f.sourceNode.dispatch("pointerdown", f.pointer(10, 10));
+    f.window.dispatch("pointermove", f.pointer(100, 250));
+    assert.equal(seam.classList.contains("rule-drop-before"), false);
+    f.window.dispatch("pointerup", f.pointer(100, 250));
+    assert.equal(f.moves.length, 0);
+    assert.deepEqual(f.notices, []);
+  }
+});
+
+test("a same-position seam is a silent no-op, and a different flow shows rejection without committing", () => {
+  for (const unchanged of [true, false]) {
+    const f = fixture();
+    const seam = f.seam({ top: 250, height: 0 });
+    f.backing.plan = unchanged ? { tree: null, error: "", unchanged: true }
+      : { tree: null, error: "같은 시간대 흐름 안에서만 조건을 이동할 수 있습니다." };
+    f.sourceNode.dispatch("pointerdown", f.pointer(10, 10));
+    f.window.dispatch("pointermove", f.pointer(100, 250));
+    assert.equal(seam.classList.contains("rule-drop-before"), false);
+    assert.equal(seam.classList.contains("rule-drop-invalid"), !unchanged);
+    f.window.dispatch("pointerup", f.pointer(100, 250));
+    assert.equal(f.moves.length, 0);
+    assert.equal(f.notices.length, unchanged ? 0 : 1);
+  }
 });

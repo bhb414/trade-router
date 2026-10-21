@@ -87,7 +87,8 @@ class LiveSellHarness:
         )
 
     async def balance(self):
-        return SimpleNamespace(positions=tuple(self.positions))
+        return SimpleNamespace(positions=tuple(self.positions), buy_commission_rate=Decimal("0"),
+                               sell_commission_rate=Decimal("0"), sell_tax_rate=Decimal("0"))
 
     async def open_orders(self):
         return tuple(self.open_order_rows)

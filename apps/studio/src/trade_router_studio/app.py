@@ -26,7 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from trade_router import (
     InstrumentId,
@@ -148,6 +148,13 @@ class OrderSubmissionRegistration(BaseModel):
     route: OrderRoute = OrderRoute.AUTO
     price: Decimal | None = Field(default=None, gt=0)
     provider_options: dict[str, object] = Field(default_factory=dict)
+    sell_position_scope: Literal["STRATEGY", "ACCOUNT"] = "STRATEGY"
+
+    @model_validator(mode="after")
+    def validate_sell_scope(self) -> "OrderSubmissionRegistration":
+        if self.side is not OrderSide.SELL and self.sell_position_scope != "STRATEGY":
+            raise ValueError("계좌 잔고 대상은 매도 주문에만 지정할 수 있습니다.")
+        return self
 
 
 class RealtimeSubscriptionRegistration(BaseModel):
@@ -369,6 +376,14 @@ def _workspace_instrument_names(
     return names
 
 
+def _accounting_order_key(row: dict[str, object]) -> tuple[float, int]:
+    value = row.get("accounting_at") or row.get("created_at")
+    timestamp = datetime.fromisoformat(str(value)) if value else None
+    if timestamp is not None and timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=SEOUL)
+    return (timestamp.timestamp() if timestamp else 0, int(row.get("accounting_sequence", 0)))
+
+
 def _matched_sale_results(
     orders: list[dict[str, object]],
 ) -> dict[int, dict[str, object]]:
@@ -376,7 +391,7 @@ def _matched_sale_results(
 
     positions: dict[str, dict[str, Decimal | bool]] = {}
     results: dict[int, dict[str, object]] = {}
-    for row in sorted(orders, key=lambda item: str(item.get("created_at") or "")):
+    for row in sorted(orders, key=_accounting_order_key):
         request = dict(row.get("request") or {})
         code = str(request.get("code") or "")
         side = str(request.get("side") or "")
@@ -450,12 +465,11 @@ def _strategy_performance(
     realized = Decimal("0")
     bought = Decimal("0")
     sold = Decimal("0")
-    matched_sales = 0
-    winning_sales = 0
+    sale_profits: dict[str, Decimal] = {}
     total_commission = Decimal("0")
     total_tax = Decimal("0")
     cost_flags: list[bool] = []
-    for row in sorted(orders, key=lambda item: str(item.get("created_at") or "")):
+    for row in sorted(orders, key=_accounting_order_key):
         request = dict(row.get("request") or {})
         code = str(request.get("code") or "")
         side = str(request.get("side") or "")
@@ -489,9 +503,8 @@ def _strategy_performance(
         matched_ratio = matched / quantity
         profit = net_sale * matched_ratio - average_cost * matched
         realized += profit
-        matched_sales += 1
-        if profit > 0:
-            winning_sales += 1
+        sale_id = str(row.get("id") or id(row))
+        sale_profits[sale_id] = sale_profits.get(sale_id, Decimal("0")) + profit
         position["quantity"] -= matched
         position["cost"] -= average_cost * matched
 
@@ -581,6 +594,8 @@ def _strategy_performance(
             }
         )
 
+    matched_sales = len(sale_profits)
+    winning_sales = sum(profit > 0 for profit in sale_profits.values())
     total_profit = realized + unrealized
     return_rate = (
         total_profit / bought * Decimal("100") if bought > 0 else None
@@ -618,16 +633,80 @@ def _strategy_trade_history(
     *,
     limit: int = 200,
     instrument_names: dict[str, str] | None = None,
+    accounting_orders: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """Return presentation-safe strategy order history without provider secrets."""
 
     names = instrument_names or {}
-    sale_results = _matched_sale_results(orders)
+    cost_orders = orders if accounting_orders is None else accounting_orders
+    sale_results = _matched_sale_results(cost_orders)
+    sales_by_order: dict[str, dict[str, object]] = {}
+    for row in cost_orders:
+        sale = sale_results.get(id(row))
+        if sale is None:
+            continue
+        order_id = str(row.get("id") or id(row))
+        aggregate = sales_by_order.setdefault(order_id, {
+            "matched_quantity": "0", "cost_basis": "0", "net_proceeds": "0",
+            "realized_profit": "0", "costs_complete": True,
+        })
+        for key in ("matched_quantity", "cost_basis", "net_proceeds", "realized_profit"):
+            aggregate[key] = str(Decimal(str(aggregate[key])) + Decimal(str(sale[key])))
+        aggregate["costs_complete"] = bool(aggregate["costs_complete"]) and bool(sale["costs_complete"])
+        cost = Decimal(str(aggregate["cost_basis"]))
+        aggregate["return_percent"] = (
+            str((Decimal(str(aggregate["realized_profit"])) / cost * 100).quantize(Decimal("0.01")))
+            if cost > 0 else None
+        )
+    history_orders = list(orders)
+    if accounting_orders is not None:
+        own_ids = {row.get("id") for row in orders}
+        external_sales: dict[str, dict[str, object]] = {}
+        for row in sorted(accounting_orders, key=_accounting_order_key):
+            if (row.get("id") in own_ids or not row.get("execution_strategy_id")
+                or row.get("execution_strategy_id") == row.get("attributed_strategy_id")):
+                continue
+            order_id = str(row["id"])
+            combined = external_sales.get(order_id)
+            if combined is None:
+                external_sales[order_id] = {**row, "request": dict(row["request"])}
+                continue
+            previous = Decimal(str(combined["filled_quantity"]))
+            quantity = Decimal(str(row["filled_quantity"]))
+            total = previous + quantity
+            combined["average_fill_price"] = str((
+                previous * Decimal(str(combined.get("average_fill_price") or "0"))
+                + quantity * Decimal(str(row.get("average_fill_price") or "0"))
+            ) / total)
+            combined["filled_quantity"] = str(total)
+            combined["request"]["quantity"] = str(total)
+            for key in ("commission", "tax"):
+                combined[key] = str(Decimal(str(combined.get(key) or "0")) + Decimal(str(row.get(key) or "0")))
+            combined["accounting_sequence"] = row.get("accounting_sequence", 0)
+        for row in external_sales.values():
+            row["message"] = (
+                f"계좌 잔고 대상 전략({row['execution_strategy_id']})의 매도로 "
+                f"이 전략 보유분 {row['filled_quantity']}주를 정리했습니다."
+            )
+        history_orders.extend(external_sales.values())
+        sequence_by_order: dict[object, int] = {}
+        for row in accounting_orders:
+            order_id = row.get("id")
+            sequence_by_order[order_id] = max(
+                sequence_by_order.get(order_id, -1),
+                int(row.get("accounting_sequence", 0)),
+            )
+        history_orders.sort(
+            key=lambda row: (
+                str(row.get("created_at") or ""),
+                sequence_by_order.get(row.get("id"), -1),
+            ), reverse=True,
+        )
     rows: list[dict[str, object]] = []
-    for row in orders[:limit]:
+    for row in history_orders[:limit]:
         request = dict(row.get("request") or {})
         code = str(request.get("code") or "")
-        sale = sale_results.get(id(row), {})
+        sale = sales_by_order.get(str(row.get("id") or id(row)), {})
         rows.append(
             {
                 "id": row.get("id"),
@@ -637,6 +716,8 @@ def _strategy_trade_history(
                 "name": names.get(code),
                 "side": request.get("side"),
                 "order_type": request.get("order_type"),
+                "sell_position_scope": request.get("sell_position_scope", "STRATEGY"),
+                "execution_strategy_id": row.get("execution_strategy_id", row.get("strategy_id")),
                 "quantity": request.get("quantity"),
                 "filled_quantity": row.get("filled_quantity"),
                 "average_fill_price": row.get("average_fill_price"),
@@ -2403,6 +2484,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 route=body.route,
                 price=body.price,
                 provider_options=dict(body.provider_options),
+                sell_position_scope=body.sell_position_scope,
             )
             order = await order_engine().submit(
                 strategy_name=session.strategy_name,
@@ -3174,6 +3256,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             )
         try:
             balance = await connection_runtime.balance(account)
+            cost_rates = connection_runtime.account_cost_rates(account)
         except SettingsError as exc:
             record_service_result(
                 session,
@@ -3217,6 +3300,10 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             "withdrawable_cash": str(balance.withdrawable_cash),
             "total_value": str(balance.total_value),
             "as_of": balance.as_of.isoformat() if balance.as_of else None,
+            **{
+                key: str(cost_rates[key]) if cost_rates.get(key) not in {None, ""} else None
+                for key in ("buy_commission_rate", "sell_commission_rate", "sell_tax_rate")
+            },
             "positions": [
                 {
                     "instrument": {
@@ -3812,6 +3899,12 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                     )
                 )
                 strategy_exposure += quantity * price
+        accounting_orders = (
+            journal().strategy_accounting_orders(
+                str(strategy_id), account_alias=str(trading_account),
+            )
+            if strategy_id and trading_account else orders
+        )
         schedules = await scheduler.snapshot()
         schedule = next(
             (item for item in schedules if item["strategy"] == name),
@@ -3890,13 +3983,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 "unresolved": len(unresolved),
             },
             "performance": _strategy_performance(
-                orders,
+                accounting_orders,
                 account,
                 instrument_names,
             ),
             "trade_history": _strategy_trade_history(
                 orders,
                 instrument_names=instrument_names,
+                accounting_orders=accounting_orders,
             ),
             "limits": {
                 "max_order_amount": _usage_value(
@@ -4131,6 +4225,7 @@ def _order_payload(order: Order) -> dict[str, object]:
             ),
             "route": order.request.route.value,
             "provider_options": order.request.provider_options,
+            "sell_position_scope": order.request.sell_position_scope,
         },
     }
 

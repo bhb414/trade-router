@@ -46,7 +46,7 @@ function harness() {
   };
   const context = vm.createContext({
     structuredClone,
-    document: { createElement: tag => new Element(tag) },
+    document: Object.assign(new Element("document"), { createElement: tag => new Element(tag) }),
     elements: { blockCanvas: new Element("div") },
     window: { innerHeight: 1000, innerWidth: 1600 },
     state: { selected: "test-strategy", blockPackage: { settings }, conditionGroupSerial: 0, connections: [] },
@@ -55,6 +55,7 @@ function harness() {
     setDirty: () => { changes += 1; },
     renderStrategyBlocks: () => { renders += 1; },
     flushBlockFieldEdits: () => true,
+    settleBlockFieldEditsForRerender: () => {},
     promoteLegacyBlockRuleTrees: () => { legacyPromotions += 1; assert.fail("Execution editing must not migrate buy/sell rules"); },
     notify: message => notices.push(message),
     packageFieldSourceName: key => key.toUpperCase(),
@@ -173,7 +174,7 @@ test("hover menu attaches cancel or amendment only to its selected condition and
   const beforeBuy = JSON.stringify(settings.buy_rule_tree), beforeSell = JSON.stringify(settings.sell_rule_tree);
   const flow = add(), node = flow.execution_rule_tree.children[0];
   const menu = menuFor(flow, node.id);
-  assert.deepEqual(menu.children.map(item => item.textContent), ["다음 조건식", "하위 계층 추가", "잔량 취소", "최유리지정가로 정정"]);
+  assert.deepEqual(menu.children.map(item => item.textContent), ["조건식", "하위 계층 추가", "잔량 취소 · 앞 조건 통과 시", "최유리지정가로 정정 · 앞 조건 통과 시"]);
   menu.children[3].click();
   assert.equal(node.action.kind, "execution");
   assert.equal(node.action.action_type, "AMEND_BEST_LIMIT");

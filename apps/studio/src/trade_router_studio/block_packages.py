@@ -622,14 +622,16 @@ class ConditionBollingerBlockSettings(BaseModel):
     sell_condition_logic: Literal["ALL", "ANY"] = "ANY"
     sell_conditions: list[BlockTradeCondition] = Field(
         default_factory=lambda: [item.model_copy() for item in DEFAULT_SELL_CONDITIONS],
-        min_length=1,
         max_length=20,
     )
     buy_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
     buy_rule_tree: BlockLogicNode | None = None
+    buy_enabled: bool = Field(default=True, strict=True)
     buy_flows: list[BlockBuyFlow] = Field(default_factory=list, max_length=8)
     sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
     sell_rule_tree: BlockLogicNode | None = None
+    sell_enabled: bool = Field(default=True, strict=True)
+    sell_position_scope: Literal["STRATEGY", "ACCOUNT"] = "STRATEGY"
     sell_flows: list[BlockSellFlow] = Field(default_factory=list, max_length=8)
     execution_flows: list[BlockExecutionFlow] = Field(default_factory=list, max_length=8)
     buy_order_type: Literal["MARKET", "LIMIT", "BEST_LIMIT"] = "MARKET"
@@ -744,11 +746,11 @@ class ConditionBollingerBlockSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_limits(self) -> "ConditionBollingerBlockSettings":
-        if self.buy_budget_per_symbol > self.total_operating_budget:
+        if self.buy_enabled and self.buy_budget_per_symbol > self.total_operating_budget:
             raise ValueError("Per-symbol budget cannot exceed total operating budget.")
-        if time.fromisoformat(self.buy_start_time) >= time.fromisoformat(self.buy_end_time):
+        if self.buy_enabled and time.fromisoformat(self.buy_start_time) >= time.fromisoformat(self.buy_end_time):
             raise ValueError("Buy start time must be earlier than buy end time.")
-        if time.fromisoformat(self.sell_start_time) >= time.fromisoformat(self.sell_end_time):
+        if self.sell_enabled and time.fromisoformat(self.sell_start_time) >= time.fromisoformat(self.sell_end_time):
             raise ValueError("Sell start time must be earlier than sell end time.")
         close_times = [
             time.fromisoformat(self.close_time),
@@ -759,7 +761,7 @@ class ConditionBollingerBlockSettings(BaseModel):
         if close_times != sorted(close_times):
             raise ValueError("Close, retry, and confirm times must be chronological.")
         self.symbols = list(dict.fromkeys(code.strip().upper() for code in self.symbols if code.strip()))
-        if not self.buy_flows and self.target_source == "SYMBOLS" and not self.symbols:
+        if self.buy_enabled and not self.buy_flows and self.target_source == "SYMBOLS" and not self.symbols:
             raise ValueError("At least one symbol is required for a symbol-list source.")
         position_only_metrics = {"average_price", "profit_rate"}
         flow_identifiers = [flow.id for flow in self.buy_flows]
@@ -771,10 +773,12 @@ class ConditionBollingerBlockSettings(BaseModel):
         execution_ids = [flow.id for flow in self.execution_flows]
         if len(execution_ids) != len(set(execution_ids)):
             raise ValueError("체결 흐름 ID는 서로 달라야 합니다.")
-        if not self.sell_flows and self.sell_rule_tree is None:
+        if self.sell_enabled and not self.sell_flows and self.sell_rule_tree is None:
             raise ValueError("매도 조건 계층이나 매도 흐름이 필요합니다.")
-        _validate_rule_tree(self.buy_rule_tree, side="BUY")
-        _validate_rule_tree(self.sell_rule_tree, side="SELL")
+        if self.buy_enabled:
+            _validate_rule_tree(self.buy_rule_tree, side="BUY")
+        if self.sell_enabled:
+            _validate_rule_tree(self.sell_rule_tree, side="SELL")
         all_buy_groups = [
             *(self.buy_condition_groups if self.buy_rule_tree is None else ()),
             *(
@@ -802,6 +806,12 @@ class ConditionBollingerBlockSettings(BaseModel):
             self.sell_rule_tree,
             *(flow.sell_rule_tree for flow in self.sell_flows),
         ) if tree is not None]
+        if not self.buy_enabled:
+            all_buy_groups = []
+            all_buy_trees = []
+        if not self.sell_enabled:
+            effective_sell_groups = []
+            effective_sell_trees = []
         for group in all_buy_groups:
             for condition in group.conditions:
                 if any(
@@ -1055,9 +1065,12 @@ SELL_CONDITION_LOGIC = __SELL_CONDITION_LOGIC__
 SELL_CONDITIONS_JSON = __SELL_CONDITIONS_JSON__
 BUY_CONDITION_GROUPS_JSON = __BUY_CONDITION_GROUPS_JSON__
 BUY_RULE_TREE_JSON = __BUY_RULE_TREE_JSON__
+BUY_ENABLED = __BUY_ENABLED__
 BUY_FLOWS_JSON = __BUY_FLOWS_JSON__
 SELL_CONDITION_GROUPS_JSON = __SELL_CONDITION_GROUPS_JSON__
 SELL_RULE_TREE_JSON = __SELL_RULE_TREE_JSON__
+SELL_ENABLED = __SELL_ENABLED__
+SELL_POSITION_SCOPE = __SELL_POSITION_SCOPE__
 SELL_FLOWS_JSON = __SELL_FLOWS_JSON__
 EXECUTION_FLOWS_JSON = __EXECUTION_FLOWS_JSON__
 BUY_ORDER_TYPE = __BUY_ORDER_TYPE__
@@ -1084,7 +1097,7 @@ SELL_CONDITION_GROUPS = tuple(json.loads(SELL_CONDITION_GROUPS_JSON))
 BUY_RULE_TREE = json.loads(BUY_RULE_TREE_JSON)
 SELL_RULE_TREE = json.loads(SELL_RULE_TREE_JSON)
 CONFIGURED_BUY_FLOWS = tuple(json.loads(BUY_FLOWS_JSON))
-RAW_BUY_FLOWS = CONFIGURED_BUY_FLOWS or ({
+RAW_BUY_FLOWS = () if not BUY_ENABLED else CONFIGURED_BUY_FLOWS or ({
     "id": "default", "name": "매수 흐름", "target_source": TARGET_SOURCE,
     "hts_user_id": HTS_USER_ID, "condition_id": CONDITION_ID,
     "expected_condition_name": EXPECTED_CONDITION_NAME,
@@ -1096,7 +1109,7 @@ RAW_BUY_FLOWS = CONFIGURED_BUY_FLOWS or ({
 },)
 CONFIGURED_SELL_FLOWS = tuple(json.loads(SELL_FLOWS_JSON))
 EXECUTION_FLOWS = tuple(json.loads(EXECUTION_FLOWS_JSON))
-RAW_SELL_FLOWS = CONFIGURED_SELL_FLOWS or ({
+RAW_SELL_FLOWS = () if not SELL_ENABLED else CONFIGURED_SELL_FLOWS or ({
     "id": "default", "name": "매도 흐름",
     "sell_scan_seconds": BUY_SCAN_SECONDS,
     "sell_start_time": SELL_START_TIME, "sell_end_time": SELL_END_TIME,
@@ -1443,6 +1456,8 @@ class ManagedBlockStrategy(Strategy):
         return effective
 
     async def _candidate_codes(self, ctx, flow=None):
+        if not BUY_FLOWS:
+            return []
         flow = flow or BUY_FLOWS[0]
         if flow["target_source"] == "HTS_CONDITION":
             rows = await ctx.discovery.matches(flow["hts_user_id"], flow["condition_id"])
@@ -1655,9 +1670,13 @@ class ManagedBlockStrategy(Strategy):
         if metric == "average_price":
             return average_price if average_price and average_price > 0 else None
         if metric == "profit_rate":
-            if not average_price or average_price <= 0 or current_price is None:
+            rates = getattr(self, "_profit_cost_rates", None)
+            if rates is None or not average_price or average_price <= 0 or current_price is None or current_price <= 0:
                 return None
-            return (current_price / average_price - Decimal("1")) * Decimal("100")
+            buy_fee, sell_fee, sell_tax = rates
+            purchase_cost = average_price * (Decimal("1") + buy_fee)
+            net_sale = current_price * (Decimal("1") - sell_fee - sell_tax)
+            return (net_sale / purchase_cost - Decimal("1")) * Decimal("100")
         index = len(bars) - 1 - offset
         if index < 0:
             return None
@@ -2055,6 +2074,14 @@ class ManagedBlockStrategy(Strategy):
             self._live_quote_subscriptions = {}
             self._live_positions = {}
             self._live_sell_pending = set()
+        if not hasattr(self, "_last_live_quote_at"):
+            self._last_live_quote_at = {}
+        if not hasattr(self, "_empty_live_reconcile_at"):
+            self._empty_live_reconcile_at = None
+        if not hasattr(self, "_account_sell_reconcile_at"):
+            self._account_sell_reconcile_at = None
+        if not hasattr(self, "_profit_costs_refreshed_at"):
+            self._profit_costs_refreshed_at = None
         if not hasattr(self, "_live_sell_recheck_at"):
             self._live_sell_recheck_at = {}
         if not hasattr(self, "_buy_submit_pending"):
@@ -2249,6 +2276,8 @@ class ManagedBlockStrategy(Strategy):
         return (configured,)
 
     async def _subscribe_live_quote(self, ctx, code):
+        if not SELL_FLOWS:
+            return
         self._ensure_live_state()
         active = self._live_quote_subscriptions.setdefault(code, {})
         for venue in self._live_quote_venues():
@@ -2274,6 +2303,7 @@ class ManagedBlockStrategy(Strategy):
 
     async def _unsubscribe_live_quote(self, ctx, code):
         self._ensure_live_state()
+        self._last_live_quote_at.pop(code, None)
         subscriptions = self._live_quote_subscriptions.pop(code, None)
         if not subscriptions:
             return
@@ -2284,14 +2314,56 @@ class ManagedBlockStrategy(Strategy):
                 except RouterError:
                     pass
 
+    def _update_profit_cost_rates(self, ctx, balance):
+        rates = []
+        for key in ("buy_commission_rate", "sell_commission_rate", "sell_tax_rate"):
+            raw = getattr(balance, key, None)
+            try:
+                rate = Decimal(str(raw)) if raw is not None else None
+            except (DecimalException, ValueError, TypeError):
+                rate = None
+            if rate is None or not rate.is_finite() or rate < 0 or rate >= 1:
+                rates = []
+                break
+            rates.append(rate)
+        if rates and rates[1] + rates[2] >= 1:
+            rates = []
+        self._profit_cost_rates = tuple(rates) if rates else None
+        self._profit_costs_refreshed_at = datetime.now(SEOUL)
+        uses_profit = any(
+            "profit_rate" in _condition_metric_names(condition)
+            for flow in SELL_FLOWS
+            for condition in _rule_conditions(flow["sell_rule_tree"])
+        )
+        if not uses_profit:
+            return
+        if not rates:
+            if not getattr(self, "_profit_cost_warning", False):
+                ctx.log.warning(
+                    "순수익률 조건 보류: 계좌의 매수·매도 수수료율과 매도 세율을 모두 설정해야 합니다. "
+                    "면제 비용은 0으로 설정하세요. 다른 매도 조건은 계속 판단합니다."
+                )
+            self._profit_cost_warning = True
+        elif getattr(self, "_profit_cost_warning", False):
+            ctx.log.info("계좌 비용 설정 확인 · 순수익률 조건 판단을 재개합니다.")
+            self._profit_cost_warning = False
+
     async def _refresh_live_positions(self, ctx, balance, open_orders):
         self._ensure_live_state()
+        self._update_profit_cost_rates(ctx, balance)
         positions = {item.instrument.code: item for item in balance.positions}
+        names = dict(ctx.state.get("instrument_names", {}))
+        names.update({
+            item.instrument.code: item.name
+            for item in balance.positions if getattr(item, "name", None)
+        })
+        ctx.state.set("instrument_names", names)
         tracked = self._sync_tracked_positions(ctx, balance)
         self._reconcile_buy_submit_pending(ctx, open_orders, positions)
+        sell_targets = self._sell_target_quantities(balance, tracked)
         desired = {
             code
-            for code in tracked
+            for code in sell_targets
             if code in positions and positions[code].quantity > 0
         }
         self._live_positions = {code: positions[code] for code in desired}
@@ -2302,6 +2374,32 @@ class ManagedBlockStrategy(Strategy):
             if code not in desired:
                 await self._unsubscribe_live_quote(ctx, code)
         return tracked, positions, {item.instrument.code for item in open_orders if item.remaining_quantity > 0}
+
+    @staticmethod
+    def _sell_target_quantities(balance, tracked):
+        # Selecting account holdings for exits must not adopt them into the
+        # strategy's buy ownership/budget tracker.
+        if SELL_POSITION_SCOPE == "ACCOUNT":
+            return {
+                position.instrument.code: position.quantity
+                for position in balance.positions if position.quantity > 0
+            }
+        return {code: Decimal(str(quantity)) for code, quantity in tracked.items()}
+
+    @staticmethod
+    def _sell_available_quantity(position, tracked):
+        if SELL_POSITION_SCOPE == "ACCOUNT":
+            owned = position.quantity
+        else:
+            owned = (
+                position.strategy_quantity if position.strategy_quantity is not None
+                else Decimal(str(tracked.get(position.instrument.code, "0")))
+            )
+        return max(Decimal("0"), min(owned, position.quantity, position.available_quantity))
+
+    @staticmethod
+    def _sell_scope_options():
+        return {"sell_position_scope": "ACCOUNT"} if SELL_POSITION_SCOPE == "ACCOUNT" else {}
 
     @staticmethod
     def _sell_flow_is_active(flow, at):
@@ -2417,8 +2515,18 @@ class ManagedBlockStrategy(Strategy):
             for item in sell_sources
             if self._source_uses_bars(item)
         )) or "봉 계산 없음"
-        ctx.log.info(f"매수 조건 계층: {buy_source_text} · 괄호 계층의 ALL/ANY 순서로 판단")
-        ctx.log.info(f"매도 조건 계층: {sell_source_text} · 괄호 계층의 ALL/ANY 순서로 판단")
+        if BUY_FLOWS:
+            ctx.log.info(f"매수 조건 계층: {buy_source_text} · 괄호 계층의 ALL/ANY 순서로 판단")
+        else:
+            ctx.log.info("매수 흐름 없음 · 자동 매수를 실행하지 않습니다.")
+        if SELL_FLOWS:
+            ctx.log.info(f"매도 조건 계층: {sell_source_text} · 괄호 계층의 ALL/ANY 순서로 판단")
+            scope_text = "계좌 전체 보유종목 (수동·다른 전략 보유분 포함)" if SELL_POSITION_SCOPE == "ACCOUNT" else "이 전략 보유종목"
+            ctx.log.info(f"매도 대상: {scope_text} · 매도 가능 수량 이내")
+            if any(source["metric"] == "profit_rate" for source in sell_sources):
+                ctx.log.info("수익률 조건: 계좌 평균 매수가에 매수수수료를 더한 원가 대비, 매도수수료·세금을 뺀 예상 순수익률")
+        else:
+            ctx.log.info("매도 흐름 없음 · 자동 매도를 실행하지 않습니다.")
         for schedule_id, flow in BUY_FLOW_SCHEDULES.items():
             ctx.scheduler.every(
                 seconds=flow["buy_scan_seconds"],
@@ -2480,12 +2588,23 @@ class ManagedBlockStrategy(Strategy):
                 f"{flow['sell_end_time']} 미만 / 조건 계층 · 보유종목·주문 공유"
             )
 
-        if any(
-            self._is_live_profit_condition(condition)
-            for flow in SELL_FLOWS
-            for condition in _rule_conditions(flow["sell_rule_tree"])
-        ):
-            ctx.log.info("익절·손절: 실시간 현재가 WebSocket 기준으로 감시합니다.")
+        live_profit_flows = tuple(
+            flow for flow in SELL_FLOWS
+            if any(self._is_live_profit_condition(condition)
+                   for condition in _rule_conditions(flow["sell_rule_tree"]))
+        )
+        if live_profit_flows:
+            # Completed-candle schedules remain unchanged. This independent
+            # watchdog only supplies a fresh quote to the existing profit exit
+            # path when the websocket has stopped delivering usable ticks.
+            ctx.scheduler.every(
+                seconds=5, schedule_id="live-profit-watchdog", aligned=True,
+                between=(
+                    min(flow["sell_start_time"] for flow in live_profit_flows),
+                    max(flow["sell_end_time"] for flow in live_profit_flows),
+                ),
+            )
+            ctx.log.info("익절·손절: 실시간 현재가 감시 · 10초간 시세 미수신 시 5초마다 현재가를 보완 조회합니다.")
             try:
                 balance = await ctx.account.balance()
                 open_orders = await ctx.account.open_orders()
@@ -2540,6 +2659,9 @@ class ManagedBlockStrategy(Strategy):
         return tracked
 
     async def on_timer(self, ctx, event):
+        if event.schedule_id == "live-profit-watchdog":
+            await self._check_live_profit_fallback(ctx)
+            return
         execution_flow_id = getattr(self, "_execution_flow_schedules", {}).get(event.schedule_id)
         if execution_flow_id is not None:
             await self._execution_rule_manager.tick(ctx, execution_flow_id)
@@ -2557,6 +2679,8 @@ class ManagedBlockStrategy(Strategy):
             await self._scan_buy_flow(ctx, event, flow)
 
     async def _scan_buy_flow(self, ctx, event, flow):
+        if not BUY_FLOWS:
+            return
         def active():
             now = datetime.now(SEOUL)
             # The branch action selects an order type after its conditions
@@ -2769,6 +2893,8 @@ class ManagedBlockStrategy(Strategy):
                 break
 
     async def on_bar(self, ctx, event):
+        if not SELL_FLOWS:
+            return
         flow = getattr(self, "_sell_flow_schedules", {}).get(
             getattr(event, "schedule_id", "")
         ) or SELL_FLOWS[0]
@@ -2778,6 +2904,8 @@ class ManagedBlockStrategy(Strategy):
             await self._on_bar_locked(ctx, event, flow)
 
     async def _on_bar_locked(self, ctx, event, flow):
+        if not SELL_FLOWS:
+            return
         if not self._sell_flow_event_is_active(
             flow, event.scheduled_at, datetime.now(SEOUL)
         ):
@@ -2789,13 +2917,14 @@ class ManagedBlockStrategy(Strategy):
             ctx.log.warning(f"매도 판단 보류 [{exc.code.value}]: {exc.message} · 다음 완성 봉에서 재시도합니다.")
             return
         tracked, positions, pending_codes = await self._refresh_live_positions(ctx, balance, open_orders)
-        for code in list(tracked):
+        sell_targets = self._sell_target_quantities(balance, tracked)
+        for code in sell_targets:
             position = positions.get(code)
             if position is None or position.quantity <= 0:
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
                 continue
-            if position.strategy_quantity is not None and position.strategy_quantity <= 0:
+            if SELL_POSITION_SCOPE == "STRATEGY" and position.strategy_quantity is not None and position.strategy_quantity <= 0:
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
                 continue
@@ -2818,8 +2947,7 @@ class ManagedBlockStrategy(Strategy):
             sell_reason = " 그리고 ".join(
                 self._condition_summary(item) for item in matched_conditions
             ) or "시간·보유 조건"
-            tracked_quantity = position.strategy_quantity if position.strategy_quantity is not None else Decimal(str(tracked[code]))
-            quantity = min(tracked_quantity, position.available_quantity)
+            quantity = self._sell_available_quantity(position, tracked)
             if quantity <= 0:
                 continue
             limit_price = None
@@ -2872,14 +3000,17 @@ class ManagedBlockStrategy(Strategy):
                     order = await ctx.orders.limit_sell(
                         code=code, quantity=quantity, price=limit_price, route=order_route,
                         client_order_id=order_id,
+                        **self._sell_scope_options(),
                     )
                 elif order_type == "BEST_LIMIT":
                     order = await ctx.orders.best_limit_sell(
                         code=code, quantity=quantity, route=order_route, client_order_id=order_id,
+                        **self._sell_scope_options(),
                     )
                 else:
                     order = await ctx.orders.market_sell(
                         code=code, quantity=quantity, route=order_route, client_order_id=order_id,
+                        **self._sell_scope_options(),
                     )
             except RouterError as exc:
                 failure_at = datetime.now(SEOUL)
@@ -2924,16 +3055,126 @@ class ManagedBlockStrategy(Strategy):
                 tracked.pop(code, None)
                 ctx.state.set("strategy_positions", tracked)
 
+    @staticmethod
+    def _live_quote_is_usable(quote, *, websocket=False):
+        if quote.delayed or quote.stale or not quote.price.is_finite() or quote.price <= 0:
+            return False
+        # Reject buffered ticks after a slow condition lookup. A REST quote may
+        # legitimately have an older last-trade time for an illiquid stock, so
+        # freshness here refers to when the provider response was received.
+        try:
+            age = (datetime.now(SEOUL) - quote.received_at).total_seconds()
+        except (AttributeError, TypeError):
+            return False
+        if age < -1 or age > 10:
+            return False
+        # A newly received websocket packet can still replay an old trade.
+        # REST last-trade timestamps, in contrast, can be old on a quiet stock.
+        market_time = getattr(quote, "market_time", None)
+        if websocket and market_time is not None:
+            try:
+                market_age = (datetime.now(SEOUL) - market_time).total_seconds()
+            except TypeError:
+                return False
+            if market_age < -1 or market_age > 10:
+                return False
+        source_alias = getattr(quote, "source_alias", None)
+        if source_alias is not None and source_alias not in {"primary", CONDITION_SOURCE}:
+            return False
+        venue = getattr(quote, "venue", None)
+        venue = getattr(venue, "value", venue)
+        allowed_venues = {MARKET_VENUE}
+        if MARKET_VENUE == "INTEGRATED":
+            allowed_venues.update(("KRX", "NXT"))
+        return venue is None or venue in allowed_venues
+
+    async def _check_live_profit_fallback(self, ctx):
+        self._ensure_live_state()
+        now = datetime.now(SEOUL)
+        if not any(
+            self._is_live_profit_condition(condition)
+            for flow in self._active_sell_flows(now)
+            for condition in _rule_conditions(flow["sell_rule_tree"])
+        ):
+            return
+        if not hasattr(self, "_sell_flow_lock"):
+            self._sell_flow_lock = asyncio.Lock()
+        async with self._sell_flow_lock:
+            def needs_quote(code):
+                last_tick = self._last_live_quote_at.get(code)
+                age = (datetime.now(SEOUL) - last_tick).total_seconds() if last_tick else None
+                return age is None or age < 0 or age >= 10
+
+            # Failed startup subscriptions can leave the local position cache
+            # empty. Refresh the selected sell targets while keeping the buy
+            # ownership tracker limited to this strategy's holdings.
+            tracked = ctx.state.get("strategy_positions", {})
+            known_codes = set(tracked) | set(self._live_positions)
+            account_refresh_due = SELL_POSITION_SCOPE == "ACCOUNT" and (
+                self._account_sell_reconcile_at is None or now >= self._account_sell_reconcile_at
+            )
+            cost_refresh_due = self._profit_costs_refreshed_at is None or not (
+                0 <= (now - self._profit_costs_refreshed_at).total_seconds() < 30
+            )
+            if known_codes:
+                if not account_refresh_due and not cost_refresh_due and not any(needs_quote(code) for code in known_codes):
+                    return
+            else:
+                # Startup balance failures can leave both local caches empty,
+                # while the central ledger still owns shares. Recover them at
+                # a bounded rate; do not poll an empty account every five seconds.
+                now = datetime.now(SEOUL)
+                if not account_refresh_due and self._empty_live_reconcile_at is not None and now < self._empty_live_reconcile_at:
+                    return
+                self._empty_live_reconcile_at = now + timedelta(seconds=30)
+            if SELL_POSITION_SCOPE == "ACCOUNT":
+                self._account_sell_reconcile_at = datetime.now(SEOUL) + timedelta(seconds=30)
+            try:
+                balance = await ctx.account.balance()
+                open_orders = await ctx.account.open_orders()
+                await self._refresh_live_positions(ctx, balance, open_orders)
+            except RouterError as exc:
+                ctx.log.warning(
+                    f"실시간 익절·손절 보완 조회 보류 [{exc.code.value}]: {exc.message}"
+                )
+                return
+            for code in tuple(self._live_positions):
+                if not needs_quote(code):
+                    continue
+                try:
+                    quote = await ctx.market.quote(code, venue=Venue(MARKET_VENUE))
+                except RouterError as exc:
+                    ctx.log.warning(
+                        f"{self._instrument_label(ctx, code)} 실시간 익절·손절 보완 시세 조회 실패 "
+                        f"[{exc.code.value}]: {exc.message}"
+                    )
+                    continue
+                if quote.instrument.code != code:
+                    continue
+                # Do not count a REST response as a healthy websocket tick.
+                # The shared exit path retains all condition/action, ownership,
+                # pending-order and trading-session guards.
+                await self._on_quote_locked(ctx, quote)
+
     async def on_quote(self, ctx, quote):
+        if not SELL_FLOWS:
+            return
         self._ensure_live_state()
         if not hasattr(self, "_sell_flow_lock"):
             self._sell_flow_lock = asyncio.Lock()
         async with self._sell_flow_lock:
-            await self._on_quote_locked(ctx, quote)
+            if not self._live_quote_is_usable(quote, websocket=True):
+                return
+            if quote.instrument.code in self._live_positions:
+                market_time = getattr(quote, "market_time", None) or quote.received_at
+                self._last_live_quote_at[quote.instrument.code] = min(quote.received_at, market_time)
+            await self._on_quote_locked(ctx, quote, websocket=True)
 
-    async def _on_quote_locked(self, ctx, quote):
+    async def _on_quote_locked(self, ctx, quote, *, websocket=False):
+        if not SELL_FLOWS:
+            return
         self._ensure_live_state()
-        if quote.delayed or quote.stale:
+        if not self._live_quote_is_usable(quote, websocket=websocket):
             return
         active_flows = self._active_sell_flows(quote.received_at)
         if not active_flows:
@@ -2969,7 +3210,7 @@ class ManagedBlockStrategy(Strategy):
             position is None
             or code in pending_codes
             or code in self._live_sell_pending
-            or code not in tracked
+            or code not in self._live_positions
         ):
             return
         matched_flow = None
@@ -2995,12 +3236,7 @@ class ManagedBlockStrategy(Strategy):
         if matched_flow is None:
             return
         order_type = matched_action["order_type"]
-        tracked_quantity = (
-            position.strategy_quantity
-            if position.strategy_quantity is not None
-            else Decimal(str(tracked[code]))
-        )
-        quantity = min(tracked_quantity, position.available_quantity)
+        quantity = self._sell_available_quantity(position, tracked)
         if quantity <= 0:
             return
         order_at = datetime.now(SEOUL)
@@ -3044,22 +3280,29 @@ class ManagedBlockStrategy(Strategy):
                         f"{blocked_reason}"
                     )
                 return
+            # Account reconciliation, mixed candle conditions or route lookup
+            # may have taken time after this tick was received.
+            if not self._live_quote_is_usable(quote, websocket=websocket):
+                return
             self._mark_live_sell_pending(code)
             order_id = f"live-exit-{code}-{order_at:%Y%m%d%H%M%S%f}-sell"
             if order_type == "LIMIT":
                 order = await ctx.orders.limit_sell(
                     code=code, quantity=quantity, price=limit_price,
                     route=order_route, client_order_id=order_id,
+                    **self._sell_scope_options(),
                 )
             elif order_type == "BEST_LIMIT":
                 order = await ctx.orders.best_limit_sell(
                     code=code, quantity=quantity, route=order_route,
                     client_order_id=order_id,
+                    **self._sell_scope_options(),
                 )
             else:
                 order = await ctx.orders.market_sell(
                     code=code, quantity=quantity, route=order_route,
                     client_order_id=order_id,
+                    **self._sell_scope_options(),
                 )
         except RouterError as exc:
             self._clear_live_sell_pending(code)
@@ -3189,9 +3432,12 @@ def _render_condition_bollinger(
         "__SELL_CONDITIONS_JSON__": _json_literal(settings.sell_conditions),
         "__BUY_CONDITION_GROUPS_JSON__": _json_literal(settings.buy_condition_groups),
         "__BUY_RULE_TREE_JSON__": _json_literal(settings.buy_rule_tree),
+        "__BUY_ENABLED__": str(settings.buy_enabled),
         "__BUY_FLOWS_JSON__": _json_literal(settings.buy_flows),
         "__SELL_CONDITION_GROUPS_JSON__": _json_literal(settings.sell_condition_groups),
         "__SELL_RULE_TREE_JSON__": _json_literal(settings.sell_rule_tree),
+        "__SELL_ENABLED__": str(settings.sell_enabled),
+        "__SELL_POSITION_SCOPE__": _literal(settings.sell_position_scope),
         "__SELL_FLOWS_JSON__": _json_literal(settings.sell_flows),
         "__EXECUTION_FLOWS_JSON__": _json_literal(settings.execution_flows),
         "__BUY_ORDER_TYPE__": _literal(settings.buy_order_type),
@@ -3271,7 +3517,7 @@ def _constants_from_source(source: str) -> tuple[ast.Module, dict[str, object]]:
         if not isinstance(target, ast.Name):
             continue
         value = _literal_value(node.value, constants)
-        if value is not None or target.id == "EXECUTION_FLOWS_JSON":
+        if value is not None or target.id in {"EXECUTION_FLOWS_JSON", "BUY_ENABLED", "SELL_ENABLED", "SELL_POSITION_SCOPE"}:
             constants[target.id] = value
     return tree, constants
 
@@ -3300,6 +3546,11 @@ def _condition_package(name: str, constants: dict[str, object]) -> BlockStrategy
         "close_confirm_time": "CLOSE_CONFIRM_TIME", "route": "ORDER_ROUTE",
     }
     required = {field: constants.get(source_name) for field, source_name in mapping.items()}
+    # Empty flow lists meant the legacy single flow in older exports. Preserve
+    # that behavior unless the user explicitly removed this side's last flow.
+    for side in ("buy", "sell"):
+        required[f"{side}_enabled"] = constants.get(f"{side.upper()}_ENABLED", True)
+    required["sell_position_scope"] = constants.get("SELL_POSITION_SCOPE", "STRATEGY")
     # v0.1.13 packages always enabled the three built-in exit conditions.
     for field in ("use_bollinger_exit", "use_take_profit", "use_stop_loss"):
         if required[field] is None:

@@ -14,12 +14,12 @@ const functionSource = name => {
   const end = source.indexOf("\nfunction ", start + 1);
   return source.slice(start, end < 0 ? undefined : end);
 };
-const context = vm.createContext({ structuredClone });
+const context = vm.createContext({ structuredClone, settleBlockFieldEditsForRerender: () => {} });
 [
   "walkBlockRule", "blockRuleContainsAction", "rewriteBlockRuleConnection",
   "blockRuleTreeEditError", "retainBlockRuleConditionReferences",
   "setBlockRuleConnection", "ensureBlockRuleTree",
-  "findBlockRuleNode", "removeBlockRuleNode", "blockRuleConditionNodes",
+  "findBlockRuleNode", "removeBlockRuleNode", "removeBlockRuleAction", "blockRuleConditionNodes",
   "blockRuleNodePath", "rewriteBlockRuleMove", "moveBlockRuleNode", "composerRuleDropPlan",
 ].forEach(name => vm.runInContext(functionSource(name), context));
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -169,6 +169,76 @@ test("deleting a condition prunes all now-empty parentheses without changing sur
   assert.deepEqual(structure(original), ["ANY", "B"]);
   assert.equal(original.children[0], surviving);
   assert.equal(original.children[0].action.id, "surviving-action");
+});
+
+test("deleting a selected condition or its removed ancestor/action closes the panel instead of selecting a parent", () => {
+  for (const kind of ["buy", "sell", "execution"]) {
+    for (const selectedSuffix of ["rule-A", "rule-inner", "rule-outer", "action-owned"]) {
+      const root = logic("ANY", [
+        logic("ALL", [logic("ALL", [condition("A", action("owned"))], null, "inner")], null, "outer"),
+        condition("B"),
+      ]);
+      context.state = { blockSelectedNode: `${kind}-${selectedSuffix}`, blockPackage: { settings: { [`${kind}_rule_tree`]: root } } };
+      context.selectedState = () => ({ running: false });
+      context.blockRuleTree = () => root;
+      context.blockFlowNodePrefix = () => kind;
+      context.commitBlockRuleMutation = () => {};
+      context.notify = message => assert.fail(message);
+      context.removeBlockRuleNode(kind, null, "A");
+      assert.equal(context.state.blockSelectedNode, false, `${kind} ${selectedSuffix}`);
+      assert.deepEqual(structure(root), ["ANY", "B"]);
+    }
+  }
+});
+
+test("deleting an unselected condition preserves a surviving condition, group or unrelated flow panel", () => {
+  for (const selected of ["sell-rule-B", "sell-rule-root", "buy-flow-other-schedule"]) {
+    const root = logic("ANY", [condition("A"), condition("B")]);
+    context.state = { blockSelectedNode: selected, blockPackage: { settings: { sell_rule_tree: root } } };
+    context.selectedState = () => ({ running: false });
+    context.blockRuleTree = () => root;
+    context.blockFlowNodePrefix = () => "sell";
+    context.commitBlockRuleMutation = () => {};
+    context.notify = message => assert.fail(message);
+    context.removeBlockRuleNode("sell", null, "A");
+    assert.equal(context.state.blockSelectedNode, selected);
+  }
+});
+
+test("removing a selected action closes only its action panel and leaves the owning condition intact", () => {
+  for (const kind of ["buy", "sell", "execution"]) {
+    for (const selected of [`${kind}-action-order`, `${kind}-rule-A`, "connection"]) {
+      const owner = condition("A", action("order"));
+      const root = logic("ANY", [owner]);
+      context.state = { blockSelectedNode: selected, blockPackage: { settings: { [`${kind}_rule_tree`]: root } } };
+      context.selectedState = () => ({ running: false });
+      context.blockRuleTree = () => root;
+      context.blockFlowNodePrefix = () => kind;
+      context.commitBlockRuleMutation = () => {};
+      context.removeBlockRuleAction(kind, null, "A");
+      assert.equal(owner.action, null);
+      assert.equal(root.children[0], owner);
+      assert.equal(context.state.blockSelectedNode, selected === `${kind}-action-order` ? false : selected);
+    }
+  }
+});
+
+test("a rejected final-condition deletion preserves selection and data", () => {
+  for (const kind of ["sell", "execution"]) {
+    const root = logic("ANY", [condition("A", action("order"))]);
+    const snapshot = JSON.stringify(root);
+    context.state = { blockSelectedNode: `${kind}-rule-A`, blockPackage: { settings: { [`${kind}_rule_tree`]: root } } };
+    context.selectedState = () => ({ running: false });
+    context.blockRuleTree = () => root;
+    context.blockFlowNodePrefix = () => kind;
+    context.commitBlockRuleMutation = () => assert.fail("Rejected deletion must not commit");
+    const notices = [];
+    context.notify = message => notices.push(message);
+    context.removeBlockRuleNode(kind, null, "A");
+    assert.equal(context.state.blockSelectedNode, `${kind}-rule-A`);
+    assert.equal(JSON.stringify(root), snapshot);
+    assert.equal(notices.length, 1);
+  }
 });
 
 test("moving sibling conditions uses the target position after removal and recognizes no-ops", () => {

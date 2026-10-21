@@ -1402,6 +1402,7 @@ def _request_payload(
         "price": str(request.price) if request.price is not None else None,
         "route": request.route.value,
         "provider_options": request.provider_options,
+        "sell_position_scope": request.sell_position_scope,
         "reserved_amount": str(reserved_amount),
     }
 
@@ -1409,7 +1410,8 @@ def _request_payload(
 def _same_request(stored: dict[str, object], request: OrderRequest) -> bool:
     comparison = _request_payload(request, reserved_amount=Decimal("0"))
     comparison.pop("reserved_amount")
-    return all(stored.get(key) == value for key, value in comparison.items())
+    normalized = {"sell_position_scope": "STRATEGY", **stored}
+    return all(normalized.get(key) == value for key, value in comparison.items())
 
 
 def _effective_request_payload(row: dict[str, object]) -> dict[str, object]:
@@ -1526,6 +1528,7 @@ def _order_from_row(row: dict[str, object]) -> Order:
         route=OrderRoute(str(payload.get("route", "AUTO"))),
         price=(Decimal(str(payload["price"])) if payload.get("price") is not None else None),
         provider_options=dict(payload.get("provider_options") or {}),
+        sell_position_scope=str(payload.get("sell_position_scope") or "STRATEGY"),
     )
     return Order(
         id=str(row["id"]),
@@ -1583,6 +1586,7 @@ def _order_event_payload(row: dict[str, Any]) -> dict[str, Any]:
             "price": str(order.request.price) if order.request.price is not None else None,
             "route": order.request.route.value,
             "provider_options": order.request.provider_options,
+            "sell_position_scope": order.request.sell_position_scope,
         },
     }
 

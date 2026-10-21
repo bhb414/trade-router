@@ -930,6 +930,10 @@ class AccountClient:
                 if payload.get("as_of")
                 else None
             ),
+            **{
+                key: Decimal(str(payload[key])) if payload.get(key) is not None else None
+                for key in ("buy_commission_rate", "sell_commission_rate", "sell_tax_rate")
+            },
         )
 
     async def positions(self) -> tuple[Position, ...]:
@@ -1046,6 +1050,7 @@ class OrderClient:
         client_order_id: str,
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
+        sell_position_scope: str = "STRATEGY",
     ) -> Order:
         return await self._submit(
             code,
@@ -1055,6 +1060,7 @@ class OrderClient:
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,
+            sell_position_scope=sell_position_scope,
         )
 
     async def best_limit_buy(
@@ -1085,6 +1091,7 @@ class OrderClient:
         client_order_id: str,
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
+        sell_position_scope: str = "STRATEGY",
     ) -> Order:
         """Sell at the best bid on receipt; any remainder rests at that price."""
         return await self._submit(
@@ -1095,6 +1102,7 @@ class OrderClient:
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,
+            sell_position_scope=sell_position_scope,
         )
 
     async def limit_buy(
@@ -1127,6 +1135,7 @@ class OrderClient:
         client_order_id: str,
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
+        sell_position_scope: str = "STRATEGY",
     ) -> Order:
         return await self._submit(
             code,
@@ -1137,6 +1146,7 @@ class OrderClient:
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,
+            sell_position_scope=sell_position_scope,
         )
 
     async def _submit(
@@ -1150,7 +1160,12 @@ class OrderClient:
         route: OrderRoute | str,
         price: Decimal | None = None,
         provider_options: dict[str, Any] | None = None,
+        sell_position_scope: str = "STRATEGY",
     ) -> Order:
+        if sell_position_scope not in {"STRATEGY", "ACCOUNT"}:
+            raise ValueError("Sell position scope must be STRATEGY or ACCOUNT.")
+        if side is not OrderSide.SELL and sell_position_scope != "STRATEGY":
+            raise ValueError("Account position scope is only valid for sell orders.")
         payload = await self._router._post(
             "/api/v1/orders",
             {
@@ -1162,6 +1177,7 @@ class OrderClient:
                 "client_order_id": client_order_id,
                 "route": OrderRoute(route).value,
                 "provider_options": provider_options or {},
+                **({"sell_position_scope": sell_position_scope} if sell_position_scope == "ACCOUNT" else {}),
             },
         )
         return _order_from_payload(payload)
@@ -1362,6 +1378,7 @@ def _order_from_payload(payload: dict[str, Any]) -> Order:
                 else None
             ),
             provider_options=dict(request_payload.get("provider_options") or {}),
+            sell_position_scope=str(request_payload.get("sell_position_scope") or "STRATEGY"),
         ),
         status=OrderStatus(payload["status"]),
         submitted_at=datetime.fromisoformat(payload["submitted_at"]),

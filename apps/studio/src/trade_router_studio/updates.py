@@ -142,13 +142,15 @@ def _release_details(
             "latest": None,
             "available": False,
             "can_apply": False,
-            "message": "아직 등록된 GitHub 배포가 없습니다.",
+            "message": f"설치 버전 v{current_version} · 아직 등록된 GitHub 배포가 없습니다.",
         }
 
-    latest = str(payload.get("tag_name", "")).lstrip("v")
-    available = bool(
-        latest and _version_tuple(latest) > _version_tuple(current_version)
-    )
+    tag = str(payload.get("tag_name", "")).strip()
+    if not re.fullmatch(r"v?\d+\.\d+\.\d+", tag):
+        raise RuntimeError("GitHub 최신 배포의 버전을 확인하지 못했습니다.")
+    latest = tag.removeprefix("v")
+    available = _version_tuple(latest) > _version_tuple(current_version)
+    versions = f"설치 v{current_version} · GitHub 공개 최신 v{latest}"
     assets = payload.get("assets")
     asset_rows = assets if isinstance(assets, list) else []
     archive_name = f"trade-router-v{latest}-windows.zip"
@@ -171,11 +173,13 @@ def _release_details(
     )
     can_apply = bool(available and archive and checksum)
     if can_apply:
-        message = f"새 버전 {latest}을 적용할 수 있습니다."
+        message = f"{versions} — 업데이트를 적용할 수 있습니다."
     elif available:
-        message = f"새 버전 {latest}이 있지만 Windows 업데이트 파일이 아직 없습니다."
+        message = f"{versions} — Windows 업데이트 파일이 아직 없습니다."
+    elif _version_tuple(current_version) > _version_tuple(latest):
+        message = f"{versions} — 설치 버전이 공개된 버전보다 앞서 있습니다."
     else:
-        message = "현재 버전이 최신입니다."
+        message = f"{versions} — 공개된 최신 버전입니다."
     return {
         "current": current_version,
         "latest": latest or None,

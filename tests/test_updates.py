@@ -11,6 +11,8 @@ import sys
 from urllib.error import HTTPError
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
+
 import trade_router_studio.updates as updates
 
 
@@ -104,6 +106,55 @@ def test_release_without_both_verified_assets_cannot_apply() -> None:
     )
     assert details["available"] is True
     assert details["can_apply"] is False
+    assert "설치 v0.1.0" in details["message"]
+    assert "GitHub 공개 최신 v0.2.0" in details["message"]
+    assert "Windows 업데이트 파일이 아직 없습니다" in details["message"]
+
+
+def test_update_status_identifies_matching_public_version() -> None:
+    details = updates._release_details({"tag_name": "v0.1.62"}, "0.1.62")
+
+    assert details["available"] is False
+    assert details["can_apply"] is False
+    assert "설치 v0.1.62" in details["message"]
+    assert "GitHub 공개 최신 v0.1.62" in details["message"]
+    assert "공개된 최신 버전입니다" in details["message"]
+
+
+def test_local_version_ahead_of_public_release_is_not_reported_as_public_latest() -> None:
+    details = updates._release_details({"tag_name": "v0.1.62"}, "0.1.66")
+
+    assert details["current"] == "0.1.66"
+    assert details["latest"] == "0.1.62"
+    assert details["available"] is False
+    assert details["can_apply"] is False
+    assert "설치 v0.1.66" in details["message"]
+    assert "GitHub 공개 최신 v0.1.62" in details["message"]
+    assert "설치 버전이 공개된 버전보다 앞서 있습니다" in details["message"]
+    assert "최신입니다" not in details["message"]
+
+
+def test_release_with_both_assets_reports_available_public_update() -> None:
+    archive = "trade-router-v0.1.67-windows.zip"
+    details = updates._release_details(
+        {
+            "tag_name": "v0.1.67",
+            "assets": [{"name": archive}, {"name": f"{archive}.sha256"}],
+        },
+        "0.1.62",
+    )
+
+    assert details["available"] is True
+    assert details["can_apply"] is True
+    assert "설치 v0.1.62" in details["message"]
+    assert "GitHub 공개 최신 v0.1.67" in details["message"]
+    assert "업데이트를 적용할 수 있습니다" in details["message"]
+
+
+@pytest.mark.parametrize("tag", [None, "", "unknown", "v0.1", "v0.1.67-broken"])
+def test_unreadable_release_version_never_claims_the_install_is_latest(tag) -> None:
+    with pytest.raises(RuntimeError, match="최신 배포의 버전을 확인하지 못했습니다"):
+        updates._release_details({"tag_name": tag}, "0.1.62")
 
 
 def test_latest_release_falls_back_when_github_api_rate_limit_is_exhausted(

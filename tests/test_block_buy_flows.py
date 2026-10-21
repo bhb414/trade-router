@@ -214,7 +214,8 @@ class Harness:
         return [SimpleNamespace(instrument=SimpleNamespace(code="035420"), name="순위 종목")]
 
     async def balance(self):
-        return SimpleNamespace(positions=list(self.positions.values()))
+        return SimpleNamespace(positions=list(self.positions.values()), buy_commission_rate=Decimal("0"),
+                               sell_commission_rate=Decimal("0"), sell_tax_rate=Decimal("0"))
 
     async def open_orders(self):
         return list(self.pending_orders)

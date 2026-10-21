@@ -166,6 +166,7 @@ def test_managed_block_compiles_generic_comparisons() -> None:
     profit_condition = BlockTradeCondition(
         left="profit_rate", operator="GTE", right="value", value=Decimal("3")
     ).model_dump(mode="json")
+    strategy._profit_cost_rates = (Decimal("0"),) * 3  # Explicit fee-free account.
     assert strategy._condition_matches(
         profit_condition, bars_by_request, Decimal("150"), current_price=Decimal("160"),
     )
@@ -1333,6 +1334,7 @@ def test_managed_block_treats_profit_rate_as_live_account_data() -> None:
     assert "bars" not in strategy.config.required_capabilities["primary"]
     condition = settings.sell_condition_groups[0].conditions[0].model_dump(mode="json")
     assert strategy._condition_requests(condition) == {}
+    strategy._profit_cost_rates = (Decimal("0"),) * 3  # Explicit fee-free account.
     assert strategy._condition_matches(
         condition, {}, Decimal("100"), current_price=Decimal("103"),
     )
@@ -1374,6 +1376,7 @@ def test_live_profit_exit_still_honors_other_and_condition_groups() -> None:
         market=market,
         log=SimpleNamespace(warning=lambda message: None),
     )
+    strategy._profit_cost_rates = (Decimal("0"),) * 3  # Explicit fee-free account.
 
     async def evaluate():
         return await strategy._condition_groups_result(
@@ -1535,7 +1538,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
             assert tree_marker in static_script.text
         assert 'event.target.closest(".composer-inspector")' in static_script.text
         assert "function bindBlockCanvasPan(world)" in static_script.text
-        assert 'event.target.closest(".composer-tree-row, .composer-tree-add-row' in static_script.text
+        assert 'event.target.closest(".composer-tree-row, .composer-tree-flow, .composer-tree-add-row' in static_script.text
         assert "function applyBlockViewport(world)" in static_script.text
         assert "function setBlockZoom(nextZoom)" in static_script.text
         assert "function fitBlockGraph()" in static_script.text
@@ -1572,7 +1575,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         assert 'condition[`right_${suffix}`] = normalized' in static_script.text
         assert "왼쪽 값 설정" in static_script.text
         assert "오른쪽 값 설정" in static_script.text
-        assert "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다." in static_script.text
+        assert "실시간 순수익률(비용 포함 %)" in static_script.text
         assert "선택한 봉의 종가와 평균 매수가로 계산" not in static_script.text
         page = client.get("/")
         static_styles = client.get("/static/styles.css")
@@ -1901,7 +1904,8 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
         average_price=Decimal("7590"),
         strategy_quantity=Decimal("5"),
     )
-    balance = SimpleNamespace(positions=(position,))
+    balance = SimpleNamespace(positions=(position,), buy_commission_rate=Decimal("0"),
+                              sell_commission_rate=Decimal("0"), sell_tax_rate=Decimal("0"))
 
     class Account:
         async def balance(self):

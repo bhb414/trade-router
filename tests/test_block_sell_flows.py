@@ -163,7 +163,8 @@ class SellHarness:
         if self.advance_on_balance_to is not None:
             self.now = self.advance_on_balance_to
             self.advance_on_balance_to = None
-        return SimpleNamespace(positions=(self.position,))
+        return SimpleNamespace(positions=(self.position,), buy_commission_rate=Decimal("0"),
+                               sell_commission_rate=Decimal("0"), sell_tax_rate=Decimal("0"))
 
     async def open_orders(self):
         return ()

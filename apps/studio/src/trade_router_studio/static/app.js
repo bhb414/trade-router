@@ -1574,6 +1574,7 @@ function blockPackageFields() {
     "buy_rule_tree", "sell_rule_tree",
     "buy_condition_logic", "sell_condition_logic", "bar_interval", "bar_data_mode",
     "bollinger_period", "bollinger_stddev", "buy_flows", "sell_flows", "execution_flows",
+    "buy_enabled", "sell_enabled", "sell_position_scope",
   ]);
   const legacy = new Set([
     "use_bollinger_exit", "use_take_profit", "use_stop_loss",
@@ -1604,10 +1605,35 @@ function currentBlockModel() {
     template: state.blockPackage.template,
     fields: [
       ...blockPackageFields(),
+      ...(state.blockPackage.template === "condition-bollinger-v1" ? [blockSellPositionScopeField()] : []),
       ...blockBuyFlows().flatMap(blockBuyFlowFields),
       ...blockSellFlows().flatMap(blockSellFlowFields),
       ...blockExecutionFlows().flatMap(blockExecutionFlowFields),
     ],
+  };
+}
+
+function blockSellPositionScopeField() {
+  return {
+    id: "setting:sell_position_scope", settingKey: "sell_position_scope",
+    sourceName: "SELL_POSITION_SCOPE", label: "매도 대상", category: "target", type: "string",
+    value: state.blockPackage?.settings?.sell_position_scope || "STRATEGY",
+  };
+}
+
+function blockSellPositionScopeDefinition(settings) {
+  const accountScope = settings.sell_position_scope === "ACCOUNT";
+  return {
+    id: "sellTargets", title: "매도 대상", meta: "모든 매도 흐름 공통",
+    tone: "target", logic: "대상", logicTone: "universe", width: 460,
+    fields: [blockSellPositionScopeField()],
+    summary: [accountScope ? "계좌 전체 보유종목" : "이 전략 보유종목"],
+    description: accountScope
+      ? "선택한 거래 계좌의 전체 보유종목에 매도 조건을 적용합니다. 수동 매수와 다른 전략의 보유종목도 포함됩니다. 계좌 평균 매입가와 설정한 수수료·세금을 반영한 추정 순수익률로 판단하고, 매도 가능한 수량을 사용합니다. 비용 요율이 미설정이면 순수익률 조건의 판단을 보류합니다."
+      : "이 전략에 귀속된 보유종목에만 매도 조건을 적용합니다. 계좌 평균 매입가와 설정한 수수료·세금을 반영한 추정 순수익률로 판단하며, 매도 수량은 이 전략 보유분으로 제한합니다. 비용 요율이 미설정이면 순수익률 조건의 판단을 보류합니다.",
+    actions: accountScope
+      ? ["수동 매수 · 다른 전략 보유 포함", "계좌 평균 매입가", "매도 가능 수량", "수수료·세금 포함"]
+      : ["이 전략 보유 수량", "계좌 평균 매입가", "수수료·세금 포함"],
   };
 }
 
@@ -1715,6 +1741,7 @@ function removeBlockExecutionFlow(flowId) {
   const flows = blockExecutionFlows();
   const index = flows.findIndex(flow => flow.id === flowId);
   if (index < 0) return;
+  settleBlockFieldEditsForRerender();
   flows.splice(index, 1);
   if (String(state.blockSelectedNode || "").startsWith(`${blockFlowNodePrefix("execution", flowId)}-`)) {
     state.blockSelectedNode = false;
@@ -1762,6 +1789,8 @@ function addBlockBuyFlow() {
     buy_condition_groups: [],
     buy_rule_tree: newBlockRuleRoot("buy", [], true),
   };
+  settings.buy_enabled = true;
+  settings.buy_flows = flows;
   flows.push(flow);
   setScheduleSectionExpanded(`flow:${flow.id}`, true);
   state.blockSelectedNode = `flow-${flow.id}-schedule`;
@@ -1773,9 +1802,14 @@ function addBlockBuyFlow() {
 function removeBlockBuyFlow(flowId) {
   const flows = blockBuyFlows();
   const index = flows.findIndex(flow => flow.id === flowId);
-  if (index < 0 || flows.length <= 1 || selectedState()?.running) return;
+  if (index < 0 || selectedState()?.running) return;
+  settleBlockFieldEditsForRerender();
   flows.splice(index, 1);
-  if (String(state.blockSelectedNode || "").startsWith(`flow-${flowId}-`)) state.blockSelectedNode = "connection";
+  state.blockPackage.settings.buy_enabled = flows.length > 0;
+  if (
+    String(state.blockSelectedNode || "").startsWith(`flow-${flowId}-`)
+    || (!flows.length && state.blockSelectedNode === "buyRules")
+  ) state.blockSelectedNode = false;
   setDirty(true);
   renderStrategyBlocks();
 }
@@ -1799,6 +1833,8 @@ function addBlockSellFlow() {
     sell_condition_groups: [newConditionGroup("sell")],
     sell_rule_tree: newBlockRuleRoot("sell", [newBlockRuleCondition("sell")], true),
   };
+  settings.sell_enabled = true;
+  settings.sell_flows = flows;
   flows.push(flow);
   setScheduleSectionExpanded(`sell-flow:${flow.id}`, true);
   state.blockSelectedNode = `${blockFlowNodePrefix("sell", flow.id)}-schedule`;
@@ -1809,11 +1845,14 @@ function addBlockSellFlow() {
 function removeBlockSellFlow(flowId) {
   const flows = blockSellFlows();
   const index = flows.findIndex(flow => flow.id === flowId);
-  if (index < 0 || flows.length <= 1 || selectedState()?.running) return;
+  if (index < 0 || selectedState()?.running) return;
+  settleBlockFieldEditsForRerender();
   flows.splice(index, 1);
-  if (String(state.blockSelectedNode || "").startsWith(`${blockFlowNodePrefix("sell", flowId)}-`)) {
-    state.blockSelectedNode = `${blockFlowNodePrefix("sell", flows[Math.max(0, index - 1)].id)}-schedule`;
-  }
+  state.blockPackage.settings.sell_enabled = flows.length > 0;
+  if (
+    String(state.blockSelectedNode || "").startsWith(`${blockFlowNodePrefix("sell", flowId)}-`)
+    || (!flows.length && state.blockSelectedNode === "sellTargets")
+  ) state.blockSelectedNode = false;
   setDirty(true);
   renderStrategyBlocks();
 }
@@ -1838,6 +1877,12 @@ function blockOrderTypeHint(orderType) {
 function blockFieldOptions(field) {
   const settings = state.blockPackage?.settings || {};
   const flow = field.flowId ? blockFlow(field.flowKind || "buy", field.flowId) : null;
+  if (field.settingKey === "sell_position_scope") {
+    return [
+      { value: "STRATEGY", label: "이 전략 보유종목" },
+      { value: "ACCOUNT", label: "계좌 전체 보유종목" },
+    ];
+  }
   if (field.settingKey === "trading_account") {
     return state.accounts.map(account => ({
       value: account.alias,
@@ -1941,6 +1986,9 @@ function blockFieldOptions(field) {
 }
 
 function normalizeBlockPackageValue(field, value) {
+  if (field.settingKey === "sell_position_scope" && !["STRATEGY", "ACCOUNT"].includes(value)) {
+    throw new Error("매도 대상을 선택하세요.");
+  }
   if (field.type === "boolean") return value === true || value === "true";
   if (field.type === "number") {
     const normalized = String(value).trim();
@@ -1965,7 +2013,7 @@ function applyBlockFieldEdit(fieldId, value, { render = true } = {}) {
     ...parsed.schedules.flatMap(schedule => schedule.fields),
   ].find(item => item.id === fieldId);
   if (!field) throw new Error("블록 구성이 변경되어 필드 위치를 찾지 못했습니다. 블록 화면을 다시 열어주세요.");
-  if (field.flowKind === "execution" && selectedState()?.running) return;
+  if ((field.flowKind === "execution" || field.settingKey === "sell_position_scope") && selectedState()?.running) return;
   if (field.settingKey && state.blockPackage) {
     const normalized = normalizeBlockPackageValue(field, value);
     if (field.settingKey === "execution_scan_seconds" && (!Number.isInteger(normalized) || normalized < 5)) {
@@ -2389,11 +2437,30 @@ function bindComposerRuleDrag(element, reference, disabled) {
 }
 
 function composerRulePointerDropAt(clientX, clientY) {
-  const target = document.elementFromPoint(clientX, clientY)?.closest("[data-rule-drop-target]");
+  const hit = document.elementFromPoint(clientX, clientY);
+  if (!hit || !elements.blockCanvas.contains(hit) || hit.closest(".composer-inspector") || selectedState()?.running) return null;
+  // The first and last seams deliberately occupy no layout space. Test their
+  // visible coordinates so pointer capture and zoom cannot turn a gap into an
+  // unrelated card drop. Prefer the closest, most specific nested seam.
+  const seams = Array.from(elements.blockCanvas.querySelectorAll(".composer-rule-insertion[data-rule-drop-target]"))
+    .map(target => {
+      const bounds = target.getBoundingClientRect();
+      return { target, bounds, distance: Math.abs(clientY - (bounds.top + bounds.height / 2)) };
+    })
+    .filter(({ target, bounds, distance }) => !target._composerRuleDropTarget?.disabled
+      && bounds.width > 0 && clientX >= bounds.left && clientX <= bounds.left + bounds.width && distance <= 12)
+    .sort((left, right) => left.distance - right.distance || left.bounds.width - right.bounds.width);
+  let target = seams[0]?.target || hit.closest("[data-rule-drop-target]");
+  if (target?.classList.contains("composer-rule-draggable")) {
+    const bounds = target.getBoundingClientRect();
+    const branch = target.closest(".composer-rule-branch");
+    const seam = clientY < bounds.top + bounds.height / 2 ? branch?.previousElementSibling : branch?.nextElementSibling;
+    if (seam?.classList.contains("composer-rule-insertion")) target = seam;
+  }
   const info = target?._composerRuleDropTarget;
   if (!info || info.disabled || !elements.blockCanvas.contains(target) || selectedState()?.running) return null;
   const bounds = target.getBoundingClientRect();
-  const placement = info.mode === "inside" ? "inside"
+  const placement = ["before", "after", "inside"].includes(info.mode) ? info.mode
     : clientY < bounds.top + bounds.height / 2 ? "before" : "after";
   const plan = composerRuleDropPlan(info.reference, placement);
   return plan ? { target, reference: info.reference, placement, plan } : null;
@@ -2474,7 +2541,24 @@ function createComposerInspector(definition, running, flowCounts = {}) {
   close.title = "상세 편집 닫기";
   close.setAttribute("aria-label", "상세 편집 닫기");
   close.addEventListener("click", () => closeComposerInspector(definition.id));
-  heading.append(copy, close);
+  heading.append(copy);
+  if (definition.flowId) {
+    const flowKind = definition.flowKind || "buy";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button quiet compact danger-text composer-inspector-remove-flow";
+    remove.textContent = "흐름 삭제";
+    remove.title = `이 ${{ buy: "매수", sell: "매도", execution: "체결" }[flowKind]} 흐름 삭제`;
+    remove.setAttribute("aria-label", remove.title);
+    remove.disabled = running;
+    remove.addEventListener("click", () => {
+      if (flowKind === "execution") removeBlockExecutionFlow(definition.flowId);
+      else if (flowKind === "sell") removeBlockSellFlow(definition.flowId);
+      else removeBlockBuyFlow(definition.flowId);
+    });
+    heading.append(remove);
+  }
+  heading.append(close);
   inspector.append(heading);
 
   const body = document.createElement("div");
@@ -2502,20 +2586,6 @@ function createComposerInspector(definition, running, flowCounts = {}) {
       actions.append(item);
     });
     body.append(actions);
-  }
-  if (definition.flowId) {
-    const flowKind = definition.flowKind || "buy";
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "button quiet compact danger-text composer-remove-flow";
-    remove.textContent = `이 ${{ buy: "매수", sell: "매도", execution: "체결" }[flowKind]} 흐름 삭제`;
-    remove.disabled = running || (flowKind !== "execution" && flowCounts[flowKind] <= 1);
-    remove.addEventListener("click", () => {
-      if (flowKind === "execution") removeBlockExecutionFlow(definition.flowId);
-      else if (flowKind === "sell") removeBlockSellFlow(definition.flowId);
-      else removeBlockBuyFlow(definition.flowId);
-    });
-    body.append(remove);
   }
   inspector.append(body);
   return inspector;
@@ -2836,7 +2906,7 @@ const BLOCK_CONDITION_METRICS = [
   ["heikin_low", "하이킨아시 저가"], ["heikin_close", "하이킨아시 종가"],
   ["volume", "거래량"], ["obv", "OBV"], ["atr", "ATR"], ["bollinger_upper", "볼린저 상단"],
   ["bollinger_middle", "볼린저 중심"], ["bollinger_lower", "볼린저 하단"],
-  ["average_price", "평균 매수가"], ["profit_rate", "실시간 수익률(평균가 대비 %)"],
+  ["average_price", "평균 매수가"], ["profit_rate", "실시간 순수익률(비용 포함 %)"],
 ];
 
 const BLOCK_CONDITION_OPERATORS = [
@@ -2852,6 +2922,10 @@ const BLOCK_EXPRESSION_METRICS = [
   ["constant", "숫자"],
   ...BLOCK_CONDITION_METRICS.filter(([key]) => key !== "obv"),
 ];
+
+function blockProfitRateHint() {
+  return "실시간 현재가와 계좌 평균 매수가에 계좌 설정의 매수·매도 수수료율과 매도세율을 반영한 추정 순수익률입니다. 비용 요율이 설정되지 않으면 이 값을 사용하는 조건의 판단을 보류합니다. 다른 조건은 각 설정에 따라 판단합니다.";
+}
 
 function blockSourceMaxHistory(interval = "3m") {
   if (!String(interval).endsWith("m")) return 400;
@@ -3189,14 +3263,14 @@ function blockConditionBarPosition(condition, side) {
 }
 
 function blockConditionTiming(condition) {
-  if (isLiveProfitCondition(condition)) return "실시간 현재가";
+  if (isLiveProfitCondition(condition)) return "실시간 순수익률 · 비용 포함";
   const labels = [];
   for (const side of ["left", "right"]) {
     const expression = conditionSideExpression(condition, side);
     if (expression) {
       walkConditionExpression(expression, node => {
         if (node.kind !== "metric") return;
-        if (node.metric === "profit_rate") labels.push("실시간 현재가");
+        if (node.metric === "profit_rate") labels.push("실시간 순수익률 · 비용 포함");
         else if (node.metric !== "average_price") {
           labels.push(`${expressionIntervalLabel(node.bar_interval)} ${expressionBarPosition(node)}`);
         }
@@ -3591,14 +3665,16 @@ function moveBlockRuleNode(kind, flowId, sourceId, targetId, placement, selectMo
   return true;
 }
 
-function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL", afterId = null) {
+function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL", afterId = null, beforeId = null) {
   if (selectedState()?.running) return;
   const parentFound = findBlockRuleNode(kind, flowId, parentId);
   const parent = parentFound?.node;
   const root = blockRuleTree(kind, flowId);
   if (parent?.kind !== "logic") return;
   const insertAfterIndex = afterId == null ? -1 : (parent.children || []).findIndex(child => child.id === afterId);
-  if (afterId != null && insertAfterIndex < 0) {
+  const insertBeforeIndex = beforeId == null ? -1 : (parent.children || []).findIndex(child => child.id === beforeId);
+  if ((afterId != null && insertAfterIndex < 0) || (beforeId != null && insertBeforeIndex < 0)
+    || (afterId != null && beforeId != null && insertBeforeIndex !== insertAfterIndex + 1)) {
     notify("조건 위치가 변경되었습니다. 추가할 위치를 다시 선택하세요.", true);
     return;
   }
@@ -3619,8 +3695,9 @@ function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL", 
   const child = childKind === "logic"
     ? newBlockRuleLogic(kind, operator, [newBlockRuleCondition(kind)], false)
     : newBlockRuleCondition(kind);
-  if (afterId == null) parent.children.push(child);
-  else parent.children.splice(insertAfterIndex + 1, 0, child);
+  const insertionIndex = beforeId != null ? insertBeforeIndex
+    : afterId != null ? insertAfterIndex + 1 : parent.children.length;
+  parent.children.splice(insertionIndex, 0, child);
   state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${child.id}`;
   commitBlockRuleMutation(true, kind);
 }
@@ -3637,6 +3714,7 @@ function removeBlockRuleNode(kind, flowId, nodeId) {
       return;
     }
   }
+  settleBlockFieldEditsForRerender();
   let selectedParent = found.parent;
   if (found.parent.children.length === 1) {
     const parentFound = findBlockRuleNode(kind, flowId, found.parent.id);
@@ -3668,7 +3746,17 @@ function removeBlockRuleNode(kind, flowId, nodeId) {
       }
     });
   }
-  state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${selectedParent.id}`;
+  const prefix = blockFlowNodePrefix(kind, flowId);
+  const selected = String(state.blockSelectedNode || "");
+  if (selected.startsWith(`${prefix}-rule-`) || selected.startsWith(`${prefix}-action-`)) {
+    let selectedSurvives = false;
+    walkBlockRule(blockRuleTree(kind, flowId), node => {
+      if (selected === `${prefix}-rule-${node.id}` || (node.action && selected === `${prefix}-action-${node.action.id}`)) {
+        selectedSurvives = true;
+      }
+    });
+    if (!selectedSurvives) state.blockSelectedNode = false;
+  }
   commitBlockRuleMutation(true, kind);
   if (clearedUnsafeSellAction) notify("조건이 없는 매도 묶음의 주문 행동도 함께 제거했습니다.");
 }
@@ -3724,8 +3812,10 @@ function addBlockRuleAction(kind, flowId, nodeId, executionActionType = "CANCEL_
 function removeBlockRuleAction(kind, flowId, nodeId) {
   const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
   if (!node?.action || selectedState()?.running) return;
+  settleBlockFieldEditsForRerender();
+  const removedSelection = `${blockFlowNodePrefix(kind, flowId)}-action-${node.action.id}`;
   node.action = null;
-  state.blockSelectedNode = `${blockFlowNodePrefix(kind, flowId)}-rule-${node.id}`;
+  if (state.blockSelectedNode === removedSelection) state.blockSelectedNode = false;
   commitBlockRuleMutation(true, kind);
 }
 
@@ -3856,14 +3946,13 @@ function addConditionGroup(kind, flowId = null) {
 function removeConditionGroup(kind, groupIndex, flowId = null) {
   const groups = blockConditionGroups(kind, flowId);
   if (!groups[groupIndex] || (kind === "sell" && groups.length <= 1)) return;
+  settleBlockFieldEditsForRerender();
   const [removed] = groups.splice(groupIndex, 1);
   const removedNode = removed?.id && (
     flowId ? `${blockFlowNodePrefix(kind, flowId)}-group-${removed.id}` : `${kind}Group-${removed.id}`
   );
   if (removedNode && state.blockSelectedNode === removedNode) {
-    state.blockSelectedNode = flowId
-      ? `${blockFlowNodePrefix(kind, flowId)}-${kind === "buy" ? "target" : "schedule"}`
-      : "sellSchedule";
+    state.blockSelectedNode = false;
   }
   setDirty(true);
   renderStrategyBlocks();
@@ -4059,7 +4148,7 @@ function createExpressionNodeEditor(
     hint.className = "block-condition-operand-hint";
     hint.textContent = expression.metric === "average_price"
       ? "계좌의 평균 매수가를 사용합니다."
-      : "실시간 현재가와 평균 매수가로 계산하며 수수료·세금은 포함하지 않습니다.";
+      : blockProfitRateHint();
     box.append(hint);
   } else {
     const interval = document.createElement("select");
@@ -4284,8 +4373,8 @@ function createCompactFormulaTokenEditor(kind, expression, disabled, updateToken
       const hint = document.createElement("p");
       hint.className = "condition-token-editor-hint";
       hint.textContent = expression.metric === "average_price"
-        ? "전략이 추적하는 평균 매수가를 사용합니다."
-        : "실시간 현재가와 평균 매수가로 계산합니다.";
+        ? "계좌의 평균 매수가를 사용합니다."
+        : blockProfitRateHint();
       grid.append(hint);
     } else {
       const interval = document.createElement("select");
@@ -4764,7 +4853,7 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
   title.textContent = expression
     ? "계산 값"
     : metric === "profit_rate"
-    ? "실시간 계산"
+    ? "실시간 순수익률"
     : metric === "obv"
       ? "OBV 계산"
     : metric === "atr"
@@ -4844,7 +4933,7 @@ function createConditionOperandEditor(kind, groupIndex, conditionIndex, side, co
   if (metric === "profit_rate") {
     const hint = document.createElement("span");
     hint.className = "block-condition-operand-hint";
-    hint.textContent = "실시간 현재가와 계좌 평균 매수가로 자동 계산합니다. 수수료·세금은 포함하지 않습니다.";
+    hint.textContent = blockProfitRateHint();
     panel.append(hint);
     appendRightAdvancedAction();
     return panel;
@@ -5117,6 +5206,9 @@ async function refreshBlockConditions(openToken = null) {
 
 function normalizeManagedBlockSettings(settings) {
   if (!settings) return settings;
+  settings.buy_enabled ??= true;
+  settings.sell_enabled ??= true;
+  settings.sell_position_scope ??= "STRATEGY";
   settings.target_source ||= "HTS_CONDITION";
   settings.ranking_kind ||= "RISE";
   settings.ranking_venue ||= "KRX";
@@ -5195,7 +5287,9 @@ function normalizeManagedBlockSettings(settings) {
       delete group.bollinger_stddev;
     });
   });
-  if (!Array.isArray(settings.buy_flows) || !settings.buy_flows.length) {
+  if (settings.buy_enabled === false) {
+    settings.buy_flows = [];
+  } else if (!Array.isArray(settings.buy_flows) || !settings.buy_flows.length) {
     const legacy = Object.fromEntries(BLOCK_BUY_FLOW_FIELDS.map(key => [key, settings[key]]));
     settings.buy_flows = [{ id: "buy-flow-1", name: "매수 흐름 1", ...structuredClone(legacy) }];
   }
@@ -5217,7 +5311,9 @@ function normalizeManagedBlockSettings(settings) {
       }));
     });
   });
-  if (!Array.isArray(settings.sell_flows) || !settings.sell_flows.length) {
+  if (settings.sell_enabled === false) {
+    settings.sell_flows = [];
+  } else if (!Array.isArray(settings.sell_flows) || !settings.sell_flows.length) {
     settings.sell_flows = [{
       id: "sell-flow-1",
       name: "매도 흐름 1",
@@ -5300,7 +5396,9 @@ async function loadBlockEditorData(name, openToken = null) {
   resetConditionFormulaDrafts();
   state.blockExpressionSelections = new WeakMap();
   state.blockConditionCache = new Map();
-  normalizeManagedBlockSettings(state.blockPackage.settings);
+  if (state.blockPackage.template === "condition-bollinger-v1") {
+    normalizeManagedBlockSettings(state.blockPackage.settings);
+  }
   prepareBlockVisualLayout(name);
   state.providers = providers;
   state.connections = connections;
@@ -5331,36 +5429,34 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
   const ruleCount = totalCount ?? blockRuleNodeCount(node);
   const children = [];
   if (node.kind === "logic") {
-    (node.children || []).forEach((child, index) => {
-      if (index) {
-        children.push({
-          kind: "logic-join",
-          id: `${node.id}-join-${index}`,
-          ruleKind: kind,
-          flowId,
-          parentId: node.id,
-          boundaryIndex: index,
-          operator: node.operator || "ALL",
-        });
-      }
-      children.push(buildComposerRuleBranch(kind, flowId, child, false, depth + 1, ruleCount, node));
-    });
-    children.push({
-      kind: "rule-add",
-      id: `${node.id}-add-child`,
-      ruleKind: kind,
-      flowId,
-      parentId: node.id,
-      ownerId: node.id,
-      ownerKind: "logic",
-      hasAction: Boolean(node.action),
-      empty: !(node.children || []).length,
-      nodeId: ruleComposerNodeId(kind, flowId, node.id),
-      isRoot,
-      depth,
-      totalCount: ruleCount,
-      disabled: (node.children || []).length >= 20,
-    });
+    const siblings = node.children || [];
+    for (let index = 0; index <= siblings.length; index += 1) {
+      const previous = siblings[index - 1];
+      const next = siblings[index];
+      children.push({
+        kind: "rule-add",
+        id: `${node.id}-insert-${index}`,
+        ruleKind: kind,
+        flowId,
+        parentId: node.id,
+        ownerId: previous?.id || node.id,
+        ownerKind: previous?.kind || "logic",
+        hasAction: Boolean((previous || node).action),
+        afterId: previous?.id || null,
+        beforeId: next?.id || null,
+        boundaryIndex: index,
+        siblingCount: siblings.length,
+        operator: node.operator || "ALL",
+        groupTools: index === siblings.length,
+        empty: !siblings.length,
+        nodeId: ruleComposerNodeId(kind, flowId, node.id),
+        isRoot,
+        depth,
+        totalCount: ruleCount,
+        disabled: siblings.length >= 20,
+      });
+      if (next) children.push(buildComposerRuleBranch(kind, flowId, next, false, depth + 1, ruleCount, node));
+    }
   }
   if (node.action) {
     children.push({
@@ -5371,24 +5467,6 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
       ownerId: node.id,
       ownerKind: node.kind,
       children: [{ kind: "node", nodeId: ruleComposerActionId(kind, flowId, node.action.id) }],
-    });
-  }
-  if (node.kind === "condition" && parent) {
-    children.push({
-      kind: "rule-add",
-      id: `${node.id}-add-block`,
-      ruleKind: kind,
-      flowId,
-      parentId: parent.id,
-      ownerId: node.id,
-      ownerKind: "condition",
-      hasAction: Boolean(node.action),
-      afterId: node.id,
-      nodeId: ruleComposerNodeId(kind, flowId, node.id),
-      isRoot: false,
-      depth: Math.max(0, depth - 1),
-      totalCount: ruleCount,
-      disabled: (parent.children || []).length >= 20,
     });
   }
   return {
@@ -5460,7 +5538,7 @@ function buildComposerTreeModel(settings) {
       title: "매수 구성",
       badge: "BUY",
       tone: "buy",
-      description: "시간대별 종목 선정과 조건 · 예산과 보유종목은 전략 전체 공유",
+      description: flows.length ? "시간대별 종목 선정과 조건 · 예산과 보유종목은 전략 전체 공유" : "흐름 없음 · 자동 매수하지 않음",
       children: [
         ...flowBranches,
         {
@@ -5470,13 +5548,13 @@ function buildComposerTreeModel(settings) {
           action: "add-buy-flow",
           disabled: flows.length >= 8,
         },
-        {
+        ...(flows.length ? [{
           kind: "node",
           id: "shared-buy-budget",
           badge: "SHARED",
           tone: "shared",
           nodeId: "buyRules",
-        },
+        }] : []),
       ],
     }, {
       kind: "section",
@@ -5484,8 +5562,11 @@ function buildComposerTreeModel(settings) {
       title: "매도 구성",
       badge: "SELL",
       tone: "sell",
-      description: "시간대별 매도 조건 · 보유종목과 주문 처리는 전략 전체 공유",
+      description: sellFlows.length
+        ? `시간대별 매도 조건 · ${settings.sell_position_scope === "ACCOUNT" ? "계좌 전체 보유종목" : "이 전략 보유종목"} 대상`
+        : "흐름 없음 · 자동 매도하지 않음",
       children: [
+        ...(sellFlows.length ? [{ kind: "node", nodeId: "sellTargets" }] : []),
         ...sellFlowBranches,
         {
           kind: "add",
@@ -5551,15 +5632,72 @@ function createComposerLogicConnector(entry, running) {
   return row;
 }
 
+function createComposerRuleInsertion(entry, running) {
+  const slot = document.createElement("div");
+  slot.className = "composer-rule-insertion";
+  slot.classList.toggle("composer-rule-insertion-empty", Boolean(entry.empty));
+  slot.dataset.insertionIndex = entry.boundaryIndex;
+  slot.dataset.parentRuleId = entry.parentId;
+  bindComposerRuleDropTarget(slot, {
+    kind: entry.ruleKind,
+    flowId: entry.flowId,
+    nodeId: entry.beforeId || entry.afterId || entry.parentId,
+  }, entry.beforeId ? "before" : entry.afterId ? "after" : "inside", running);
+  const between = entry.boundaryIndex > 0 && entry.boundaryIndex < entry.siblingCount;
+  slot.classList.toggle("composer-rule-insertion-between", between);
+  if (between) slot.append(createComposerLogicConnector(entry, running));
+  slot.append(createComposerRuleAddMenu(entry, running));
+  return slot;
+}
+
+function positionComposerRuleConnectors(tree) {
+  // Work inside-out so a parent connects to a nested group's actual entry,
+  // never to its invisible insertion target.
+  const entryAnchor = branch => branch.classList.contains("composer-then-branch") ? 31
+    : Number.parseFloat(branch.style.getPropertyValue("--rule-entry-y")) || 23;
+  Array.from(tree.querySelectorAll(".composer-rule-group > .composer-tree-children")).reverse().forEach(children => {
+    const branches = Array.from(children.querySelectorAll(":scope > .composer-rule-branch, :scope > .composer-then-branch"))
+      .filter(branch => !branch.classList.contains("composer-rule-empty"));
+    const first = branches[0];
+    const last = branches[branches.length - 1];
+    const top = first ? first.offsetTop + entryAnchor(first) : 0;
+    const bottom = last ? last.offsetTop + entryAnchor(last) : top;
+    children.style.setProperty("--rule-rail-top", `${top}px`);
+    children.style.setProperty("--rule-rail-height", `${Math.max(0, bottom - top)}px`);
+    children.parentElement.style.setProperty("--rule-entry-y", `${children.offsetTop + top}px`);
+    children.parentElement.classList.toggle("composer-rule-empty", !first);
+  });
+  tree.querySelectorAll(".composer-rule-insertion-between").forEach(slot => {
+    const previous = slot.previousElementSibling;
+    const next = slot.nextElementSibling;
+    const conditionRows = branch => branch?.querySelectorAll('.composer-rule-branch[data-tone="condition"] > .composer-tree-row') || [];
+    const previousRows = conditionRows(previous);
+    const nextRows = conditionRows(next);
+    const previousCard = previous?.querySelector(":scope > .composer-tree-row") || previousRows[previousRows.length - 1];
+    const nextCard = next?.querySelector(":scope > .composer-tree-row") || nextRows[0];
+    const button = slot.querySelector(".composer-logic-connector");
+    if (!previousCard || !nextCard || !button) return;
+    const slotBounds = slot.getBoundingClientRect();
+    const scale = slot.offsetHeight > 0 ? slotBounds.height / slot.offsetHeight : 1;
+    if (!(scale > 0)) return;
+    const middle = (previousCard.getBoundingClientRect().bottom + nextCard.getBoundingClientRect().top) / 2;
+    button.style.top = `${(middle - slotBounds.top) / scale}px`;
+  });
+}
+
 function createComposerRuleAddMenu(entry, running) {
   const canvas = elements.blockCanvas;
-  if (!canvas._ruleAddMenuDismissHandler) {
-    canvas._ruleAddMenuDismissHandler = event => {
-      canvas.querySelectorAll(".composer-tree-rule-add[open]").forEach(openMenu => {
-        if (!openMenu.contains(event.target)) openMenu.open = false;
+  if (!document._ruleAddMenuDismissHandler) {
+    document._ruleAddMenuDismissHandler = event => {
+      elements.blockCanvas?.querySelectorAll(".composer-tree-rule-add").forEach(openMenu => {
+        if (openMenu.contains(event.target)) return;
+        openMenu.open = false;
+        // A pointer dismissal must also release focus; otherwise :focus-within
+        // leaves the insertion trigger visible after the pointer moves away.
+        if (openMenu.contains(document.activeElement)) document.activeElement?.blur();
       });
     };
-    canvas.addEventListener("pointerdown", canvas._ruleAddMenuDismissHandler, true);
+    document.addEventListener("pointerdown", document._ruleAddMenuDismissHandler, true);
   }
   const toolbar = document.createElement("div");
   const conditionScope = entry.ownerKind === "condition";
@@ -5572,7 +5710,14 @@ function createComposerRuleAddMenu(entry, running) {
   const summary = document.createElement("summary");
   summary.className = "composer-rule-add-trigger";
   summary.textContent = "+ 블록 추가";
-  summary.setAttribute("aria-label", `${conditionScope ? "이 조건 다음" : "이 계층"} 블록 추가 메뉴`);
+  const insertionLabel = entry.afterId ? "앞 블록 다음" : entry.beforeId ? "첫 블록 앞" : "이 계층";
+  summary.setAttribute("aria-label", `${insertionLabel} 블록 추가 메뉴`);
+  summary.addEventListener("click", event => {
+    if (!menu.open || event.detail === 0) return;
+    event.preventDefault();
+    menu.open = false;
+    summary.blur();
+  });
   menu.append(summary);
   const options = document.createElement("div");
   options.className = "composer-tree-rule-add-options";
@@ -5588,11 +5733,11 @@ function createComposerRuleAddMenu(entry, running) {
       || Number(entry.depth || 0) + addedDepth > 8;
     button.addEventListener("click", event => {
       event.stopPropagation();
-      addBlockRuleChild(entry.ruleKind, entry.flowId, entry.parentId, childKind, operator, entry.afterId || null);
+      addBlockRuleChild(entry.ruleKind, entry.flowId, entry.parentId, childKind, operator, entry.afterId || null, entry.beforeId || null);
     });
     options.append(button);
   };
-  make(conditionScope ? "다음 조건식" : "조건식", "condition");
+  make("조건식", "condition");
   make("하위 계층 추가", "logic", "ALL");
   const owner = findBlockRuleNode(entry.ruleKind, entry.flowId, entry.ownerId)?.node;
   const exists = Boolean(owner?.action);
@@ -5605,7 +5750,8 @@ function createComposerRuleAddMenu(entry, running) {
     const order = document.createElement("button");
     order.type = "button";
     order.className = "composer-rule-order-add";
-    order.textContent = exists ? `${orderLabel} · 이미 추가됨` : orderLabel;
+    const actionScope = entry.afterId ? (conditionScope ? "앞 조건 통과 시" : "앞 계층 통과 시") : "전체 계층 통과 시";
+    order.textContent = `${orderLabel} · ${exists ? "이미 추가됨" : actionScope}`;
     order.disabled = running || !owner || exists || emptySell || conflict;
     order.title = exists ? "행동 카드를 눌러 실행 방식을 편집하세요."
       : emptySell ? `${entry.ruleKind === "execution" ? "체결 행동" : "매도 주문"}을 추가하려면 조건식이 하나 이상 필요합니다.`
@@ -5622,7 +5768,9 @@ function createComposerRuleAddMenu(entry, running) {
   menu.addEventListener("toggle", () => {
     if (!menu.open) return;
     canvas.querySelectorAll(".composer-tree-rule-add[open]").forEach(openMenu => {
-      if (openMenu !== menu) openMenu.open = false;
+      if (openMenu === menu) return;
+      openMenu.open = false;
+      if (openMenu.contains(document.activeElement)) document.activeElement?.blur();
     });
     menu.classList.remove("opens-up");
     options.style.maxHeight = "";
@@ -5657,7 +5805,7 @@ function createComposerRuleAddMenu(entry, running) {
     summary.focus({ preventScroll: true });
   });
   toolbar.append(menu);
-  if (conditionScope) return toolbar;
+  if (!entry.groupTools) return toolbar;
   const settings = document.createElement("button");
   settings.type = "button";
   settings.className = "composer-rule-settings";
@@ -5673,14 +5821,6 @@ function createComposerRuleAddMenu(entry, running) {
     focusComposerInspector();
   });
   toolbar.append(settings);
-  const dropEnd = document.createElement("div");
-  dropEnd.className = "composer-rule-drop-end";
-  dropEnd.textContent = entry.isRoot ? "이 흐름의 마지막 조건으로 이동" : "이 단계의 마지막 조건으로 이동";
-  dropEnd.setAttribute("aria-label", dropEnd.textContent);
-  bindComposerRuleDropTarget(dropEnd, {
-    kind: entry.ruleKind, flowId: entry.flowId, nodeId: entry.parentId,
-  }, "inside", running);
-  toolbar.append(dropEnd);
   return toolbar;
 }
 
@@ -5691,9 +5831,9 @@ function createComposerThenBranch(entry, definitions, running) {
   branch.dataset.ruleActionOwner = entry.ownerId;
   branch.setAttribute("aria-label", `${conditionScope ? "이 조건" : "이 계층"} 통과 시 ${entry.ruleKind === "execution" ? "체결 행동" : "주문"}`);
   const label = document.createElement("span");
-  label.className = "composer-then-label";
-  label.textContent = conditionScope ? "통과하면" : "계층 통과 시";
-  if (!conditionScope) label.title = "통과한 하위 조건에서 선택된 행동이 없을 때 실행하는 기본 행동";
+  label.className = "composer-then-arrow";
+  label.setAttribute("aria-hidden", "true");
+  label.title = conditionScope ? "조건을 만족하면 실행" : "조건을 만족하면 실행 · 하위 조건의 행동이 우선";
   branch.append(label);
   const children = document.createElement("div");
   children.className = "composer-then-children";
@@ -5737,7 +5877,7 @@ function createComposerTreeBranchHeader(entry, running) {
 function renderComposerTreeBranch(entry, definitions, running) {
   if (entry.kind === "add") return createComposerTreeAddRow(entry, running);
   if (entry.kind === "logic-join") return createComposerLogicConnector(entry, running);
-  if (entry.kind === "rule-add") return createComposerRuleAddMenu(entry, running);
+  if (entry.kind === "rule-add") return createComposerRuleInsertion(entry, running);
   if (entry.kind === "then") return createComposerThenBranch(entry, definitions, running);
   const branch = document.createElement(entry.kind === "section" ? "section" : "div");
   branch.className = `composer-tree-branch${entry.kind === "section" ? " composer-tree-section" : ""}${entry.kind === "rule-node" ? " composer-rule-branch" : ""}`;
@@ -5817,21 +5957,26 @@ function applyBlockViewport(world) {
 
 function bindBlockCanvasPan(world) {
   const canvas = elements.blockCanvas;
+  canvas._blockPanCleanup?.();
   if (canvas._blockPanHandler) canvas.removeEventListener("pointerdown", canvas._blockPanHandler);
   if (canvas._blockWheelHandler) canvas.removeEventListener("wheel", canvas._blockWheelHandler);
   if (canvas._blockKeyHandler) canvas.removeEventListener("keydown", canvas._blockKeyHandler);
   const panHandler = event => {
-    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-add-row, .composer-inspector, .composer-tree-rule-add-options, button, input, select, textarea, a, summary, [contenteditable]")) return;
+    if (event.button !== 0 || event.target.closest(".composer-tree-row, .composer-tree-flow, .composer-tree-add-row, .composer-inspector, .composer-tree-rule-add-options, button, input, select, textarea, a, summary, [contenteditable]")) return;
     event.preventDefault();
     const viewport = ensureBlockLayout().viewport;
     const strategyName = state.selected;
     const layout = state.blockPackage?.layout;
     const start = { x: viewport.x, y: viewport.y };
     const origin = { x: event.clientX, y: event.clientY };
+    const selectedNode = state.blockSelectedNode;
     let moved = false;
     canvas.setPointerCapture(event.pointerId);
     canvas.classList.add("panning");
     const move = moveEvent => {
+      if (moveEvent.pointerId !== event.pointerId) return;
+      if (!moved && Math.hypot(moveEvent.clientX - origin.x, moveEvent.clientY - origin.y) < 4) return;
+      moved = true;
       viewport.x = clampBlockNumber(
         start.x + moveEvent.clientX - origin.x,
         -BLOCK_VIEWPORT_COORD_LIMIT,
@@ -5844,19 +5989,29 @@ function bindBlockCanvasPan(world) {
         BLOCK_VIEWPORT_COORD_LIMIT,
         start.y,
       );
-      moved ||= Math.abs(viewport.x - start.x) >= .1 || Math.abs(viewport.y - start.y) >= .1;
       applyBlockViewport(world);
     };
-    const end = endEvent => {
-      if (canvas.hasPointerCapture?.(endEvent.pointerId)) {
-        canvas.releasePointerCapture(endEvent.pointerId);
+    const cleanup = () => {
+      if (canvas.hasPointerCapture?.(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
       }
       canvas.classList.remove("panning");
       canvas.removeEventListener("pointermove", move);
       canvas.removeEventListener("pointerup", end);
       canvas.removeEventListener("pointercancel", end);
-      if (moved) persistBlockLayout(strategyName, layout);
+      canvas._blockPanCleanup = null;
     };
+    const end = endEvent => {
+      if (endEvent.pointerId !== event.pointerId) return;
+      cleanup();
+      if (moved) persistBlockLayout(strategyName, layout);
+      else if (endEvent.type === "pointerup" && state.selected === strategyName
+        && state.blockSelectedNode === selectedNode && canvas.querySelector(".composer-inspector")) {
+        closeComposerInspector(null);
+        canvas.focus({ preventScroll: true });
+      }
+    };
+    canvas._blockPanCleanup = cleanup;
     canvas.addEventListener("pointermove", move);
     canvas.addEventListener("pointerup", end);
     canvas.addEventListener("pointercancel", end);
@@ -6199,7 +6354,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
     remove.className = "button quiet compact schedule-flow-remove";
     remove.textContent = "삭제";
     remove.setAttribute("aria-label", `${flow.name} 매수 흐름 삭제`);
-    remove.disabled = running || flows.length <= 1;
+    remove.disabled = running;
     remove.addEventListener("click", () => removeBlockBuyFlow(flow.id));
     const panel = createScheduleSection({ key: `flow:${flow.id}`, title: `${flow.buy_start_time}–${flow.buy_end_time}  ${flow.name}`,
       summary: `${sourceLabel} → ${groups.length ? `매수 조건 ${groups.length}개 블록 모두 통과` : "추가 조건 없이 통과"} → 공통 주문`,
@@ -6263,7 +6418,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
       remove.className = "button quiet compact schedule-flow-remove";
       remove.textContent = "삭제";
       remove.setAttribute("aria-label", `${flow.name} 매도 흐름 삭제`);
-      remove.disabled = running || sellFlows.length <= 1;
+      remove.disabled = running;
       remove.addEventListener("click", () => removeBlockSellFlow(flow.id));
       const panel = createScheduleSection({
         key: `sell-flow:${flow.id}`,
@@ -6276,7 +6431,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
       ));
       const sellHint = document.createElement("p");
       sellHint.className = "schedule-explanation";
-      sellHint.textContent = "수익률 조건은 실시간 현재가, 차트 조건은 각 조건에 설정한 봉 주기와 완성 여부로 판단합니다.";
+      sellHint.textContent = "순수익률 조건은 실시간 현재가에 계좌 설정의 수수료·세금을 반영합니다. 비용 요율이 미설정이면 해당 조건의 판단을 보류합니다. 차트 조건은 각 조건의 봉 주기와 완성 여부로 판단합니다.";
       panel.content.append(sellHint);
       appendScheduleConditions(panel.content, "sell", flow.id, running);
       sellList.append(panel.section);
@@ -6360,7 +6515,7 @@ function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
           ? (node.action.action_type === "AMEND_BEST_LIMIT" ? "남은 수량 · 기존 주문 정정" : "미체결 잔량만 취소")
           : `${orderTypeLabel(node.action.order_type, "현재가 지정가")} 주문`],
         actions: kind === "execution" ? ["미체결 잔량", "조건 확인", "체결 행동", "상태 확인"] : kind === "sell"
-          ? ["전략 소유 수량", "주문 제출", "상태 조정"]
+          ? [state.blockPackage.settings.sell_position_scope === "ACCOUNT" ? "계좌 매도 가능 수량" : "전략 소유 수량", "주문 제출", "상태 조정"]
           : ["공통 예산", "멱등성 예약", "위험 검사", "주문 제출"],
         ruleActionOwner: { kind, flowId, nodeId: node.id, order_type: node.action.order_type },
       });
@@ -6391,6 +6546,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       fields: take("buy_budget_per_symbol", "total_operating_budget", "max_new_buys_per_scan"),
       summary: [`종목당 ${money(valueOf("buy_budget_per_symbol"))}`, `총 ${money(valueOf("total_operating_budget"))}`, `조회당 ${valueOf("max_new_buys_per_scan")}종목`],
       actions: ["미보유", "미체결 없음", "가능 수량 ≥ 1", "운용 예산 이내"] },
+    ...(sellFlows.length ? [blockSellPositionScopeDefinition(settings)] : []),
   ];
   flows.forEach((flow, flowIndex) => {
     const prefix = `flow-${flow.id}`;
@@ -6429,7 +6585,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
       ? "실시간 · 봉 시점"
       : hasLiveConditions ? "실시간" : "봉 시점";
     const scheduleActions = [
-      ...(hasLiveConditions ? ["수익률 · 실시간 현재가"] : []),
+      ...(hasLiveConditions ? ["순수익률 · 실시간 현재가 · 비용 포함"] : []),
       ...(hasBarConditions ? ["차트 값 · 각 조건의 봉 설정"] : []),
       `${flow.sell_scan_seconds}초 보완 판단`,
     ];
@@ -6468,12 +6624,17 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
   tree.append(renderComposerTreeBranch(buildComposerTreeModel(settings), definitions, running));
   world.append(tree);
   elements.blockCanvas.append(world);
+  elements.blockCanvas._ruleConnectorObserver?.disconnect();
+  elements.blockCanvas._ruleConnectorObserver = typeof window.ResizeObserver === "function"
+    ? new window.ResizeObserver(() => positionComposerRuleConnectors(tree)) : null;
+  elements.blockCanvas._ruleConnectorObserver?.observe(tree);
   bindBlockCanvasPan(world);
   applyBlockViewport(world);
   state.blockGraphRedraw = null;
   window.requestAnimationFrame(() => {
     world.style.width = `${Math.max(1120, tree.scrollWidth + tree.offsetLeft + 180)}px`;
     world.style.height = `${Math.max(1100, tree.scrollHeight + tree.offsetTop + 180)}px`;
+    positionComposerRuleConnectors(tree);
   });
   const selected = nodes.find(node => node.id === state.blockSelectedNode);
   const inspector = createComposerInspector(selected, running, { buy: flows.length, sell: sellFlows.length, execution: executionFlows.length });

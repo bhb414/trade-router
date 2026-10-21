@@ -257,10 +257,17 @@ class Balance:
     total_value: Decimal
     positions: tuple[Position, ...] = ()
     as_of: datetime | None = None
+    # Fractional rates: 0.001 means 0.1%. None means not configured, not zero.
+    buy_commission_rate: Decimal | None = None
+    sell_commission_rate: Decimal | None = None
+    sell_tax_rate: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.as_of is not None and self.as_of.tzinfo is None:
             raise ValueError("Balance timestamp must include a timezone.")
+        for rate in (self.buy_commission_rate, self.sell_commission_rate, self.sell_tax_rate):
+            if rate is not None and (not rate.is_finite() or rate < 0):
+                raise ValueError("Account cost rates must be finite and non-negative.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,8 +336,13 @@ class OrderRequest:
     route: OrderRoute = OrderRoute.AUTO
     price: Decimal | None = None
     provider_options: dict[str, Any] = field(default_factory=dict)
+    sell_position_scope: str = "STRATEGY"
 
     def __post_init__(self) -> None:
+        if self.sell_position_scope not in {"STRATEGY", "ACCOUNT"}:
+            raise ValueError("Sell position scope must be STRATEGY or ACCOUNT.")
+        if self.side is not OrderSide.SELL and self.sell_position_scope != "STRATEGY":
+            raise ValueError("Account position scope is only valid for sell orders.")
         if self.quantity <= 0:
             raise ValueError("Order quantity must be positive.")
         if not self.client_order_id.strip():

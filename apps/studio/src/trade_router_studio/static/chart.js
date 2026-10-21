@@ -3,6 +3,8 @@
 
   const STORAGE_KEY = "trade-router.chart-settings.v1";
   const ATR_WARMUP_BARS = 100;
+  const REFRESH_INTERVAL_MS = 10_000;
+  const STREAM_STALE_MS = 15_000;
   const palette = ["#2f67d8", "#e59028", "#7c4dba", "#16856f", "#d24b5f", "#5c6f82"];
   const state = {
     code: "",
@@ -13,6 +15,14 @@
     sources: [],
     socket: null,
     fallbackTimer: null,
+    refreshInFlight: null,
+    lastStreamAt: 0,
+    lastStreamQuote: null,
+    lastRefreshAt: 0,
+    lastBarsRefreshAt: 0,
+    lastConnectAt: 0,
+    refreshFailed: false,
+    refreshError: "",
     searchTimer: null,
     searchRequest: 0,
     loadGeneration: 0,
@@ -30,7 +40,7 @@
     noMoreHistory: false,
     historyRetryAt: 0,
     indicators: [
-      { id: crypto.randomUUID(), type: "BOLLINGER", placement: "SERIES", period: 20, deviation: 2, color: "#2f67d8" },
+      { id: crypto.randomUUID(), type: "BOLLINGER", placement: "SERIES", period: 20, deviation: 2, priceSource: "RAW", color: "#2f67d8" },
       { id: crypto.randomUUID(), type: "VOLUME", placement: "PANEL", period: 20, color: "#7c8798" },
     ],
   };
@@ -38,14 +48,20 @@
   const $ = selector => document.querySelector(selector);
   const el = {};
 
-  async function request(path) {
-    const response = await fetch(path, { headers: { Accept: "application/json" }, cache: "no-store" });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const detail = payload.detail;
-      throw new Error(detail?.message || detail || `HTTP ${response.status}`);
+  async function request(path, timeoutMs = 0) {
+    const controller = timeoutMs ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const response = await fetch(path, { headers: { Accept: "application/json" }, cache: "no-store", ...(controller ? { signal: controller.signal } : {}) });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = payload.detail;
+        throw new Error(detail?.message || detail || `HTTP ${response.status}`);
+      }
+      return payload;
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
-    return payload;
   }
 
   function number(value) {
@@ -80,7 +96,7 @@
       if (saved.chartType) el.type.value = saved.chartType;
       if (Array.isArray(saved.indicators) && saved.indicators.length <= 8) {
         const interval = saved.interval || el.interval.value || "3m";
-        state.indicators = saved.indicators.map((item, index) => ({
+        state.indicators = saved.indicators.map((item, index) => normalizeIndicator({
           id: item.id || crypto.randomUUID(),
           type: item.type || "SMA",
           placement: item.placement === "PANEL" ? "PANEL" : "SERIES",
@@ -92,6 +108,7 @@
           slow: Math.max(3, Number(item.slow) || 26),
           signal: Math.max(2, Number(item.signal) || 9),
           color: item.color || palette[index % palette.length],
+          priceSource: item.priceSource || "CHART",
         }));
       }
       return saved.source || "AUTO";
@@ -218,6 +235,9 @@
   }
 
   function indicatorSeries(indicator, rows, rawRows = rows) {
+    indicator = normalizeIndicator({ ...indicator });
+    if (indicator.priceSource === "RAW") rows = rawRows;
+    else if (indicator.priceSource === "HEIKIN_ASHI") rows = heikinAshi(rawRows);
     const closes = rows.map(row => row.close);
     if (indicator.type === "SMA") return [{ name: `SMA ${indicator.period}`, values: sma(closes, indicator.period), color: indicator.color }];
     if (indicator.type === "EMA") return [{ name: `EMA ${indicator.period}`, values: ema(closes, indicator.period), color: indicator.color }];
@@ -539,7 +559,30 @@
     return `${indicator.type} (${indicator.period})`;
   }
 
+  function normalizeIndicator(indicator) {
+    const positive = (value, fallback, minimum, integer = true) => {
+      const numeric = Number(value);
+      const valid = Number.isFinite(numeric) && numeric >= minimum ? numeric : fallback;
+      return integer ? Math.floor(valid) : valid;
+    };
+    indicator.period = indicator.type === "ATR" ? clampAtrPeriod(indicator.period) : positive(indicator.period, 20, 2);
+    indicator.deviation = positive(indicator.deviation, 2, .1, false);
+    indicator.fast = positive(indicator.fast, 12, 2);
+    indicator.slow = positive(indicator.slow, 26, 3);
+    indicator.signal = positive(indicator.signal, 9, 2);
+    if (!["RAW", "HEIKIN_ASHI", "CHART"].includes(indicator.priceSource)) indicator.priceSource = "CHART";
+    return indicator;
+  }
+
+  function indicatorPriceSourceLabel(indicator) {
+    if (["VOLUME", "OBV", "ATR"].includes(indicator.type)) return "실제 시세";
+    if (indicator.priceSource === "RAW") return "실제 종가";
+    if (indicator.priceSource === "HEIKIN_ASHI") return "하이킨아시 종가";
+    return el.type.value === "HEIKIN_ASHI" ? "차트 종가: 하이킨아시" : "차트 종가: 실제";
+  }
+
   function renderIndicatorParameters(indicator, container) {
+    normalizeIndicator(indicator);
     container.replaceChildren();
     const definitions = indicator.type === "MACD"
       ? [["fast", "단기", 2], ["slow", "장기", 3], ["signal", "시그널", 2]]
@@ -556,23 +599,39 @@
         indicator.period = clampAtrPeriod(indicator.period);
         input.max = String(atrMaxPeriod());
       }
-      input.step = key === "deviation" ? "0.1" : "1";
+      input.step = key === "deviation" ? "0.01" : "1";
       input.value = String(indicator[key] ?? (key === "deviation" ? 2 : indicator.type === "ATR" ? 14 : 20));
       input.addEventListener("change", () => {
         const value = Math.max(min, Number(input.value) || min);
         indicator[key] = indicator.type === "ATR" && key === "period" ? clampAtrPeriod(value) : value;
+        normalizeIndicator(indicator);
         input.value = String(indicator[key]);
-        saveSettings(); drawChart();
+        saveSettings(); renderIndicatorSummary(); drawChart();
         if (indicator.type === "ATR" && key === "period") void ensureAtrHistory();
       });
       wrapper.append(input);
       container.append(wrapper);
     });
+    if (!["VOLUME", "OBV", "ATR"].includes(indicator.type)) {
+      const wrapper = document.createElement("label");
+      wrapper.className = "chart-indicator-price-source";
+      wrapper.textContent = "계산 기준";
+      const source = document.createElement("select");
+      for (const [value, label] of [["RAW", "실제 종가 (전략 지표 기준)"], ["HEIKIN_ASHI", "하이킨아시 종가"], ["CHART", "차트 유형과 동일"]]) source.add(new Option(label, value));
+      source.value = indicator.priceSource;
+      source.addEventListener("change", () => {
+        indicator.priceSource = source.value;
+        saveSettings(); renderIndicatorSummary(); drawChart();
+      });
+      wrapper.append(source);
+      container.append(wrapper);
+    }
   }
 
   function renderIndicators() {
     el.indicators.replaceChildren();
     state.indicators.forEach(indicator => {
+      normalizeIndicator(indicator);
       const row = document.createElement("div");
       row.className = "chart-indicator-row";
       const type = document.createElement("select");
@@ -599,7 +658,8 @@
         }
         if (indicator.type === "ATR") indicator.period = 14;
         if (indicator.type === "ATR") indicator.period = clampAtrPeriod(indicator.period);
-        renderIndicatorParameters(indicator, parameters); saveSettings(); drawChart();
+        normalizeIndicator(indicator);
+        renderIndicatorParameters(indicator, parameters); saveSettings(); renderIndicatorSummary(); drawChart();
         if (indicator.type === "ATR") void ensureAtrHistory();
       });
       placement.addEventListener("change", () => { indicator.placement = placement.value; saveSettings(); drawChart(); });
@@ -608,25 +668,34 @@
       row.append(type, placement, parameters, color, remove);
       el.indicators.append(row);
     });
-    const names = {
-      SMA: "이동평균", EMA: "지수이동평균", BOLLINGER: "볼린저밴드",
-      VOLUME: "거래량", OBV: "OBV", ATR: "ATR(진행봉 포함)", RSI: "RSI", MACD: "MACD",
-    };
+    renderIndicatorSummary();
+  }
+
+  function renderIndicatorSummary() {
     el.indicatorSummary.textContent = state.indicators.length
-      ? state.indicators.map(item => names[item.type] || item.type).join(" · ")
+      ? state.indicators.map(item => `${indicatorLabel(item)} · ${indicatorPriceSourceLabel(item)}`).join(" / ")
       : "설정 없음";
+    el.indicatorSummary.title = el.indicatorSummary.textContent;
   }
 
   async function loadSources(preferred = "AUTO") {
     const payload = await request("/api/chart/sources");
     state.sources = payload.sources || [];
-    el.source.replaceChildren(new Option("자동 선택 · 여유 연결 우선", "AUTO"));
+    el.source.replaceChildren(new Option("자동 선택 · 실전 시세 우선", "AUTO"));
     state.sources.forEach(item => {
       const environment = item.target === "LIVE" ? "실전" : item.target === "PAPER" ? "모의" : item.target;
       const capacity = `${Math.floor(item.available)}/${Math.floor(item.capacity)}`;
       el.source.add(new Option(`${item.label} · ${String(item.provider).toUpperCase()} ${environment} · 여유 ${capacity}`, item.id));
     });
     el.source.value = [...el.source.options].some(option => option.value === preferred) ? preferred : "AUTO";
+  }
+
+  function selectedChartSource() {
+    if (el.source.value !== "AUTO") return el.source.value;
+    const eligible = state.sources.filter(item => !item.venues || item.venues.includes(el.venue.value));
+    // A spare mock quota does not imply a working realtime price stream.
+    return eligible.find(item => item.target === "LIVE" && item.state === "connected")?.id
+      || eligible.find(item => item.target === "LIVE")?.id || "AUTO";
   }
 
   function showSearchResults(rows) {
@@ -702,8 +771,14 @@
   }
 
   function restoreStreamState() {
-    if (state.socket?.readyState === WebSocket.OPEN) setLiveState("실시간", "live");
-    else if (state.fallbackTimer) setLiveState("REST 보완 · 10초", "fallback");
+    const fresh = state.lastStreamAt && Date.now() - state.lastStreamAt < STREAM_STALE_MS;
+    const updated = state.lastRefreshAt ? new Date(state.lastRefreshAt).toLocaleTimeString("ko-KR", { hour12: false }) : "";
+    el.live.title = [updated ? `마지막 자동 조회 ${updated}` : "실제 시세 수신을 기다리고 있습니다.", state.refreshError].filter(Boolean).join("\n");
+    if (fresh && state.refreshFailed) setLiveState("실시간 · 자동 조회 재시도", "fallback");
+    else if (fresh) setLiveState("실시간", "live");
+    else if (state.refreshFailed) setLiveState("자동 갱신 실패 · 재시도 중", "error");
+    else if (state.lastRefreshAt) setLiveState(`자동 갱신 · 10초 · ${updated}`, "fallback");
+    else if (state.fallbackTimer) setLiveState("시세 수신 대기 · 자동 갱신", "connecting");
     else setLiveState("조회됨", "idle");
   }
 
@@ -799,10 +874,12 @@
   }
 
   function applyQuote(quote) {
-    if (!quote || !state.bars.length) return;
-    state.quote = quote;
+    if (!validQuote(quote)) return false;
     const price = number(quote.price);
     const start = bucketStart(quote.market_time || quote.received_at, el.interval.value);
+    if (!Number.isFinite(start)) return false;
+    state.quote = quote;
+    if (!state.bars.length) { renderQuote(); return true; }
     const last = state.bars[state.bars.length - 1];
     const lastStart = bucketStart(last.open_time, el.interval.value);
     const followingLatest = state.viewEnd == null || state.viewEnd >= state.bars.length;
@@ -829,57 +906,169 @@
       last.complete = false;
     }
     renderQuote(); drawChart();
+    return true;
+  }
+
+  function validQuote(quote) {
+    return quote && number(quote.price) > 0 && (!quote.instrument?.code || quote.instrument.code === state.code)
+      && Number.isFinite(new Date(quote.market_time || quote.received_at).getTime());
+  }
+
+  function mergeRecentBars(rows, streamBars = new Map()) {
+    if (!rows.length) return;
+    const followingLatest = state.viewEnd == null || state.viewEnd >= state.bars.length;
+    const anchor = state.bars[Math.max(0, (state.viewEnd ?? state.bars.length) - 1)]?.open_time;
+    const crosshairTime = state.crosshair ? state.bars[state.crosshair.index]?.open_time : null;
+    const byTime = new Map(state.bars.map(row => [new Date(row.open_time).getTime(), row]));
+    for (const row of rows) {
+      const key = new Date(row.open_time).getTime();
+      if (Number.isFinite(key)) byTime.set(key, barNumbers(row));
+    }
+    // Preserve every tick's extrema during the request, including buckets that
+    // have since closed. Replaying only the last tick can lose an intrabar spike.
+    for (const [key, ticks] of streamBars) {
+      const row = byTime.get(key);
+      if (row) {
+        row.high = Math.max(row.high, ticks.high);
+        row.low = Math.min(row.low, ticks.low);
+        row.close = ticks.close;
+      }
+    }
+    state.bars = [...byTime.values()].sort((a, b) => new Date(a.open_time) - new Date(b.open_time));
+    const indexOf = time => state.bars.findIndex(row => new Date(row.open_time).getTime() === new Date(time).getTime());
+    const oldEnd = state.viewEnd;
+    state.viewEnd = followingLatest ? state.bars.length : (anchor ? indexOf(anchor) + 1 : oldEnd);
+    if (state.drag && oldEnd != null) state.drag.startEnd += state.viewEnd - oldEnd;
+    if (crosshairTime) state.crosshair.index = indexOf(crosshairTime);
   }
 
   function stopRealtime() {
     state.manualClose = true;
-    if (state.socket) { state.socket.close(); state.socket = null; }
+    const socket = state.socket;
+    state.socket = null;
+    if (socket) socket.close();
     if (state.fallbackTimer) { clearInterval(state.fallbackTimer); state.fallbackTimer = null; }
+    state.refreshInFlight = null;
+    state.lastStreamAt = 0;
+    state.lastStreamQuote = null;
+    state.lastRefreshAt = 0;
+    state.lastBarsRefreshAt = 0;
+    state.refreshFailed = false;
+    state.refreshError = "";
   }
 
-  function startFallback(generation = state.loadGeneration) {
-    if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
-    if (state.manualClose || state.fallbackTimer || !state.code || !state.source) return;
-    setLiveState("REST 보완 · 10초", "fallback");
-    const poll = async () => {
-      try {
-        const payload = await request(`/api/chart/quote?code=${encodeURIComponent(state.code)}&venue=${el.venue.value}&source=${encodeURIComponent(state.source.id)}`);
-        if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
-        applyQuote(payload.quote);
-      } catch (_) { /* the central request router will retry on the next tick */ }
+  function realtimeActive(generation) {
+    return !state.manualClose && generation === state.loadGeneration && state.loadedGeneration === generation;
+  }
+
+  async function refreshChart(generation = state.loadGeneration) {
+    if (!realtimeActive(generation) || state.refreshInFlight || !state.code || !state.source) return;
+    const token = { streamBars: new Map() };
+    state.refreshInFlight = token;
+    const startedAt = Date.now();
+    const fresh = state.lastStreamAt && startedAt - state.lastStreamAt < STREAM_STALE_MS;
+    const updateBars = !fresh || startedAt - state.lastBarsRefreshAt >= 30_000;
+    const query = new URLSearchParams({ code: state.code, venue: el.venue.value, source: state.source.id });
+    const barsQuery = new URLSearchParams(query);
+    const interval = el.interval.value;
+    const lastTime = new Date(state.bars.at(-1)?.open_time || startedAt).getTime();
+    const intervalMs = interval.endsWith("m") ? parseInt(interval, 10) * 60_000 : 86_400_000;
+    barsQuery.set("interval", interval);
+    barsQuery.set("count", String(Math.min(400, Math.max(20, Math.ceil((startedAt - lastTime) / intervalMs) + 2))));
+    restoreStreamState();
+    try {
+      const [quoteResult, barsResult] = await Promise.allSettled([
+        request(`/api/chart/quote?${query}`, 15_000),
+        updateBars ? request(`/api/chart/bars?${barsQuery}`, 15_000) : Promise.resolve(null),
+      ]);
+      if (!realtimeActive(generation) || state.refreshInFlight !== token) return;
+      const quoteOk = quoteResult.status === "fulfilled" && validQuote(quoteResult.value.quote);
+      const barsOk = barsResult.status === "fulfilled" && Array.isArray(barsResult.value?.bars);
+      // REST quotes may use receipt time, so only broker bars may create REST candles.
+      if (quoteOk && token.streamBars.size === 0) state.quote = quoteResult.value.quote;
+      if (barsOk) {
+        mergeRecentBars(barsResult.value.bars, token.streamBars);
+        state.lastBarsRefreshAt = Date.now();
+      }
+      state.refreshFailed = !quoteOk || (updateBars && !barsOk);
+      const describeFailure = (label, result) => `${label}: ${result.status === "rejected" ? (result.reason?.message || "조회 실패") : "유효한 데이터가 없습니다."}`;
+      state.refreshError = [
+        !quoteOk ? describeFailure("현재가", quoteResult) : "",
+        updateBars && !barsOk ? describeFailure("봉", barsResult) : "",
+      ].filter(Boolean).join(" / ");
+      if (quoteOk || barsOk) state.lastRefreshAt = Date.now();
+      el.empty.hidden = Boolean(state.bars.length);
+      renderQuote(); drawChart(); restoreStreamState();
+    } finally {
+      if (state.refreshInFlight === token) state.refreshInFlight = null;
+    }
+  }
+
+  function connectStream(generation) {
+    if (!realtimeActive(generation) || !state.source?.realtime) return;
+    const previous = state.socket;
+    state.socket = null;
+    if (previous) previous.close();
+    state.lastConnectAt = Date.now();
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${protocol}//${location.host}/api/chart/stream?code=${encodeURIComponent(state.code)}&venue=${el.venue.value}&source=${encodeURIComponent(state.source.id)}`;
+    let socket;
+    try { socket = new WebSocket(url); }
+    catch (_) { restoreStreamState(); return; }
+    state.socket = socket;
+    socket.onmessage = event => {
+      if (!realtimeActive(generation) || state.socket !== socket) return;
+      let payload;
+      try { payload = JSON.parse(event.data); } catch (_) { return; }
+      if (payload.event_type === "quote" && validQuote(payload.quote)) {
+        const quote = payload.quote;
+        const time = new Date(quote.market_time || quote.received_at).getTime();
+        const previousTime = new Date(state.lastStreamQuote?.market_time || 0).getTime();
+        if (time < previousTime || quote.stale || quote.delayed || Date.now() - time > STREAM_STALE_MS || time > Date.now() + 5_000) return;
+        if (applyQuote(quote)) {
+          state.lastStreamAt = Date.now();
+          state.lastStreamQuote = quote;
+          const streamBars = state.refreshInFlight?.streamBars;
+          if (streamBars) {
+            const key = bucketStart(quote.market_time || quote.received_at, el.interval.value);
+            const price = number(quote.price);
+            const ticks = streamBars.get(key) || { high: price, low: price };
+            streamBars.set(key, { high: Math.max(ticks.high, price), low: Math.min(ticks.low, price), close: price });
+          }
+          restoreStreamState();
+        }
+      } else if (payload.event_type === "error") {
+        state.lastStreamAt = 0;
+        socket.close();
+      } else if (payload.event_type === "subscribed") {
+        // Subscription registration is not proof of receiving broker prices.
+        restoreStreamState();
+      }
     };
-    state.fallbackTimer = setInterval(poll, 10_000);
+    socket.onerror = () => {
+      if (realtimeActive(generation) && state.socket === socket) socket.close();
+    };
+    socket.onclose = () => {
+      if (state.socket !== socket) return;
+      state.socket = null;
+      state.lastStreamAt = 0;
+      if (realtimeActive(generation)) { restoreStreamState(); void refreshChart(generation); }
+    };
   }
 
   function startRealtime(generation = state.loadGeneration) {
     if (generation !== state.loadGeneration || state.loadedGeneration !== generation) return;
     stopRealtime();
     state.manualClose = false;
-    if (!state.source?.realtime) { startFallback(generation); return; }
-    setLiveState("실시간 연결 중", "connecting");
-    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${protocol}//${location.host}/api/chart/stream?code=${encodeURIComponent(state.code)}&venue=${el.venue.value}&source=${encodeURIComponent(state.source.id)}`;
-    const socket = new WebSocket(url);
-    state.socket = socket;
-    socket.onmessage = event => {
-      if (generation !== state.loadGeneration || state.loadedGeneration !== generation || state.socket !== socket) return;
-      const payload = JSON.parse(event.data);
-      if (payload.event_type === "subscribed") setLiveState("실시간", "live");
-      else if (payload.event_type === "quote") applyQuote(payload.quote);
-      else if (payload.event_type === "error") {
-        setLiveState("실시간 연결 실패", "error");
-        socket.close();
-      }
-    };
-    socket.onerror = () => {
-      if (generation === state.loadGeneration && state.loadedGeneration === generation && state.socket === socket) {
-        setLiveState("실시간 연결 실패", "error");
-      }
-    };
-    socket.onclose = () => {
-      if (state.socket === socket) state.socket = null;
-      if (!state.manualClose && generation === state.loadGeneration) startFallback(generation);
-    };
+    state.lastBarsRefreshAt = Date.now();
+    state.fallbackTimer = setInterval(() => {
+      if (!realtimeActive(generation)) return;
+      restoreStreamState();
+      void refreshChart(generation);
+      if (!state.socket && Date.now() - state.lastConnectAt >= 30_000) connectStream(generation);
+    }, REFRESH_INTERVAL_MS);
+    connectStream(generation);
+    restoreStreamState();
   }
 
   async function loadChart() {
@@ -897,7 +1086,7 @@
     saveSettings();
     try {
       const initialCount = Math.min(400, Math.max(180, requiredAtrHistory()));
-      const query = new URLSearchParams({ code: state.code, interval: el.interval.value, venue: el.venue.value, source: el.source.value, count: String(initialCount) });
+      const query = new URLSearchParams({ code: state.code, interval: el.interval.value, venue: el.venue.value, source: selectedChartSource(), count: String(initialCount) });
       const payload = await request(`/api/chart/data?${query}`);
       if (generation !== state.loadGeneration) return;
       state.source = payload.source;
@@ -974,6 +1163,13 @@
       indicatorModal: $("#chart-indicator-modal"), indicatorSummary: $("#chart-indicator-summary"),
     });
     if (!el.modal) return;
+    const resumeChart = () => {
+      if (document.hidden || el.modal.hidden || !realtimeActive(state.loadGeneration)) return;
+      void refreshChart();
+      if (!state.socket) connectStream(state.loadGeneration);
+    };
+    document.addEventListener("visibilitychange", resumeChart);
+    window.addEventListener("online", resumeChart);
     const restoredSource = restoreSettings();
     renderIndicators();
     $("#chart-close").addEventListener("click", close);
@@ -990,7 +1186,7 @@
     el.indicatorModal.addEventListener("click", event => { if (event.target === el.indicatorModal) closeIndicatorSettings(); });
     $("#chart-add-indicator").addEventListener("click", () => {
       if (state.indicators.length >= 8) return;
-      state.indicators.push({ id: crypto.randomUUID(), type: "SMA", placement: "SERIES", period: 20, color: palette[state.indicators.length % palette.length] });
+      state.indicators.push(normalizeIndicator({ id: crypto.randomUUID(), type: "SMA", placement: "SERIES", period: 20, priceSource: "RAW", color: palette[state.indicators.length % palette.length] }));
       renderIndicators(); saveSettings(); drawChart();
     });
     el.search.addEventListener("input", () => {
@@ -1019,7 +1215,7 @@
       saveSettings();
       if (state.code) loadChart();
     });
-    el.type.addEventListener("change", () => { saveSettings(); drawChart(); });
+    el.type.addEventListener("change", () => { saveSettings(); renderIndicatorSummary(); drawChart(); });
     el.canvas.addEventListener("pointerdown", event => {
       if (!state.geometry || event.button !== 0) return;
       state.drag = {

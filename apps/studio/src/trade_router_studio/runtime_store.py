@@ -17,6 +17,13 @@ from trade_router import OrderStatus
 SEOUL = ZoneInfo("Asia/Seoul")
 
 
+def _execution_timestamp(value: object) -> float:
+    timestamp = datetime.fromisoformat(str(value))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=SEOUL)
+    return timestamp.timestamp()
+
+
 class RuntimeStoreRestartRequired(RuntimeError):
     """The runtime journal must be reopened by the supervising launcher."""
 
@@ -821,10 +828,10 @@ class RuntimeStore:
             normalized = [OrderStatus(status).value for status in statuses]
             clauses.append("status IN (" + ",".join("?" for _ in normalized) + ")")
             values.extend(normalized)
-        query = "SELECT * FROM order_ledger"
+        query = "SELECT rowid AS accounting_sequence, * FROM order_ledger"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC LIMIT ?"
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         values.append(min(max(limit, 1), 1_000))
         rows = self._fetchall(query, values)
         return [self._order_row(row) for row in rows]
@@ -848,44 +855,155 @@ class RuntimeStore:
             limit=1_000,
         )
 
+    def strategy_accounting_orders(
+        self,
+        strategy_id: str,
+        *,
+        account_alias: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Project fills onto their owners without transferring external inventory.
+
+        An explicit ACCOUNT sell consumes the submitting strategy's lots first,
+        then other strategy lots in acquisition order. Any remaining quantity
+        belongs to untracked account inventory and has no strategy cost basis.
+        Replaying individual fills in execution order preserves both ownership
+        and price attribution across partial fills and restarts.
+        Broker orders stay attributed to their submitting strategy in the ledger.
+        """
+        clauses = ["CAST(filled_quantity AS REAL) > 0"]
+        values: list[Any] = []
+        if account_alias is not None:
+            clauses.append("account_alias = ?")
+            values.append(account_alias)
+        rows = self._fetchall(
+            "SELECT rowid AS accounting_sequence, * FROM order_ledger WHERE "
+            + " AND ".join(clauses) + " ORDER BY rowid ASC", values,
+        )
+        fill_query = "SELECT f.rowid AS fill_sequence, f.* FROM order_fills f JOIN order_ledger o ON o.id = f.order_id"
+        fill_values: list[Any] = []
+        if account_alias is not None:
+            fill_query += " WHERE o.account_alias = ?"
+            fill_values.append(account_alias)
+        fill_rows = self._fetchall(fill_query, fill_values)
+        fills_by_order: dict[str, list[sqlite3.Row]] = {}
+        for fill in fill_rows:
+            fills_by_order.setdefault(str(fill["order_id"]), []).append(fill)
+        events: list[dict[str, Any]] = []
+        for raw in rows:
+            original = self._order_row(raw)
+            cumulative = Decimal(str(original["filled_quantity"] or "0"))
+            remaining = cumulative
+            covered_amount = Decimal("0")
+            covered_commission = Decimal("0")
+            covered_tax = Decimal("0")
+            order_fills = sorted(
+                fills_by_order.get(str(original["id"]), []),
+                key=lambda fill: (_execution_timestamp(fill["filled_at"]), int(fill["fill_sequence"])),
+            )
+            for fill in order_fills:
+                quantity = min(remaining, Decimal(str(fill["quantity"])))
+                if quantity <= 0:
+                    continue
+                ratio = quantity / Decimal(str(fill["quantity"]))
+                commission = Decimal(str(fill["commission"])) * ratio
+                tax = Decimal(str(fill["tax"])) * ratio
+                events.append({
+                    **original,
+                    "filled_quantity": str(quantity),
+                    "average_fill_price": str(fill["price"]),
+                    "commission": str(commission), "tax": str(tax),
+                    "costs_complete": bool(fill["costs_complete"]),
+                    "accounting_at": str(fill["filled_at"]),
+                    "accounting_sequence": int(fill["fill_sequence"]),
+                })
+                remaining -= quantity
+                covered_amount += quantity * Decimal(str(fill["price"]))
+                covered_commission += commission
+                covered_tax += tax
+            if remaining > 0:
+                # Older ledgers may have only cumulative snapshots. Preserve
+                # their known quantity without applying it at order-submission
+                # time, which can precede another strategy's intervening sale.
+                amount = cumulative * Decimal(str(original.get("average_fill_price") or "0")) - covered_amount
+                events.append({
+                    **original,
+                    "filled_quantity": str(remaining),
+                    "average_fill_price": str(amount / remaining) if amount > 0 else None,
+                    "commission": str(max(Decimal("0"), Decimal(str(original.get("commission") or "0")) - covered_commission)),
+                    "tax": str(max(Decimal("0"), Decimal(str(original.get("tax") or "0")) - covered_tax)),
+                    "accounting_at": str(original["updated_at"]),
+                })
+        events.sort(key=lambda row: (_execution_timestamp(row["accounting_at"]), int(row["accounting_sequence"])))
+        lots: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        attributed: list[dict[str, Any]] = []
+        for sequence, row in enumerate(events):
+            row["accounting_sequence"] = sequence
+            request = row["request"]
+            code = str(request.get("code") or "").strip()
+            if not code:
+                continue
+            owner = str(row["strategy_id"])
+            quantity = Decimal(str(row["filled_quantity"] or "0"))
+            key = (str(row["account_alias"]), code)
+            inventory = lots.setdefault(key, [])
+            side = str(request.get("side") or "").upper()
+            if side == "BUY":
+                inventory.append({"owner": owner, "quantity": quantity})
+                if owner == strategy_id:
+                    attributed.append(row)
+                continue
+            if side != "SELL":
+                continue
+            candidates = [lot for lot in inventory if lot["owner"] == owner]
+            if request.get("sell_position_scope") == "ACCOUNT":
+                candidates += [lot for lot in inventory if lot["owner"] != owner]
+            remaining = quantity
+            allocations: dict[str, Decimal] = {}
+            for lot in candidates:
+                consumed = min(remaining, lot["quantity"])
+                if consumed <= 0:
+                    continue
+                lot["quantity"] -= consumed
+                remaining -= consumed
+                lot_owner = lot["owner"]
+                allocations[lot_owner] = allocations.get(lot_owner, Decimal("0")) + consumed
+                if remaining <= 0:
+                    break
+            lots[key] = [lot for lot in inventory if lot["quantity"] > 0]
+            allocated = allocations.get(strategy_id, Decimal("0"))
+            if allocated <= 0:
+                continue
+            ratio = allocated / quantity
+            projected = {
+                **row,
+                "request": {**request, "quantity": str(allocated)},
+                "filled_quantity": str(allocated),
+                "commission": str(Decimal(str(row.get("commission") or "0")) * ratio),
+                "tax": str(Decimal(str(row.get("tax") or "0")) * ratio),
+                "execution_strategy_id": owner,
+                "attributed_strategy_id": strategy_id,
+                "source_filled_quantity": str(quantity),
+            }
+            if owner != strategy_id:
+                projected["message"] = f"계좌 잔고 대상 전략({owner})의 매도로 이 전략 보유분 {allocated}주를 정리했습니다."
+            attributed.append(projected)
+        return list(reversed(attributed))
+
     def strategy_position_quantities(
         self,
         strategy_id: str,
         *,
         account_alias: str | None = None,
     ) -> dict[str, Decimal]:
-        """Derive strategy-owned quantities from confirmed fills in the ledger."""
-
-        clauses = ["strategy_id = ?", "CAST(filled_quantity AS REAL) > 0"]
-        values: list[Any] = [strategy_id]
-        if account_alias is not None:
-            clauses.append("account_alias = ?")
-            values.append(account_alias)
-        query = (
-            "SELECT request_json, filled_quantity FROM order_ledger WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY created_at ASC, id ASC"
-        )
-        rows = self._fetchall(query, values)
+        """Derive remaining owned quantities, including explicit account sells."""
         quantities: dict[str, Decimal] = {}
-        for row in rows:
-            request = json.loads(row["request_json"])
-            code = str(request.get("code") or "").strip()
-            if not code:
-                continue
-            filled = Decimal(str(row["filled_quantity"] or "0"))
-            if str(request.get("side") or "").upper() == "BUY":
-                quantities[code] = quantities.get(code, Decimal("0")) + filled
-            elif str(request.get("side") or "").upper() == "SELL":
-                quantities[code] = max(
-                    Decimal("0"),
-                    quantities.get(code, Decimal("0")) - filled,
-                )
-        return {
-            code: quantity
-            for code, quantity in quantities.items()
-            if quantity > 0
-        }
+        for row in reversed(self.strategy_accounting_orders(strategy_id, account_alias=account_alias)):
+            request = row["request"]
+            code = str(request["code"])
+            quantity = Decimal(str(row["filled_quantity"]))
+            change = quantity if request["side"] == "BUY" else -quantity
+            quantities[code] = quantities.get(code, Decimal("0")) + change
+        return {code: quantity for code, quantity in quantities.items() if quantity > 0}
 
     def order(self, order_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -1161,6 +1279,7 @@ class RuntimeStore:
     @staticmethod
     def _order_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
+            **({"accounting_sequence": row["accounting_sequence"]} if "accounting_sequence" in row.keys() else {}),
             "id": row["id"],
             "strategy_id": row["strategy_id"],
             "account_alias": row["account_alias"],
