@@ -66,7 +66,10 @@ def fixture_input():
     events = [{"source": SECRETS[5], "occurred_at": NOW.isoformat(),
                "event_type": "order.rejected", "message": message,
                "details": {"order_id": SECRETS[7], "error_code": "ORDER_REJECTED", "secrets": SECRETS}}]
-    store = SimpleNamespace(orders=lambda limit: orders, events=lambda limit: events, unresolved_orders=lambda: [])
+    store = SimpleNamespace(orders=lambda limit: orders,
+                            events=lambda limit, event_types=None: [item for item in events
+                                if event_types is None or item["event_type"] in event_types],
+                            unresolved_orders=lambda: [])
     arguments = dict(version="0.1.70", manager=manager, store=store, now=NOW,
                      permissions=[{"scope_type": "account", "scope_id": SECRETS[4], "armed": True, "reconciled": True},
                                   {"scope_type": "strategy", "scope_id": SECRETS[6], "armed": True}],
@@ -137,6 +140,7 @@ def test_malformed_block_source_is_not_attached_or_executed():
 
 
 @pytest.mark.parametrize("message,reason", [
+    ("전략 프로세스가 종료되어 일정·실시간 구독·세션을 정리했습니다.", "PROCESS_EXITED"),
     ("순수익률 조건 보류: 계좌의 매수·매도 수수료율과 매도 세율을 모두 설정해야 합니다.", "COST_RATES_MISSING"),
     ("순수익률 조건 보류: 계좌 수수료율·세율에 잘못된 값이 있습니다.", "COST_RATES_INVALID"),
     ("계좌 비용 설정 확인 · 순수익률 조건 판단을 재개합니다.", "COST_RATES_READY"),

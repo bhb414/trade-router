@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime
 from decimal import Decimal
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -794,16 +795,23 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     instrument_catalog = InstrumentCatalog(workspace.data / "instrument-catalog.json")
 
     async def handle_strategy_exit(strategy_name: str) -> None:
+        # Keep a bounded, allowlisted failure summary after the in-memory logs vanish.
+        if runtime_store is not None:
+            try:
+                await asyncio.to_thread(
+                    runtime_store.record,
+                    source=strategy_name,
+                    event_type="strategy.process_exit",
+                    message="전략 프로세스가 종료되었습니다.",
+                    details=manager.exit_diagnostics(strategy_name),
+                )
+            except Exception:
+                # Diagnostics are best effort; failure must not prevent cleanup.
+                logging.getLogger(__name__).warning("전략 종료 진단 기록을 저장하지 못했습니다.")
         await scheduler.unregister(strategy_name)
         await realtime.unsubscribe_strategy(strategy_name)
         await strategy_events.unregister(strategy_name)
         pending_strategy_events.pop(strategy_name, None)
-        if runtime_store is not None:
-            runtime_store.record(
-                source=strategy_name,
-                event_type="strategy.process_exit",
-                message="전략 프로세스가 종료되어 일정·실시간 구독·세션을 정리했습니다.",
-            )
 
     manager = StrategyManager(
         workspace,

@@ -180,17 +180,7 @@ def test_explicit_tree_remains_authoritative_even_with_legacy_ids() -> None:
     assert restored.children[0].condition.value == Decimal("999")
 
 
-def test_empty_sell_action_tree_and_nested_empty_group_are_rejected() -> None:
-    empty_sell = _logic(
-        "sell-root",
-        "ALL",
-        action=_action("sell-all", "SELL", "MARKET"),
-    )
-    with pytest.raises(ValidationError):
-        sell_settings_for([
-            sell_flow(sell_condition_groups=[], sell_rule_tree=empty_sell),
-        ])
-
+def test_nested_empty_buy_group_is_rejected() -> None:
     nested_empty = _logic(
         "buy-root",
         "ALL",

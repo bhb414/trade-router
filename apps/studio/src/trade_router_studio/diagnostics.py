@@ -13,11 +13,13 @@ from zoneinfo import ZoneInfo
 from trade_router import OrderStatus, RouterErrorCode
 
 from .block_packages import block_package_from_source
+from .process_diagnostics import safe_exit_details
 
 SEOUL = ZoneInfo("Asia/Seoul")
 MAX_STRATEGIES = 50
 MAX_HISTORY = 1000
 MAX_LOGS = 500
+MAX_EXITS = 200
 ERROR_CODES = {item.value for item in RouterErrorCode}
 METRICS = frozenset({
     "open", "high", "low", "close", "volume", "heikin_open", "heikin_high",
@@ -41,6 +43,8 @@ EVENT_TYPES = {
 }
 # Match diagnostic meaning, not text to retain. No substring from a message is exported.
 REASONS = (
+    ("사용자 요청으로 전략을 중지", "USER_STOPPED"),
+    ("전략 프로세스가 종료", "PROCESS_EXITED"),
     ("계좌의 매수·매도 수수료율과 매도 세율을 모두 설정", "COST_RATES_MISSING"),
     ("계좌 수수료율·세율에 잘못된 값", "COST_RATES_INVALID"),
     ("비용 설정 누락", "COST_RATES_MISSING"),
@@ -67,8 +71,6 @@ REASONS = (
     ("시세가 오래", "STALE_MARKET_DATA"),
     ("실시간 구독", "REALTIME_SUBSCRIPTION"),
     ("실시간 현재가 감시", "LIVE_EXIT_WATCHDOG_READY"),
-    ("사용자 요청으로 전략을 중지", "USER_STOPPED"),
-    ("전략 프로세스가 종료", "PROCESS_EXITED"),
     ("Traceback", "SCRIPT_EXCEPTION"),
 )
 
@@ -344,15 +346,25 @@ def build_diagnostics(*, version, manager, store, permissions, accounts,
                            "route": _enum(request.get("route"), {"KRX", "NXT", "SOR", "AUTO"}),
                            **_reason(item.get("message"))})
     raw_events = store.events(limit=MAX_HISTORY)
-    event_rows = []
-    for item in recent(raw_events, "occurred_at"):
+
+    def project_event(item):
         details = item.get("details") or {}
-        event_rows.append({"at": _timestamp(item.get("occurred_at")),
+        projected = {"at": _timestamp(item.get("occurred_at")),
                            "strategy": None if item.get("source") == "system" else ids.get("strategy", item.get("source")),
                            "event": _enum(item.get("event_type"), EVENT_TYPES),
                            "duration_ms": _number(details.get("duration_ms"), 0, 3600000),
                            "order": ids.get("order", details.get("order_id")),
-                           **_reason(item.get("message"), details)})
+                           **_reason(item.get("message"), details)}
+        if item.get("event_type") == "strategy.process_exit":
+            summary = safe_exit_details(details)
+            projected.update(summary)
+            projected["reason"] = summary["exit_reason"]
+        return projected
+
+    event_rows = [project_event(item) for item in recent(raw_events, "occurred_at")]
+    # Busy quote polling must not crowd the actual stop reason out of an export.
+    raw_exits = store.events(limit=MAX_EXITS, event_types=("strategy.process_exit",))
+    exit_rows = [project_event(item) for item in recent(raw_exits, "occurred_at")]
     data = {
         "schema_version": 1, "app_version": version,
         "exported_at": now.isoformat(),
@@ -367,11 +379,13 @@ def build_diagnostics(*, version, manager, store, permissions, accounts,
                                            "subscriptions": _number(item.get("subscriptions"), 0, 10000),
                                            "last_received_at": _timestamp(item.get("last_received_at"))}
                                           for item in realtime_states[:100]]},
-        "history": {"orders": order_rows, "events": event_rows, "strategy_logs": logs},
+        "history": {"orders": order_rows, "events": event_rows, "strategy_logs": logs,
+                    "strategy_exits": exit_rows},
         "coverage": {"strategy_limit": MAX_STRATEGIES, "strategy_limit_reached": len(rows) > MAX_STRATEGIES,
                      "unresolved_orders": {"limit": MAX_HISTORY, "read": len(unresolved), "limit_reached": len(unresolved) >= MAX_HISTORY},
                      "orders": {"limit": MAX_HISTORY, "read": len(raw_orders), "exported": len(order_rows), "limit_reached": len(raw_orders) >= MAX_HISTORY},
                      "events": {"limit": MAX_HISTORY, "read": len(raw_events), "exported": len(event_rows), "limit_reached": len(raw_events) >= MAX_HISTORY},
+                     "strategy_exits": {"limit": MAX_EXITS, "read": len(raw_exits), "exported": len(exit_rows), "limit_reached": len(raw_exits) >= MAX_EXITS},
                      "strategy_logs": history_meta,
                      "raw_messages_excluded": True,
                      "unknown_reason_count": sum(item["reason"] == "UNCLASSIFIED" for item in [*logs, *event_rows, *order_rows])},
@@ -380,7 +394,8 @@ def build_diagnostics(*, version, manager, store, permissions, accounts,
 
 diagnostics.json은 허용한 항목만 추출한 자료입니다. 원본 로그/DB/설정/전략 소스는 포함하지 않습니다.
 포함: 앱 버전, 시각, 익명 ID, 현재 실행·주문 허용 상태, 저장된 매도 시간·조건구조·수익률 기준,
-주문 상태와 시각, 고정 오류 분류, 위험 한도 설정 여부, 실시간 구독수와 연결 수신 시각.
+주문 상태와 시각, 고정 오류 분류, 위험 한도 설정 여부, 실시간 구독수와 연결 수신 시각,
+프로세스 종료 코드·사용자 중지 여부·허용된 예외 종류·Windows 오류 번호·고정 실패 영역.
 제외: API 키·토큰·계좌번호·HTS ID·연결주소·사용자 경로·별칭/이름·종목명/코드,
 보유수량·금액·자산·실주문번호·원문 오류/로그·전략 소스. 숫자 조건 중 수익률 기준 외 직접 값도 제외합니다.
 
@@ -388,6 +403,7 @@ current_snapshot은 내보낸 시점의 현재 상태이며, 사고 당시 상�
 saved_sell_settings는 저장된 설정이며 실행 당시 설정과 다를 수 있습니다.
 history는 선택한 시간 안에서 보관된 최근 기록만 포함합니다. coverage에서 제한과 누락을 확인하세요.
 전략 로그는 메모리에 보관되어 프로그램 재시작 후 이전 로그가 없을 수 있습니다.
+strategy_exits는 DB에 남은 최근 종료 기록이며 재시작 후에도 포함합니다. 이전 버전에서 누락된 원인은 복원할 수 없습니다.
 UNCLASSIFIED는 원문을 안전하게 제외하여 분류하지 못한 기록이며 오류가 없다는 뜻이 아닙니다.
 realtime.last_received_at은 연결 전체의 마지막 수신 시각이며 특정 종목의 최신 시세를 보장하지 않습니다.
 아무 곳에도 자동 전송하지 않습니다. 내용을 확인한 뒤 이 ZIP만 전달하세요.

@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .paths import WorkspacePaths
+from .process_diagnostics import failure_line, safe_exit_details
 from .sessions import StrategySessionRegistry
 
 
@@ -58,6 +59,8 @@ class StrategyProcess:
     stop_requested: bool = False
     runtime_managed: bool = False
     next_log_sequence: int = 0
+    failure_details: dict[str, object] = field(default_factory=dict)
+    traceback_seen: bool = False
 
     @property
     def running(self) -> bool:
@@ -176,10 +179,16 @@ class StrategyManager:
             state = self._states.setdefault(name, StrategyProcess(name=name))
             if state.running:
                 return self._describe(name, state)
+            if state.reader_task is not None and not state.reader_task.done():
+                # The child can exit before its asynchronous cleanup has finished.
+                # Do not let that cleanup revoke the next run's sessions/schedules.
+                await state.reader_task
             self._append_log(state, "system", "전략을 시작했습니다.")
             state.started_at = datetime.now().astimezone()
             state.stopped_at = None
             state.exit_code = None
+            state.failure_details.clear()
+            state.traceback_seen = False
             state.stop_requested = False
             source = path.read_text(encoding="utf-8")
             state.runtime_managed = _uses_strategy_runtime(source)
@@ -320,6 +329,15 @@ class StrategyManager:
             "exit_code": state.exit_code if state else None,
         }
 
+    def exit_diagnostics(self, name: str) -> dict[str, object]:
+        """Safe summary for the durable process-exit event, before cleanup."""
+        state = self._states.get(name)
+        if state is None:
+            return safe_exit_details({})
+        failure = state.failure_details if state.exit_code and not state.stop_requested else {}
+        return safe_exit_details({**failure, "exit_code": state.exit_code,
+                                  "stop_requested": state.stop_requested})
+
     async def _read_output(self, state: StrategyProcess) -> None:
         assert state.process is not None
         assert state.process.stdout is not None
@@ -328,11 +346,15 @@ class StrategyManager:
             level, message = self._classify_output(decoded)
             self._append_log(state, level, message)
         state.exit_code = await state.process.wait()
+        state.stopped_at = datetime.now().astimezone()
         if self._sessions is not None:
             self._sessions.revoke_strategy(state.name)
         if self._on_exit is not None:
-            await self._on_exit(state.name)
-        state.stopped_at = datetime.now().astimezone()
+            try:
+                await self._on_exit(state.name)
+            except Exception:
+                # Reporting/cleanup failure must not hide the actual process result.
+                self._append_log(state, "warning", "전략 종료 기록 또는 연결 정리를 완료하지 못했습니다.")
         if state.stop_requested:
             self._append_log(state, "success", "사용자 요청으로 전략을 중지했습니다.")
         else:
@@ -347,6 +369,16 @@ class StrategyManager:
     def _append_log(state: StrategyProcess, level: str, message: str) -> None:
         if not message:
             return
+        if message.startswith("Traceback "):
+            # A new failure can use an exception class outside the allowlist.
+            # Do not misreport a previously caught traceback as its cause.
+            state.failure_details.clear()
+            state.traceback_seen = True
+        elif message.startswith('  File "'):
+            state.traceback_seen = True
+        if state.traceback_seen and (failure := failure_line(message)) is not None:
+            # A later exception must not inherit a caught error's Windows code.
+            state.failure_details = failure
         state.next_log_sequence += 1
         state.logs.append(
             StrategyLogEntry(

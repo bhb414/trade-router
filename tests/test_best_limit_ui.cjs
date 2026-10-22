@@ -91,7 +91,9 @@ test("new actions inherit BEST_LIMIT and composer cards name it correctly after 
     context.collectComposerRuleDefinitions(definitions, kind, null, plain(root));
     const actionCard = definitions.find(node => node.ruleActionOwner);
     assert.equal(actionCard.meta, "최유리지정가");
-    assert.deepEqual(plain(actionCard.summary), ["최유리지정가 주문"]);
+    assert.deepEqual(plain(actionCard.summary), kind === "sell"
+      ? ["최유리지정가 주문", "작동 시간 내 조건 없이 매도"]
+      : ["최유리지정가 주문"]);
     assert.equal(actionCard.ruleActionOwner.order_type, "BEST_LIMIT");
   }
 });

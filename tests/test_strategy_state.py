@@ -13,6 +13,7 @@ import pytest
 from trade_router import Strategy
 from trade_router_studio import strategy_worker
 from trade_router_studio.strategy_worker import StrategyState, _run_events
+from trade_router_studio.file_io import snapshot_backup_path
 
 
 class Log:
@@ -361,3 +362,119 @@ def test_worker_flushes_state_even_when_startup_fails(tmp_path, monkeypatch):
     assert len(closed) == 1
     assert closed[0]._closed
     assert payload(closed[0]._path)["pending_buy_submissions"] == {"on_start": 1}
+
+
+@pytest.mark.parametrize("error", [1176, 1177])
+def test_partial_main_replacement_recovers_acknowledged_state_not_stale_journal(tmp_path, monkeypatch, error):
+    state = make_state(tmp_path, monkeypatch)
+    state.set("strategy_positions", {"sold-stock": 10})
+    stale_journal = state._path.read_bytes()
+    state.set("strategy_positions", {})
+    acknowledged = state._path.read_bytes()
+    state._pending_path.write_bytes(stale_journal)
+    real_replace = strategy_worker.replace_snapshot
+
+    def partial_replace(source, target):
+        if target == state._path:
+            if error == 1177:
+                os.replace(target, snapshot_backup_path(target))
+            raise OSError(f"native partial replacement {error}")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(strategy_worker, "replace_snapshot", partial_replace)
+    with pytest.raises(OSError, match="native partial replacement"):
+        state.set("strategy_positions", {"unacknowledged": 1})
+    assert state.get("strategy_positions") == {}
+    assert list(state._path.parent.glob("*.tmp")), "failed replacement must preserve its attempted snapshot"
+    state.close()
+    survivor = state._path if state._path.exists() else snapshot_backup_path(state._path)
+    assert survivor.read_bytes() == acknowledged
+    monkeypatch.setattr(strategy_worker, "replace_snapshot", real_replace)
+    recovered = make_state(tmp_path, monkeypatch)
+    try:
+        assert recovered.get("strategy_positions") == {}
+        assert payload(recovered._path)["strategy_positions"] == {}
+        assert not recovered._pending_path.exists()
+    finally:
+        recovered.close()
+
+
+@pytest.mark.parametrize("error", [1176, 1177])
+def test_partial_pending_replacement_recovers_latest_acknowledged_journal(tmp_path, monkeypatch, error):
+    state = make_state(tmp_path, monkeypatch)
+    state.set("pending_buy_submissions", {})
+    real_replace = strategy_worker.replace_snapshot
+    # Keep this failure injection deterministic; background recovery has its
+    # own crash/race and live-lane tests below and above.
+    monkeypatch.setattr(state, "_start_writer_locked", lambda: None)
+    locked = deny_main_replace(monkeypatch, state)
+    state.set("pending_buy_submissions", {"already-submitted": 1})
+    acknowledged = state._pending_path.read_bytes()
+
+    def partial_replace(source, target):
+        if target == state._path:
+            raise PermissionError("locked main")
+        if target == state._pending_path:
+            if error == 1177:
+                os.replace(target, snapshot_backup_path(target))
+            raise OSError(f"native partial replacement {error}")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(strategy_worker, "replace_snapshot", partial_replace)
+    with pytest.raises(OSError, match="native partial replacement"):
+        state.set("pending_buy_submissions", {"unacknowledged": 2})
+    assert state.get("pending_buy_submissions") == {"already-submitted": 1}
+    state.close()
+    survivor = state._pending_path if state._pending_path.exists() else snapshot_backup_path(state._pending_path)
+    assert survivor.read_bytes() == acknowledged
+    locked.clear()
+    monkeypatch.setattr(strategy_worker, "replace_snapshot", real_replace)
+    recovered = make_state(tmp_path, monkeypatch)
+    try:
+        assert recovered.get("pending_buy_submissions") == {"already-submitted": 1}
+        assert payload(recovered._path)["pending_buy_submissions"] == {"already-submitted": 1}
+    finally:
+        recovered.close()
+
+
+def test_crash_during_promotion_recovers_pending_after_main_renamed(tmp_path, monkeypatch):
+    state = make_state(tmp_path, monkeypatch)
+    state.set("value", 1)
+    locked = deny_main_replace(monkeypatch, state)
+    state.set("value", 2)
+    state.close()
+    os.replace(state._path, snapshot_backup_path(state._path))
+    locked.clear()
+    recovered = make_state(tmp_path, monkeypatch)
+    try:
+        assert recovered.get("value") == 2
+        assert payload(recovered._path)["value"] == 2
+    finally:
+        recovered.close()
+
+
+def test_missing_legacy_main_with_backup_is_never_empty_new_state(tmp_path, monkeypatch):
+    state = make_state(tmp_path, monkeypatch)
+    state.close()
+    snapshot_backup_path(state._path).write_text('{"pending_buy_submissions":{"legacy":1}}', encoding="utf-8")
+    recovered = make_state(tmp_path, monkeypatch)
+    try:
+        assert recovered.get("pending_buy_submissions") == {"legacy": 1}
+        assert payload(recovered._path)["pending_buy_submissions"] == {"legacy": 1}
+        assert recovered._revision == 1
+    finally:
+        recovered.close()
+
+
+def test_unreadable_backup_fails_closed_instead_of_loading_older_pending(tmp_path, monkeypatch):
+    state = make_state(tmp_path, monkeypatch)
+    state.set("value", 1)
+    state._pending_path.write_bytes(state._path.read_bytes())
+    state.close()
+    state._path.unlink()
+    backup = snapshot_backup_path(state._path)
+    backup.write_text("broken latest acknowledged backup", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="복구 기록"):
+        make_state(tmp_path, monkeypatch)
+    assert not state._path.exists()
+    assert backup.read_text(encoding="utf-8") == "broken latest acknowledged backup"

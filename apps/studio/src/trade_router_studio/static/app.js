@@ -1689,7 +1689,7 @@ function blockSellFlowFields(flow) {
       return {
         id: `sell-flow:${flow.id}:${settingKey}`, flowKind: "sell", flowId: flow.id,
         settingKey, sourceName,
-        label: ({ name: "흐름 이름", target_mode: "매도 대상 방식", buy_flow_ids: "연결할 매수 흐름 · 조건", operating_start_time: "작동 시작", operating_end_time: "작동 종료", sell_scan_seconds: "봉 조건 확인 간격(초)" })[settingKey] || label,
+        label: ({ name: "흐름 이름", target_mode: "매도 대상 방식", buy_flow_ids: "연결할 매수 흐름 · 조건", operating_start_time: "작동 시작", operating_end_time: "작동 종료", sell_scan_seconds: "매도 확인 간격(초)" })[settingKey] || label,
         category, type: settingKey === "buy_flow_ids" ? "flow_ids" : settingKey === "buy_node_refs" ? "node_refs" : BLOCK_PACKAGE_FIELD_TYPES[settingKey] || "string", value: flow[settingKey],
       };
     });
@@ -1879,8 +1879,8 @@ function addBlockSellFlow() {
     target_mode: "BUY_FLOWS", buy_flow_ids: [], buy_node_refs: [],
     sell_scan_seconds: previous?.sell_scan_seconds || settings.buy_scan_seconds || 30,
     operating_start_time: "08:00", operating_end_time: "20:00",
-    sell_condition_groups: [newConditionGroup("sell")],
-    sell_rule_tree: newBlockRuleRoot("sell", [newBlockRuleCondition("sell")], true),
+    sell_condition_groups: [],
+    sell_rule_tree: newBlockRuleRoot("sell", [], false),
   };
   settings.sell_enabled = true;
   settings.sell_flows = flows;
@@ -3033,16 +3033,20 @@ function createExecutionActionEditor(reference, disabled) {
 
 function createBlockRuleActionEditor(reference, disabled) {
   if (reference.kind === "execution") return createExecutionActionEditor(reference, disabled);
-  const node = findBlockRuleNode(reference.kind, reference.flowId, reference.nodeId)?.node;
+  const found = findBlockRuleNode(reference.kind, reference.flowId, reference.nodeId);
+  const node = found?.node;
   const wrap = document.createElement("div");
   wrap.className = "rule-action-editor";
   if (!node?.action) return wrap;
   const hint = document.createElement("p");
   hint.className = "composer-inspector-hint";
-  hint.textContent = reference.kind === "sell"
-    ? "이 조건 경로가 통과하면 전략 소유 수량을 선택한 방식으로 매도합니다."
+  const unconditionalSell = reference.kind === "sell" && node.kind === "logic" && !(node.children || []).length;
+  hint.textContent = unconditionalSell
+    ? (found.parent ? "상위 조건을 통과하면 선택한 대상의 매도 가능 수량을 매도합니다." : "작동 시간 안에서 선택한 대상의 매도 가능 수량을 매도 확인 간격마다 확인해 주문합니다.")
+    : reference.kind === "sell"
+    ? "이 조건 경로가 통과하면 선택한 대상의 매도 가능 수량을 선택한 방식으로 매도합니다."
     : "이 조건 경로가 통과하면 공통 예산과 주문 위험 검사를 거쳐 매수합니다.";
-  if (node.kind === "logic") {
+  if (node.kind === "logic" && !unconditionalSell) {
     hint.textContent += " 통과한 하위 조건에서 선택된 주문이 없을 때 실행하는 기본 주문입니다.";
   }
   const executionHint = document.createElement("p");
@@ -3797,7 +3801,7 @@ function rewriteBlockRuleMove(root, sourceId, targetId, placement, side = "BUY")
     node.children = node.children.filter(child => {
       if (child.kind !== "logic" || child.children.length) return true;
       if (child.action) {
-        orphanedAction = true;
+        orphanedAction = side !== "SELL";
         return true;
       }
       return false;
@@ -3809,7 +3813,7 @@ function rewriteBlockRuleMove(root, sourceId, targetId, placement, side = "BUY")
   }
   const error = blockRuleTreeEditError(changed);
   if (error) return rejected(error);
-  if (["SELL", "EXECUTION"].includes(side) && !blockRuleConditionNodes(changed).length) {
+  if (side === "EXECUTION" && !blockRuleConditionNodes(changed).length) {
     return rejected(`${side === "EXECUTION" ? "체결" : "매도"} 흐름에는 조건식이 하나 이상 필요합니다.`);
   }
   if (JSON.stringify(changed) === JSON.stringify(root)) return { tree: null, error: "", unchanged: true };
@@ -3876,7 +3880,7 @@ function addBlockRuleChild(kind, flowId, parentId, childKind, operator = "ALL", 
 function removeBlockRuleNode(kind, flowId, nodeId) {
   const found = findBlockRuleNode(kind, flowId, nodeId);
   if (!found?.parent || selectedState()?.running) return;
-  if (kind === "sell" || kind === "execution") {
+  if (kind === "execution") {
     const rootConditionCount = blockRuleConditionNodes(blockRuleTree(kind, flowId)).length;
     const removedConditionCount = found.node.kind === "condition"
       ? 1 : blockRuleConditionNodes(found.node).length;
@@ -3889,7 +3893,7 @@ function removeBlockRuleNode(kind, flowId, nodeId) {
   let selectedParent = found.parent;
   if (found.parent.children.length === 1) {
     const parentFound = findBlockRuleNode(kind, flowId, found.parent.id);
-    if (parentFound?.parent) {
+    if (parentFound?.parent && !(kind === "sell" && found.parent.action)) {
       // A nested logic group may not remain empty: deleting its final child
       // removes that now-meaningless pair of parentheses as one unit.
       parentFound.parent.children.splice(parentFound.index, 1);
@@ -3902,20 +3906,12 @@ function removeBlockRuleNode(kind, flowId, nodeId) {
   }
   // Explicit parentheses can nest several one-child groups. Prune all empty
   // ancestors after deletion so a saved tree never contains an empty group.
-  while (selectedParent.kind === "logic" && !selectedParent.children.length) {
+  while (selectedParent.kind === "logic" && !selectedParent.children.length
+    && !(kind === "sell" && selectedParent.action)) {
     const emptyParent = findBlockRuleNode(kind, flowId, selectedParent.id);
     if (!emptyParent?.parent) break;
     emptyParent.parent.children.splice(emptyParent.index, 1);
     selectedParent = emptyParent.parent;
-  }
-  let clearedUnsafeSellAction = false;
-  if (kind === "sell") {
-    walkBlockRule(blockRuleTree(kind, flowId), node => {
-      if (node.kind === "logic" && node.action && blockRuleConditionNodes(node).length === 0) {
-        node.action = null;
-        clearedUnsafeSellAction = true;
-      }
-    });
   }
   const prefix = blockFlowNodePrefix(kind, flowId);
   const selected = String(state.blockSelectedNode || "");
@@ -3929,7 +3925,6 @@ function removeBlockRuleNode(kind, flowId, nodeId) {
     if (!selectedSurvives) state.blockSelectedNode = false;
   }
   commitBlockRuleMutation(true, kind);
-  if (clearedUnsafeSellAction) notify("조건이 없는 매도 묶음의 주문 행동도 함께 제거했습니다.");
 }
 
 function blockRuleContainsAction(node) {
@@ -3965,7 +3960,7 @@ function blockRuleActionConflict(root, nodeId) {
 function addBlockRuleAction(kind, flowId, nodeId, executionActionType = "CANCEL_REMAINDER") {
   const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
   if (!node || node.action || selectedState()?.running) return;
-  if (["sell", "execution"].includes(kind) && node.kind === "logic" && blockRuleConditionNodes(node).length === 0) {
+  if (kind === "execution" && node.kind === "logic" && blockRuleConditionNodes(node).length === 0) {
     notify(`${kind === "execution" ? "체결" : "매도"} 행동을 추가하려면 이 묶음에 조건식을 먼저 추가하세요.`, true);
     return;
   }
@@ -3981,11 +3976,19 @@ function addBlockRuleAction(kind, flowId, nodeId, executionActionType = "CANCEL_
 }
 
 function removeBlockRuleAction(kind, flowId, nodeId) {
-  const node = findBlockRuleNode(kind, flowId, nodeId)?.node;
+  const found = findBlockRuleNode(kind, flowId, nodeId);
+  const node = found?.node;
   if (!node?.action || selectedState()?.running) return;
   settleBlockFieldEditsForRerender();
   const removedSelection = `${blockFlowNodePrefix(kind, flowId)}-action-${node.action.id}`;
   node.action = null;
+  // Removing a standalone nested order also removes its now-empty wrapper.
+  let empty = found;
+  while (empty?.parent && empty.node.kind === "logic"
+    && !empty.node.children.length && !empty.node.action) {
+    empty.parent.children.splice(empty.index, 1);
+    empty = findBlockRuleNode(kind, flowId, empty.parent.id);
+  }
   if (state.blockSelectedNode === removedSelection) state.blockSelectedNode = false;
   commitBlockRuleMutation(true, kind);
 }
@@ -5645,6 +5648,8 @@ function buildComposerRuleBranch(kind, flowId, node, isRoot = false, depth = 0, 
       flowId,
       ownerId: node.id,
       ownerKind: node.kind,
+      unconditionalSell: kind === "sell" && node.kind === "logic" && !(node.children || []).length,
+      isRoot,
       children: [{ kind: "node", nodeId: ruleComposerActionId(kind, flowId, node.action.id) }],
     });
   }
@@ -5922,8 +5927,10 @@ function createComposerRuleAddMenu(entry, running) {
   make("하위 계층 추가", "logic", "ALL");
   const owner = findBlockRuleNode(entry.ruleKind, entry.flowId, entry.ownerId)?.node;
   const exists = Boolean(owner?.action);
-  const emptySell = ["sell", "execution"].includes(entry.ruleKind)
+  const emptyExecution = entry.ruleKind === "execution"
     && owner?.kind === "logic" && !blockRuleConditionNodes(owner).length;
+  const unconditionalSell = entry.ruleKind === "sell"
+    && owner?.kind === "logic" && !(owner.children || []).length;
   const conflict = blockRuleActionConflict(blockRuleTree(entry.ruleKind, entry.flowId), entry.ownerId);
   const actionOptions = entry.ruleKind === "execution" ? executionActionOptions()
     : [[null, entry.ruleKind === "sell" ? "매도 주문" : "매수 주문"]];
@@ -5931,12 +5938,14 @@ function createComposerRuleAddMenu(entry, running) {
     const order = document.createElement("button");
     order.type = "button";
     order.className = "composer-rule-order-add";
-    const actionScope = entry.afterId ? (conditionScope ? "앞 조건 통과 시" : "앞 계층 통과 시") : "전체 계층 통과 시";
+    const actionScope = unconditionalSell ? "조건 없이 실행"
+      : entry.afterId ? (conditionScope ? "앞 조건 통과 시" : "앞 계층 통과 시") : "전체 계층 통과 시";
     order.textContent = `${orderLabel} · ${exists ? "이미 추가됨" : actionScope}`;
-    order.disabled = running || !owner || exists || emptySell || conflict;
+    order.disabled = running || !owner || exists || emptyExecution || conflict;
     order.title = exists ? "행동 카드를 눌러 실행 방식을 편집하세요."
-      : emptySell ? `${entry.ruleKind === "execution" ? "체결 행동" : "매도 주문"}을 추가하려면 조건식이 하나 이상 필요합니다.`
+      : emptyExecution ? "체결 행동을 추가하려면 조건식이 하나 이상 필요합니다."
         : conflict ? "AND 경로에 다른 행동이 있습니다. 공통 계층에 행동을 추가하세요."
+          : unconditionalSell ? "설정한 작동 시간에 선택된 매도 대상을 매도합니다. 상위 계층의 조건은 그대로 적용됩니다."
           : `${conditionScope ? "이 조건이" : "이 계층이"} 통과했을 때 실행할 ${orderLabel}`;
     order.setAttribute("aria-label", `${order.textContent} · ${conditionScope ? "이 조건에 연결" : "이 계층에 연결"}`);
     order.addEventListener("click", event => {
@@ -6010,11 +6019,14 @@ function createComposerThenBranch(entry, definitions, running) {
   const conditionScope = entry.ownerKind === "condition";
   branch.className = `composer-then-branch ${conditionScope ? "composer-condition-action" : "composer-group-action"}`;
   branch.dataset.ruleActionOwner = entry.ownerId;
-  branch.setAttribute("aria-label", `${conditionScope ? "이 조건" : "이 계층"} 통과 시 ${entry.ruleKind === "execution" ? "체결 행동" : "주문"}`);
+  const actionDescription = entry.unconditionalSell
+    ? (entry.isRoot ? "작동 시간 내 조건 없이 매도" : "상위 조건 통과 시 매도")
+    : `${conditionScope ? "이 조건" : "이 계층"} 통과 시 ${entry.ruleKind === "execution" ? "체결 행동" : "주문"}`;
+  branch.setAttribute("aria-label", actionDescription);
   const label = document.createElement("span");
   label.className = "composer-then-arrow";
   label.setAttribute("aria-hidden", "true");
-  label.title = conditionScope ? "조건을 만족하면 실행" : "조건을 만족하면 실행 · 하위 조건의 행동이 우선";
+  label.title = entry.unconditionalSell ? actionDescription : (conditionScope ? "조건을 만족하면 실행" : "조건을 만족하면 실행 · 하위 조건의 행동이 우선");
   branch.append(label);
   const children = document.createElement("div");
   children.className = "composer-then-children";
@@ -6787,6 +6799,7 @@ function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
       });
     }
     if (node.action) {
+      const unconditionalSell = kind === "sell" && node.kind === "logic" && !node.children.length;
       nodes.push({
         id: ruleComposerActionId(kind, flowId, node.action.id),
         title: kind === "execution" ? executionActionLabel(node.action.action_type) : kind === "sell" ? "매도 주문" : "매수 주문",
@@ -6797,7 +6810,8 @@ function collectComposerRuleDefinitions(nodes, kind, flowId, root) {
         width: 420,
         summary: [kind === "execution"
           ? (node.action.action_type === "AMEND_BEST_LIMIT" ? "남은 수량 · 기존 주문 정정" : "미체결 잔량만 취소")
-          : `${orderTypeLabel(node.action.order_type, "현재가 지정가")} 주문`],
+          : `${orderTypeLabel(node.action.order_type, "현재가 지정가")} 주문`,
+          ...(unconditionalSell ? [isRoot ? "작동 시간 내 조건 없이 매도" : "상위 조건 통과 시 매도"] : [])],
         actions: kind === "execution" ? ["미체결 잔량", "조건 확인", "체결 행동", "상태 확인"] : kind === "sell"
           ? [blockSellTargetMode(blockSellFlow(flowId)) === "BUY_FLOWS" ? "연결 매수 체결 수량" : state.blockPackage.settings.sell_position_scope === "ACCOUNT" ? "계좌 매도 가능 수량" : "전략 소유 수량", "주문 제출", "상태 조정"]
           : ["공통 예산", "멱등성 예약", "위험 검사", "주문 제출"],
@@ -6867,11 +6881,13 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
     const hasBarConditions = ruleConditions.some(hasBarMetricCondition);
     const scheduleMeta = hasLiveConditions && hasBarConditions
       ? "실시간 · 봉 시점"
-      : hasLiveConditions ? "실시간" : "봉 시점";
+      : hasLiveConditions ? "실시간" : hasBarConditions ? "봉 시점"
+        : !ruleConditions.length ? (blockRuleContainsAction(blockRuleTree("sell", flow.id)) ? "조건 없이 매도" : "주문 없음 · 대기") : "정기 확인";
     const scheduleActions = [
       ...(hasLiveConditions ? ["순수익률 · 실시간 현재가 · 비용 포함"] : []),
       ...(hasBarConditions ? ["차트 값 · 각 조건의 봉 설정"] : []),
       ...(hasBarConditions ? [`${flow.sell_scan_seconds}초마다 봉 조건 확인`] : []),
+      ...(!hasLiveConditions && !hasBarConditions ? [`${flow.sell_scan_seconds}초마다 매도 확인`] : []),
     ];
     nodes.push({
       id: `${prefix}-schedule`, title: flow.name || `매도 흐름 ${flowIndex + 1}`,

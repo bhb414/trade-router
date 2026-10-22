@@ -306,7 +306,7 @@ test("order menu attaches to its condition, while group order remains a separate
   assert.equal(h.commits(), 2);
 });
 
-test("AND sibling action conflicts, empty sell groups and existing orders are unavailable and guarded", () => {
+test("AND sibling action conflicts and existing orders are unavailable and guarded", () => {
   const existingOrder = action("keep");
   const a = condition("A", existingOrder);
   const b = condition("B");
@@ -323,12 +323,22 @@ test("AND sibling action conflicts, empty sell groups and existing orders are un
   assert.equal(h.commits(), 0);
   assert.match(h.notices[0], /AND/);
   assert.equal(h.menuFor("root").buttons[2].disabled, false);
-  const empty = group("empty", []);
-  const emptyHarness = harness(empty);
-  assert.equal(emptyHarness.menuFor("empty").buttons[2].disabled, true);
-  emptyHarness.context.addBlockRuleAction("sell", null, "empty");
-  assert.equal(empty.action, null);
-  assert.equal(emptyHarness.commits(), 0);
+});
+
+test("empty sell levels offer a standalone order without manufacturing a condition", () => {
+  for (const nested of [false, true]) {
+    const empty = group("empty", []);
+    const root = nested ? group("root", [empty, condition("B")]) : empty;
+    const h = harness(root);
+    const button = h.menuFor("empty").buttons[2];
+    assert.equal(button.disabled, false);
+    assert.match(button.textContent, /조건 없이 실행/);
+    button.click();
+    assert.equal(empty.action.side, "SELL");
+    assert.equal(empty.children.length, 0);
+    assert.equal(h.commits(), 1);
+    assert.equal(h.menuFor("empty").buttons[2].disabled, true);
+  }
 });
 
 test("buy and sell menus match their flow and running guards prevent all mutations", () => {

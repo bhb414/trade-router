@@ -24,7 +24,7 @@ from trade_router import (
 from trade_router.client import fill_from_event, orderbook_from_event, quote_from_event, _order_from_payload
 
 from trade_router_studio.event_bus import RuntimeEventBuffer
-from trade_router_studio.file_io import read_shared_text, replace_snapshot
+from trade_router_studio.file_io import read_shared_text, replace_snapshot, snapshot_backup_path
 
 
 class StrategyLogger:
@@ -78,14 +78,40 @@ class StrategyState:
             self._loop.create_future() if self._loop is not None else None
         )
         self._values, self._revision = self._read_snapshot(self._path)
-        self._persisted_revision = self._revision
+        self._persisted_revision = self._revision if self._path.exists() else -1
         self._pending_revision: int | None = None
+        snapshots = [(self._path, self._values, self._revision)] if self._persisted_revision >= 0 else []
         if self._pending_path.exists():
             pending, revision = self._read_snapshot(self._pending_path, required=True)
             self._pending_revision = revision
-            if revision > self._revision:
-                self._values, self._revision = pending, revision
-                self._log.warning("이전 실행의 전략 상태 저장 기록을 복구했습니다.")
+            snapshots.append((self._pending_path, pending, revision))
+        # ReplaceFileW error 1177 can leave either acknowledged snapshot under
+        # its backup name. Read every surviving record before choosing a
+        # revision; otherwise an older pending journal can revive sold holdings.
+        for original in (self._path, self._pending_path):
+            backup = snapshot_backup_path(original)
+            if backup.exists():
+                values, revision = self._read_snapshot(
+                    backup, required=True, allow_legacy=original == self._path,
+                )
+                snapshots.append((backup, values, revision))
+        source, values, revision = max(
+            snapshots, key=lambda item: item[2], default=(self._path, self._values, self._revision),
+        )
+        if source != self._path and revision > self._persisted_revision:
+            revision = max(1, revision)  # A recovered legacy backup becomes a versioned journal.
+            self._values, self._revision = values, revision
+            if source != self._pending_path:
+                # Copy rather than move: a second partial replacement must not
+                # consume the only surviving acknowledged recovery snapshot.
+                serialized = json.dumps(
+                    {**values, self._REVISION_KEY: revision}, ensure_ascii=False, indent=2,
+                )
+                temporary = self._write_snapshot(serialized)
+                replace_snapshot(temporary, self._pending_path)
+                self._pending_revision = revision
+            self._log.warning("이전 실행의 전략 상태 저장 기록을 복구했습니다.")
+        if self._pending_revision is not None:
             with self._lock:
                 if not self._promote_pending_locked():
                     self._start_writer_locked()
@@ -108,6 +134,7 @@ class StrategyState:
                 {**values, self._REVISION_KEY: revision}, ensure_ascii=False, indent=2,
             )
             temporary = self._write_snapshot(serialized)
+            committed = False
             try:
                 try:
                     replace_snapshot(temporary, self._path)
@@ -124,12 +151,16 @@ class StrategyState:
                         if not self._promote_pending_locked():
                             self._start_writer_locked()
                 self._values, self._revision = values, revision
+                committed = True
             finally:
-                # Never remove a committed journal/main snapshot on failure.
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                # Native replacement may fail after renaming the old target.
+                # Keep the attempted snapshot for diagnosis/recovery instead of
+                # deleting the sole remaining new file on that error path.
+                if committed:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def _write_snapshot(self, serialized: str) -> Path:
         fd, name = tempfile.mkstemp(prefix=self._path.name + ".", suffix=".tmp", dir=self._path.parent)
@@ -147,14 +178,15 @@ class StrategyState:
             raise
         return temporary
 
-    def _read_snapshot(self, path: Path, *, required: bool = False) -> tuple[dict[str, Any], int]:
+    def _read_snapshot(self, path: Path, *, required: bool = False,
+                       allow_legacy: bool = False) -> tuple[dict[str, Any], int]:
         try:
             payload = json.loads(read_shared_text(path))
             if not isinstance(payload, dict):
                 raise ValueError("Strategy state must be an object.")
             revision = payload.pop(self._REVISION_KEY, 0)
             if (not isinstance(revision, int) or isinstance(revision, bool)
-                    or revision < (1 if required else 0)):
+                    or revision < (1 if required and not allow_legacy else 0)):
                 raise ValueError("Invalid strategy state revision.")
             return payload, revision
         except FileNotFoundError as exc:

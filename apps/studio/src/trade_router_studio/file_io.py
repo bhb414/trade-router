@@ -44,8 +44,19 @@ def read_shared_text(path: Path, *, encoding: str = "utf-8") -> str:
         return stream.read()
 
 
+def snapshot_backup_path(target: Path) -> Path:
+    """Known recovery location for ReplaceFileW's partially completed rename."""
+    return target.with_name(target.name + ".replace-backup")
+
+
 def replace_snapshot(source: Path, target: Path) -> None:
-    """Replace an existing Windows snapshot even while shared readers hold it."""
+    """Replace a snapshot, retaining the previous Windows target for recovery.
+
+    ReplaceFileW is not an all-or-nothing operation on failure. Supplying a
+    backup preserves the old target on error 1176, and gives it a known name
+    on error 1177. Callers must retain/recover this backup, including after a
+    process exits between the native rename steps.
+    """
     if os.name != "nt" or not target.exists():
         os.replace(source, target)
         return
@@ -56,7 +67,7 @@ def replace_snapshot(source: Path, target: Path) -> None:
     replace_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
                             wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
     replace_file.restype = wintypes.BOOL
-    if not replace_file(str(target), str(source), None, 0, None, None):
+    if not replace_file(str(target), str(source), str(snapshot_backup_path(target)), 0, None, None):
         error = ctypes.get_last_error()
         if error == 2 and not target.exists():
             os.replace(source, target)

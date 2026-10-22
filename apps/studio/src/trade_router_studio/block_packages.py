@@ -394,9 +394,10 @@ def _validate_rule_tree(
         raise ValueError(f"{label} 흐름에는 {label} 주문 행동만 넣을 수 있습니다.")
     if any(
         isinstance(node, BlockLogicNode) and not node.children and node is not tree
+        and not (side == "SELL" and node.action is not None)
         for node in nodes
     ):
-        raise ValueError("조건 계층 안의 그룹은 비워 둘 수 없습니다.")
+        raise ValueError("조건 계층 안의 그룹에는 조건이나 매도 주문 행동이 필요합니다.")
     for node in nodes:
         if not isinstance(node, BlockLogicNode) or node.operator != "ALL":
             continue
@@ -408,8 +409,6 @@ def _validate_rule_tree(
                 "AND 그룹에서는 하나의 하위 분기에만 주문 행동을 둘 수 있습니다. "
                 "여러 주문 행동은 OR 분기로 나누거나 AND 그룹 자체의 행동으로 설정하세요."
             )
-    if side == "SELL" and not conditions:
-        raise ValueError("매도 조건 계층에는 하나 이상의 조건이 필요합니다.")
 
 
 def _legacy_condition_groups(
@@ -2068,13 +2067,16 @@ class ManagedBlockStrategy(Strategy):
 
             children = node.get("children", ())
             if not children:
-                # An empty ALL would be vacuously true.  That is useful only
-                # for the legacy/direct-buy form (condition-search results are
-                # bought without an extra indicator filter).  In every other
-                # position, especially SELL, fail closed so deleting the last
-                # condition can never become an unconditional order.
+                # An explicit SELL action can stand alone, including inside a
+                # parenthesized branch. Ancestor conditions still gate it and
+                # callers retain operating-hour, ownership and order checks.
+                # Empty groups without an action never become vacuously true.
+                # Preserve the legacy/direct-buy exception at the root only.
                 action = node.get("action")
-                if depth == 0 and action and action.get("side") == "BUY":
+                if action and (
+                    action.get("side") == "SELL"
+                    or (depth == 0 and action.get("side") == "BUY")
+                ):
                     return True, [], action, False
                 return False, [], None, False
 

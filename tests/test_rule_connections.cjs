@@ -224,7 +224,7 @@ test("removing a selected action closes only its action panel and leaves the own
 });
 
 test("a rejected final-condition deletion preserves selection and data", () => {
-  for (const kind of ["sell", "execution"]) {
+  for (const kind of ["execution"]) {
     const root = logic("ANY", [condition("A", action("order"))]);
     const snapshot = JSON.stringify(root);
     context.state = { blockSelectedNode: `${kind}-rule-A`, blockPackage: { settings: { [`${kind}_rule_tree`]: root } } };
@@ -238,6 +238,32 @@ test("a rejected final-condition deletion preserves selection and data", () => {
     assert.equal(context.state.blockSelectedNode, `${kind}-rule-A`);
     assert.equal(JSON.stringify(root), snapshot);
     assert.equal(notices.length, 1);
+  }
+});
+
+test("deleting the final sell condition preserves an explicitly attached root or nested order", () => {
+  for (const nested of [false, true]) {
+    const order = { ...action("liquidate"), side: "SELL" };
+    const owner = logic("ANY", [condition("A")], order, "owner");
+    const root = nested ? logic("ALL", [owner]) : owner;
+    context.state = { blockSelectedNode: "sell-rule-A", blockPackage: { settings: { sell_rule_tree: root } } };
+    context.selectedState = () => ({ running: false });
+    context.blockRuleTree = () => root;
+    context.blockFlowNodePrefix = () => "sell";
+    let commits = 0;
+    context.commitBlockRuleMutation = () => { commits += 1; };
+    context.notify = message => assert.fail(message);
+    context.removeBlockRuleNode("sell", null, "A");
+    assert.equal(owner.children.length, 0);
+    assert.equal(owner.action, order);
+    assert.equal(context.state.blockSelectedNode, false);
+    if (nested) assert.equal(root.children[0], owner);
+    assert.equal(commits, 1);
+    context.state.blockSelectedNode = "sell-action-liquidate";
+    context.removeBlockRuleAction("sell", null, "owner");
+    assert.equal(owner.action, null);
+    assert.equal(root.children.length, 0);
+    assert.equal(context.state.blockSelectedNode, false);
   }
 });
 
@@ -282,6 +308,11 @@ test("moving the last child prunes empty actionless ancestors but rejects orphan
   assert.equal(rejected.tree, null);
   assert.match(rejected.error, /주문만 남습니다/);
   assert.deepEqual(original, before);
+  const sellMove = context.rewriteBlockRuleMove(original, "A", "B", "after", "SELL");
+  assert.equal(sellMove.error, "");
+  assert.equal(sellMove.tree.children[0].action.id, "group-order");
+  assert.equal(sellMove.tree.children[0].children.length, 0);
+  assert.deepEqual(structure(plain(sellMove.tree)), ["ANY", ["ALL"], "B", "A"]);
 });
 
 test("moving onto itself is a no-op while descendants, the root and conflicting AND actions remain rejected", () => {
@@ -321,7 +352,7 @@ test("same-position moves leave the original tree and dirty state untouched", ()
   assert.equal(commits, 0);
 });
 
-test("moves enforce final depth, child limit, and SELL condition requirement", () => {
+test("moves enforce final depth, child limit, and execution condition requirement", () => {
   let deep = logic("ALL", [condition("deep-condition")], null, "deep-destination");
   for (let index = 0; index < 6; index += 1) deep = logic("ALL", [deep], null, `deep-${index}`);
   const root = logic("ANY", [
@@ -332,7 +363,7 @@ test("moves enforce final depth, child limit, and SELL condition requirement", (
   const full = logic("ALL", Array.from({ length: 20 }, (_, index) => condition(`full-${index}`)), null, "full");
   assert.match(context.rewriteBlockRuleMove(logic("ANY", [condition("A"), full]), "A", "full", "inside").error, /20개/);
   const emptySell = logic("ANY", [logic("ALL", [], null, "empty-a"), logic("ALL", [], null, "empty-b")]);
-  assert.match(context.rewriteBlockRuleMove(emptySell, "empty-a", "empty-b", "after", "SELL").error, /매도 흐름/);
+  assert.match(context.rewriteBlockRuleMove(emptySell, "empty-a", "empty-b", "after", "EXECUTION").error, /체결 흐름/);
 });
 
 test("a committed move preserves unfinished formula identities and is blocked while running", () => {

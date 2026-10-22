@@ -400,6 +400,7 @@ class RuntimeStore:
         *,
         limit: int = 200,
         source: str | None = None,
+        event_types: tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
         safe_limit = min(max(limit, 1), 1_000)
         query = (
@@ -407,9 +408,18 @@ class RuntimeStore:
             "FROM runtime_events"
         )
         values: list[Any] = []
+        predicates: list[str] = []
         if source:
-            query += " WHERE source = ?"
+            predicates.append("source = ?")
             values.append(source)
+        if event_types is not None:
+            if not event_types:
+                return []
+            selected = tuple(event_types[:32])
+            predicates.append("event_type IN (" + ",".join("?" for _ in selected) + ")")
+            values.extend(selected)
+        if predicates:
+            query += " WHERE " + " AND ".join(predicates)
         query += " ORDER BY id DESC LIMIT ?"
         values.append(safe_limit)
         rows = self._fetchall(query, values)
