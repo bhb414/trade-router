@@ -672,7 +672,7 @@ function renderStrategyOverview() {
   const performance = summary?.performance || {};
   document.querySelector("#overview-cost-basis").textContent = performance.costs_complete
     ? "체결 금액에 계좌별 수수료율과 매도 세율을 반영한 순손익입니다."
-    : "수수료율 또는 매도 세율이 비어 있어 현재 손익의 비용은 미확정입니다.";
+    : "일부 체결의 비용 정보가 확인되지 않아 손익이 추정값으로 표시됩니다. 계좌 설정의 빈 비용 항목은 0으로 계산합니다.";
   renderStrategyBalanceContent();
 
   renderServiceResultTabs(
@@ -1629,8 +1629,8 @@ function blockSellPositionScopeDefinition(settings) {
     fields: [blockSellPositionScopeField()],
     summary: [accountScope ? "계좌 전체 보유종목" : "이 전략 보유종목"],
     description: accountScope
-      ? "선택한 거래 계좌의 전체 보유종목에 매도 조건을 적용합니다. 수동 매수와 다른 전략의 보유종목도 포함됩니다. 계좌 평균 매입가와 설정한 수수료·세금을 반영한 추정 순수익률로 판단하고, 매도 가능한 수량을 사용합니다. 비용 요율이 미설정이면 순수익률 조건의 판단을 보류합니다."
-      : "이 전략에 귀속된 보유종목에만 매도 조건을 적용합니다. 계좌 평균 매입가와 설정한 수수료·세금을 반영한 추정 순수익률로 판단하며, 매도 수량은 이 전략 보유분으로 제한합니다. 비용 요율이 미설정이면 순수익률 조건의 판단을 보류합니다.",
+      ? "선택한 거래 계좌의 전체 보유종목에 매도 조건을 적용합니다. 수동 매수와 다른 전략의 보유종목도 포함됩니다. 계좌 평균 매입가와 설정한 수수료·세금을 반영한 추정 순수익률로 판단하고, 매도 가능한 수량을 사용합니다. 비워 둔 비용 항목은 각각 0으로 계산합니다."
+      : "이 전략에 귀속된 보유종목에만 매도 조건을 적용합니다. 계좌 평균 매입가와 설정한 수수료·세금을 반영한 추정 순수익률로 판단하며, 매도 수량은 이 전략 보유분으로 제한합니다. 비워 둔 비용 항목은 각각 0으로 계산합니다.",
     actions: accountScope
       ? ["수동 매수 · 다른 전략 보유 포함", "계좌 평균 매입가", "매도 가능 수량", "수수료·세금 포함"]
       : ["이 전략 보유 수량", "계좌 평균 매입가", "수수료·세금 포함"],
@@ -2924,7 +2924,7 @@ const BLOCK_EXPRESSION_METRICS = [
 ];
 
 function blockProfitRateHint() {
-  return "실시간 현재가와 계좌 평균 매수가에 계좌 설정의 매수·매도 수수료율과 매도세율을 반영한 추정 순수익률입니다. 비용 요율이 설정되지 않으면 이 값을 사용하는 조건의 판단을 보류합니다. 다른 조건은 각 설정에 따라 판단합니다.";
+  return "실시간 현재가와 계좌 평균 매수가에 계좌 설정의 매수·매도 수수료율과 매도세율을 반영한 추정 순수익률입니다. 비워 둔 비용 항목은 각각 0으로 계산하며, 입력한 수수료·세율만 반영합니다.";
 }
 
 function blockSourceMaxHistory(interval = "3m") {
@@ -6516,7 +6516,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
       ));
       const sellHint = document.createElement("p");
       sellHint.className = "schedule-explanation";
-      sellHint.textContent = "순수익률 조건은 실시간 현재가에 계좌 설정의 수수료·세금을 반영합니다. 비용 요율이 미설정이면 해당 조건의 판단을 보류합니다. 차트 조건은 각 조건의 봉 주기와 완성 여부로 판단합니다.";
+      sellHint.textContent = "순수익률 조건은 실시간 현재가에 계좌 설정의 수수료·세금을 반영합니다. 비워 둔 비용 항목은 각각 0으로 계산합니다. 차트 조건은 각 조건의 봉 주기와 완성 여부로 판단합니다.";
       panel.content.append(sellHint);
       appendScheduleConditions(panel.content, "sell", flow.id, running);
       sellList.append(panel.section);
@@ -7727,9 +7727,8 @@ function renderAccountList() {
     limitSummary.textContent = limitParts.length ? `계좌 상한 · ${limitParts.join(" · ")}` : "계좌 상한 미설정";
     const costs = account.cost_rates || {};
     const costSummary = document.createElement("span");
-    costSummary.textContent = costs.buy_commission_rate != null && costs.sell_commission_rate != null && costs.sell_tax_rate != null
-      ? `비용 반영 · 매수 ${costs.buy_commission_rate} / 매도 ${costs.sell_commission_rate} / 세금 ${costs.sell_tax_rate}`
-      : "수수료·세율 미설정 · 전략 손익에 비용 미확정 표시";
+    const costValue = key => String(costs[key] ?? "").trim() || "0";
+    costSummary.textContent = `비용 반영 · 매수 ${costValue("buy_commission_rate")} / 매도 ${costValue("sell_commission_rate")} / 세금 ${costValue("sell_tax_rate")} · 빈칸은 0`;
     information.append(title, description, limitSummary, costSummary);
     const permission = state.orderPermissions.find(
       item => item.scope_type === "account" && item.scope_id === account.alias

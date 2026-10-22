@@ -58,7 +58,7 @@ test("the formula data editor explains account fees, tax, estimation and missing
   const h = harness();
   const panel = h.createCompactFormulaTokenEditor("sell", { kind: "metric", metric: "profit_rate" }, false, () => {});
   const visible = textOf(panel);
-  for (const expected of [/추정 순수익률/, /계좌 평균 매수가/, /매수·매도 수수료율/, /매도세율/, /설정되지 않으면/, /판단을 보류/, /다른 조건/]) {
+  for (const expected of [/추정 순수익률/, /계좌 평균 매수가/, /매수·매도 수수료율/, /매도세율/, /비워 둔 비용 항목/, /각각 0으로 계산/, /입력한 수수료·세율만 반영/]) {
     assert.match(visible, expected);
   }
   assert.doesNotMatch(visible, /수수료·세금은 포함하지|봉 주기|봉 상태/);
@@ -70,7 +70,8 @@ test("legacy operand editor uses the same net-profit explanation and remains ind
   const panel = h.createConditionOperandEditor("sell", 0, 0, "right", { right: "profit_rate" }, false);
   assert.match(textOf(panel), /실시간 순수익률/);
   assert.match(textOf(panel), /추정 순수익률/);
-  assert.match(textOf(panel), /판단을 보류/);
+  assert.match(textOf(panel), /각각 0으로 계산/);
+  assert.doesNotMatch(textOf(panel), /판단을 보류/);
   assert.equal(panel.children.some(child => child.tagName === "INPUT" || child.tagName === "SELECT"), false);
 });
 

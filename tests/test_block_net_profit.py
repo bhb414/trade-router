@@ -75,34 +75,79 @@ def test_explicit_zero_rates_keep_exact_price_return_and_boundary():
     assert len(harness.orders) == 1
 
 
-@pytest.mark.parametrize("invalid", [None, "", "bad", "NaN", "Infinity", "-0.01", "1"])
+@pytest.mark.parametrize("blank", [None, "", "  \t\n  "])
 @pytest.mark.parametrize("key", ["buy_commission_rate", "sell_commission_rate", "sell_tax_rate"])
-def test_missing_or_invalid_rates_clear_previous_value_without_gross_fallback(key, invalid):
+def test_each_blank_cost_is_zero_while_other_entered_costs_are_retained(key, blank):
     harness = harness_for()
+    asyncio.run(harness.prepare_live_position())
+    harness.rates[key] = blank
+    asyncio.run(harness.prepare_live_position())
+    expected = [Decimal("0.001"), Decimal("0.001"), Decimal("0.002")]
+    expected[list(harness.rates).index(key)] = Decimal("0")
+    buy_fee, sell_fee, tax = expected
+    assert net_value(harness) == (Decimal("103") * (1 - sell_fee - tax) / (Decimal("100") * (1 + buy_fee)) - 1) * 100
+    assert not any("순수익률 조건 보류" in line for line in harness.logs)
+
+
+@pytest.mark.parametrize("rates", [{}, dict.fromkeys(("buy_commission_rate", "sell_commission_rate", "sell_tax_rate"), None),
+                                  {"buy_commission_rate": "", "sell_commission_rate": " \t", "sell_tax_rate": None}])
+def test_unset_costs_do_not_block_three_percent_stop_at_six_percent_loss(rates):
+    harness = harness_for(condition=profit_condition("-3", operator="LTE"))
+    harness.rates = rates
+    async def run():
+        await harness.prepare_live_position()
+        await harness.strategy.on_quote(harness.ctx, harness.quote("94"))
+        await harness.strategy.on_quote(harness.ctx, harness.quote("94"))
+    asyncio.run(run())
+    assert net_value(harness, "94") == Decimal("-6")
+    assert len(harness.orders) == 1
+    assert harness.orders[0]["quantity"] == Decimal("5")
+    assert not any("순수익률 조건 보류" in line for line in harness.logs)
+
+
+def test_tax_only_setting_keeps_blank_commissions_zero_and_exact_stop_boundary():
+    harness = harness_for(condition=profit_condition("-3", operator="LTE"))
+    harness.rates = {"sell_tax_rate": " 0.002 "}
+    async def run():
+        await harness.prepare_live_position()
+        # -2.8% gross remains above the -3% net stop; -2.9% gross crosses it.
+        await harness.strategy.on_quote(harness.ctx, harness.quote("97.2"))
+        assert harness.orders == []
+        await harness.strategy.on_quote(harness.ctx, harness.quote("97.1"))
+    asyncio.run(run())
+    assert net_value(harness, "97.1") == Decimal("-3.0942")
+    assert len(harness.orders) == 1
+
+
+@pytest.mark.parametrize("invalid", ["bad", "NaN", "Infinity", "-0.01", "1"])
+@pytest.mark.parametrize("key", ["buy_commission_rate", "sell_commission_rate", "sell_tax_rate"])
+def test_invalid_entered_rates_clear_previous_value_without_gross_fallback(key, invalid):
+    harness = harness_for(condition=profit_condition("-3", operator="LTE"))
     asyncio.run(harness.prepare_live_position())
     assert net_value(harness) is not None
     harness.rates[key] = invalid
     asyncio.run(harness.prepare_live_position())
     asyncio.run(harness.prepare_live_position())
     assert net_value(harness) is None
-    asyncio.run(harness.strategy.on_quote(harness.ctx, harness.quote("110")))
+    asyncio.run(harness.strategy.on_quote(harness.ctx, harness.quote("94")))
     assert harness.orders == []
     assert sum("순수익률 조건 보류" in line for line in harness.logs) == 1
 
 
-def test_invalid_combined_sale_cost_and_old_balance_without_rates_fail_closed():
+def test_invalid_combined_sale_cost_stays_blocked_until_rates_are_cleared():
     harness = harness_for()
     harness.rates.update(sell_commission_rate=Decimal("0.6"), sell_tax_rate=Decimal("0.5"))
     asyncio.run(harness.prepare_live_position())
     assert net_value(harness) is None
     harness.rates = {}
     asyncio.run(harness.prepare_live_position())
-    assert net_value(harness) is None
+    assert net_value(harness) == Decimal("3")
+    assert any("판단을 재개" in line for line in harness.logs)
 
 
-def test_missing_cost_does_not_block_other_or_candle_condition():
+def test_invalid_entered_cost_does_not_block_other_or_candle_condition():
     harness = harness_for(groups=[condition_group("either", profit_condition(), close_condition("150"))])
-    harness.rates = {}
+    harness.rates = {"sell_tax_rate": "invalid"}
     async def run():
         await harness.strategy.on_start(harness.ctx)
         schedule_id = next(kwargs["schedule_id"] for _, _, kwargs in harness.scheduler.calls
@@ -130,11 +175,11 @@ def test_cost_change_is_rechecked_after_cached_live_candidate_before_order():
 def test_healthy_websocket_still_recovers_new_cost_settings_without_restart():
     harness = harness_for()
     async def run():
-        harness.rates = {}
+        harness.rates = {"sell_tax_rate": "invalid"}
         await harness.prepare_live_position()
         await harness.strategy.on_quote(harness.ctx, harness.quote("104"))
         assert harness.orders == []
-        harness.rates = dict.fromkeys(("buy_commission_rate", "sell_commission_rate", "sell_tax_rate"), Decimal("0"))
+        harness.rates = {}
         harness.now += timedelta(seconds=31)
         harness.strategy._last_live_quote_at["005930"] = harness.now
         await harness.strategy._check_live_profit_fallback(harness.ctx)

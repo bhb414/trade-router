@@ -2319,7 +2319,8 @@ class ManagedBlockStrategy(Strategy):
         for key in ("buy_commission_rate", "sell_commission_rate", "sell_tax_rate"):
             raw = getattr(balance, key, None)
             try:
-                rate = Decimal(str(raw)) if raw is not None else None
+                text = "" if raw is None else str(raw).strip()
+                rate = Decimal(text) if text else Decimal("0")
             except (DecimalException, ValueError, TypeError):
                 rate = None
             if rate is None or not rate.is_finite() or rate < 0 or rate >= 1:
@@ -2340,8 +2341,9 @@ class ManagedBlockStrategy(Strategy):
         if not rates:
             if not getattr(self, "_profit_cost_warning", False):
                 ctx.log.warning(
-                    "순수익률 조건 보류: 계좌의 매수·매도 수수료율과 매도 세율을 모두 설정해야 합니다. "
-                    "면제 비용은 0으로 설정하세요. 다른 매도 조건은 계속 판단합니다."
+                    "순수익률 조건 보류: 계좌 수수료율·세율에 잘못된 값이 있습니다. "
+                    "각 비용은 0% 이상 100% 미만, 매도 수수료율과 세율의 합은 100% 미만이어야 합니다. "
+                    "다른 매도 조건은 계속 판단합니다."
                 )
             self._profit_cost_warning = True
         elif getattr(self, "_profit_cost_warning", False):

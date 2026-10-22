@@ -458,9 +458,17 @@ class ConnectionRuntime:
         account = self._settings.get_account(account_reference)
         return dict(account.get("risk_limits", {}))
 
-    def account_cost_rates(self, account_reference: str) -> dict[str, str | None]:
+    def account_cost_rates(self, account_reference: str) -> dict[str, str]:
         account = self._settings.get_account(account_reference)
-        return dict(account.get("cost_rates", {}))
+        configured = account.get("cost_rates") or {}
+        # Blank costs mean zero for this account. Resolve them here so both
+        # existing strategy balance readers and fill-cost estimation agree,
+        # without overwriting the saved settings or masking invalid values.
+        return {
+            key: "0" if configured.get(key) is None or not str(configured[key]).strip()
+            else str(configured[key])
+            for key in ("buy_commission_rate", "sell_commission_rate", "sell_tax_rate")
+        }
 
     async def instrument_name(
         self,
