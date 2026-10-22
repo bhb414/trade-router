@@ -2254,6 +2254,20 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .composer-inspector .strategy-block-field input,
 .composer-inspector .strategy-block-field select { height: 34px; }
 .composer-inspector .strategy-block-field textarea { min-height: 76px; }
+.block-buy-flow-links { min-width: 0; margin: 8px 0 0; padding: 12px; border: 1px solid #d3dce9; border-radius: 10px; }
+.block-buy-flow-links legend { padding: 0 5px; color: #4c5b70; font-size: 12px; font-weight: 700; }
+.block-buy-flow-options { display: grid; gap: 8px; }
+.block-buy-flow-group { display: grid; gap: 5px; padding-bottom: 9px; border-bottom: 1px solid #e4e9f1; }
+.block-buy-flow-group:last-child { padding-bottom: 0; border-bottom: 0; }
+.block-buy-flow-option { display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid #e2e7ef; border-radius: 7px; cursor: pointer; }
+.block-buy-flow-option.nested { margin-left: calc(var(--link-depth) * 14px); padding: 8px; border-color: transparent; border-left-color: #c5d3e6; border-radius: 0 6px 6px 0; }
+.block-buy-flow-option:has(input:checked) { background: #edf5ff; border-color: #98b9e8; }
+.block-buy-flow-option:has(input:disabled) { cursor: default; opacity: .6; }
+.block-buy-flow-option input { width: 17px; height: 17px; margin: 0; flex: 0 0 auto; accent-color: #2563eb; }
+.block-buy-flow-option span { display: grid; min-width: 0; gap: 4px; overflow-wrap: anywhere; }
+.block-buy-flow-option strong { font-size: 13px; color: #34425b; }
+.block-buy-flow-option small, .block-buy-flow-hint { color: #68778d; font-size: 12px; line-height: 1.5; }
+.block-buy-flow-hint { margin: 10px 0 0; }
 .composer-inspector .block-condition-editor {
   gap: 9px;
   padding: 0;

@@ -65,7 +65,7 @@ function harness() {
   [
     "blockExecutionFlows", "blockExecutionFlowFields", "blockFlow", "blockFlowNodePrefix",
     "blockBuyFlows", "blockBuyFlow", "blockSellFlows", "blockSellFlow",
-    "addBlockExecutionFlow", "removeBlockExecutionFlow", "createComposerTreeAddRow", "buildComposerTreeModel",
+    "addBlockExecutionFlow", "removeBlockExecutionFlow", "createComposerTreeAddRow", "blockSellTargetMode", "blockSellTargetSummary", "buildComposerTreeModel",
     "executionMetricOptions", "executionValueOptions", "executionOperatorOptions", "newExecutionCondition",
     "executionConditionSummary", "executionActionOptions", "executionActionLabel",
     "createExecutionConditionEditor", "updateExecutionCondition", "createExecutionActionEditor", "updateExecutionAction", "createBlockRuleNodeEditor",

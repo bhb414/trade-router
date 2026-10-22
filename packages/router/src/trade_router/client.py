@@ -917,6 +917,8 @@ class AccountClient:
                     else None
                 ),
                 name=row.get("name"),
+                buy_flow_quantities={key: Decimal(str(value)) for key, value in (row.get("buy_flow_quantities") or {}).items()},
+                buy_origin_lots=tuple({"flow_id": lot["flow_id"], "node_ids": tuple(lot.get("node_ids") or ()), "quantity": Decimal(str(lot["quantity"]))} for lot in row.get("buy_origin_lots") or ()),
             )
             for row in payload.get("positions", [])
         )
@@ -1031,6 +1033,8 @@ class OrderClient:
         client_order_id: str,
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
+        buy_flow_id: str | None = None,
+        buy_rule_node_ids: tuple[str, ...] | list[str] = (),
     ) -> Order:
         return await self._submit(
             code,
@@ -1040,6 +1044,8 @@ class OrderClient:
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,
+            buy_flow_id=buy_flow_id,
+            buy_rule_node_ids=buy_rule_node_ids,
         )
 
     async def market_sell(
@@ -1051,6 +1057,8 @@ class OrderClient:
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
         sell_position_scope: str = "STRATEGY",
+        sell_buy_flow_ids: tuple[str, ...] | list[str] = (),
+        sell_buy_node_refs: tuple[dict[str, str], ...] | list[dict[str, str]] = (),
     ) -> Order:
         return await self._submit(
             code,
@@ -1061,6 +1069,8 @@ class OrderClient:
             route=route,
             provider_options=provider_options,
             sell_position_scope=sell_position_scope,
+            sell_buy_flow_ids=sell_buy_flow_ids,
+            sell_buy_node_refs=sell_buy_node_refs,
         )
 
     async def best_limit_buy(
@@ -1071,6 +1081,8 @@ class OrderClient:
         client_order_id: str,
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
+        buy_flow_id: str | None = None,
+        buy_rule_node_ids: tuple[str, ...] | list[str] = (),
     ) -> Order:
         """Buy at the best ask on receipt; any remainder rests at that price."""
         return await self._submit(
@@ -1081,6 +1093,8 @@ class OrderClient:
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,
+            buy_flow_id=buy_flow_id,
+            buy_rule_node_ids=buy_rule_node_ids,
         )
 
     async def best_limit_sell(
@@ -1092,6 +1106,8 @@ class OrderClient:
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
         sell_position_scope: str = "STRATEGY",
+        sell_buy_flow_ids: tuple[str, ...] | list[str] = (),
+        sell_buy_node_refs: tuple[dict[str, str], ...] | list[dict[str, str]] = (),
     ) -> Order:
         """Sell at the best bid on receipt; any remainder rests at that price."""
         return await self._submit(
@@ -1103,6 +1119,8 @@ class OrderClient:
             route=route,
             provider_options=provider_options,
             sell_position_scope=sell_position_scope,
+            sell_buy_flow_ids=sell_buy_flow_ids,
+            sell_buy_node_refs=sell_buy_node_refs,
         )
 
     async def limit_buy(
@@ -1114,6 +1132,8 @@ class OrderClient:
         client_order_id: str,
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
+        buy_flow_id: str | None = None,
+        buy_rule_node_ids: tuple[str, ...] | list[str] = (),
     ) -> Order:
         return await self._submit(
             code,
@@ -1124,6 +1144,8 @@ class OrderClient:
             client_order_id=client_order_id,
             route=route,
             provider_options=provider_options,
+            buy_flow_id=buy_flow_id,
+            buy_rule_node_ids=buy_rule_node_ids,
         )
 
     async def limit_sell(
@@ -1136,6 +1158,8 @@ class OrderClient:
         route: OrderRoute | str = OrderRoute.AUTO,
         provider_options: dict[str, Any] | None = None,
         sell_position_scope: str = "STRATEGY",
+        sell_buy_flow_ids: tuple[str, ...] | list[str] = (),
+        sell_buy_node_refs: tuple[dict[str, str], ...] | list[dict[str, str]] = (),
     ) -> Order:
         return await self._submit(
             code,
@@ -1147,6 +1171,8 @@ class OrderClient:
             route=route,
             provider_options=provider_options,
             sell_position_scope=sell_position_scope,
+            sell_buy_flow_ids=sell_buy_flow_ids,
+            sell_buy_node_refs=sell_buy_node_refs,
         )
 
     async def _submit(
@@ -1161,11 +1187,22 @@ class OrderClient:
         price: Decimal | None = None,
         provider_options: dict[str, Any] | None = None,
         sell_position_scope: str = "STRATEGY",
+        buy_flow_id: str | None = None,
+        buy_rule_node_ids: tuple[str, ...] | list[str] = (),
+        sell_buy_flow_ids: tuple[str, ...] | list[str] = (),
+        sell_buy_node_refs: tuple[dict[str, str], ...] | list[dict[str, str]] = (),
     ) -> Order:
         if sell_position_scope not in {"STRATEGY", "ACCOUNT"}:
             raise ValueError("Sell position scope must be STRATEGY or ACCOUNT.")
         if side is not OrderSide.SELL and sell_position_scope != "STRATEGY":
             raise ValueError("Account position scope is only valid for sell orders.")
+        OrderRequest(
+            instrument=InstrumentId(code), side=side, order_type=order_type,
+            quantity=Decimal(str(quantity)), client_order_id=client_order_id,
+            route=OrderRoute(route), price=price, sell_position_scope=sell_position_scope,
+            buy_flow_id=buy_flow_id, sell_buy_flow_ids=tuple(sell_buy_flow_ids),
+            buy_rule_node_ids=tuple(buy_rule_node_ids), sell_buy_node_refs=tuple(sell_buy_node_refs),
+        )
         payload = await self._router._post(
             "/api/v1/orders",
             {
@@ -1178,6 +1215,10 @@ class OrderClient:
                 "route": OrderRoute(route).value,
                 "provider_options": provider_options or {},
                 **({"sell_position_scope": sell_position_scope} if sell_position_scope == "ACCOUNT" else {}),
+                **({"buy_flow_id": buy_flow_id} if buy_flow_id is not None else {}),
+                **({"buy_rule_node_ids": list(buy_rule_node_ids)} if buy_rule_node_ids else {}),
+                **({"sell_buy_node_refs": list(sell_buy_node_refs)} if sell_buy_node_refs else {}),
+                **({"sell_buy_flow_ids": list(sell_buy_flow_ids)} if sell_buy_flow_ids else {}),
             },
         )
         return _order_from_payload(payload)
@@ -1379,6 +1420,10 @@ def _order_from_payload(payload: dict[str, Any]) -> Order:
             ),
             provider_options=dict(request_payload.get("provider_options") or {}),
             sell_position_scope=str(request_payload.get("sell_position_scope") or "STRATEGY"),
+            buy_flow_id=request_payload.get("buy_flow_id"),
+            sell_buy_flow_ids=tuple(request_payload.get("sell_buy_flow_ids") or ()),
+            buy_rule_node_ids=tuple(request_payload.get("buy_rule_node_ids") or ()),
+            sell_buy_node_refs=tuple(request_payload.get("sell_buy_node_refs") or ()),
         ),
         status=OrderStatus(payload["status"]),
         submitted_at=datetime.fromisoformat(payload["submitted_at"]),

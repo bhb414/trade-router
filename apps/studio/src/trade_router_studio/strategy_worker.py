@@ -21,6 +21,8 @@ from trade_router import (
 )
 from trade_router.client import fill_from_event, orderbook_from_event, quote_from_event, _order_from_payload
 
+from trade_router_studio.event_bus import RuntimeEventBuffer
+
 
 class StrategyLogger:
     def info(self, message: object) -> None:
@@ -66,6 +68,128 @@ class StrategyState:
         return payload if isinstance(payload, dict) else {}
 
 
+async def _dispatch_event(strategy: Strategy, context: StrategyContext, event: dict[str, Any]) -> None:
+    event_type = str(event.get("event_type") or "schedule")
+    if event_type == "quote":
+        payload = dict(event["quote"])
+        payload["source_alias"] = event.get("source_alias")
+        await strategy.on_quote(context, quote_from_event(payload))
+    elif event_type == "orderbook":
+        payload = dict(event["orderbook"])
+        payload["source_alias"] = event.get("source_alias")
+        await strategy.on_orderbook(context, orderbook_from_event(payload))
+    elif event_type == "order":
+        await strategy.on_order(context, _order_from_payload(event["order"]))
+    elif event_type == "fill":
+        await strategy.on_fill(context, fill_from_event(event["fill"]))
+    else:
+        value = SimpleNamespace(
+            schedule_id=event["schedule_id"],
+            kind=ScheduleKind(event["kind"]),
+            scheduled_at=datetime.fromisoformat(event["scheduled_at"]),
+            bar_interval=event.get("bar_interval"),
+        )
+        if value.kind is ScheduleKind.BAR_CLOSE:
+            await strategy.on_bar(context, value)
+        else:
+            await strategy.on_timer(context, value)
+
+
+class StrategyEventDispatcher:
+    """Five bounded, serial lanes for explicitly concurrency-safe strategies.
+
+    Hand-written Strategy subclasses remain serial unless they opt in with
+    runtime_lane(event). Generated managed strategies provide that contract and
+    protect shared portfolio/order mutations separately from market I/O.
+    """
+
+    LANES = ("buy", "sell", "live", "execution", "control")
+
+    def __init__(self, strategy: Strategy, context: StrategyContext, *, capacity: int = 256) -> None:
+        self.strategy = strategy
+        self.context = context
+        self.classify = getattr(strategy, "runtime_lane", None)
+        self.failure: asyncio.Future[BaseException] = asyncio.get_running_loop().create_future()
+        self.closed = False
+        self.queues: dict[str, RuntimeEventBuffer] = {}
+        self.tasks: list[asyncio.Task[None]] = []
+        self._reported_coalescing: dict[str, int] = {}
+        if callable(self.classify):
+            self.queues = {name: RuntimeEventBuffer(capacity, coalesce_schedules=True) for name in self.LANES}
+            self.tasks = [asyncio.create_task(self._consume(name), name=f"strategy-{name}") for name in self.LANES]
+
+    async def submit(self, event: dict[str, Any]) -> None:
+        if self.closed:
+            raise RuntimeError("Strategy dispatcher is closed.")
+        if not self.queues:
+            await _dispatch_event(self.strategy, self.context, event)
+            return
+        name = self.classify(event)
+        if name not in self.queues:
+            raise ValueError(f"Unknown strategy runtime lane: {name!r}")
+        queue = self.queues[name]
+        await queue.put(event)
+        previous = self._reported_coalescing.get(name, 0)
+        if queue.coalesced and (previous == 0 or queue.coalesced - previous >= 100):
+            self._reported_coalescing[name] = queue.coalesced
+            self.context.log.warning(
+                f"실행 이벤트 대기 병합: {name}, {queue.coalesced}건. "
+                "일정은 최신 요청, 시세는 최저·최고·최신 가격을 보존합니다."
+            )
+
+    async def _consume(self, name: str) -> None:
+        try:
+            while True:
+                event = await self.queues[name].get()
+                await _dispatch_event(self.strategy, self.context, event)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if not self.failure.done():
+                self.failure.set_result(exc)
+
+    async def close(self) -> None:
+        self.closed = True
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        for queue in self.queues.values():
+            await queue.close()
+        if not self.failure.done():
+            self.failure.cancel()
+
+
+async def _run_events(strategy: Strategy, context: StrategyContext, runtime: Any,
+                      stop_signal: asyncio.Future[None]) -> None:
+    dispatcher = StrategyEventDispatcher(strategy, context)
+
+    async def receive() -> None:
+        while True:
+            try:
+                event = await runtime.next_event()
+            except RouterError as exc:
+                context.log.warning(f"중앙 실행 이벤트 연결이 끊겨 다시 시도합니다: {exc}")
+                await asyncio.sleep(1)
+                continue
+            if event is not None:
+                await dispatcher.submit(event)
+
+    receiver = asyncio.create_task(receive(), name="strategy-events")
+    try:
+        done, _ = await asyncio.wait(
+            {stop_signal, receiver, dispatcher.failure}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_signal not in done:
+            if dispatcher.failure in done:
+                raise dispatcher.failure.result()
+            await receiver
+    finally:
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
+        # No callbacks remain alive when the caller invokes strategy.on_stop.
+        await dispatcher.close()
+
+
 async def run(path: Path) -> None:
     strategy = _load_strategy(path)
     config = getattr(strategy, "config", None)
@@ -93,53 +217,7 @@ async def run(path: Path) -> None:
         )
         stop_signal = _stdin_stop_signal()
         try:
-            while True:
-                event_task = asyncio.create_task(router.runtime.next_event())
-                done, _ = await asyncio.wait(
-                    {stop_signal, event_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if stop_signal in done:
-                    event_task.cancel()
-                    await asyncio.gather(event_task, return_exceptions=True)
-                    break
-                try:
-                    event = await event_task
-                except RouterError as exc:
-                    logger.warning(
-                        f"중앙 실행 이벤트 연결이 끊겨 다시 시도합니다: {exc}"
-                    )
-                    await asyncio.sleep(1)
-                    continue
-                if event is None:
-                    continue
-                event_type = str(event.get("event_type") or "schedule")
-                if event_type == "quote":
-                    payload = dict(event["quote"])
-                    payload["source_alias"] = event.get("source_alias")
-                    await strategy.on_quote(context, quote_from_event(payload))
-                    continue
-                if event_type == "orderbook":
-                    payload = dict(event["orderbook"])
-                    payload["source_alias"] = event.get("source_alias")
-                    await strategy.on_orderbook(context, orderbook_from_event(payload))
-                    continue
-                if event_type == "order":
-                    await strategy.on_order(context, _order_from_payload(event["order"]))
-                    continue
-                if event_type == "fill":
-                    await strategy.on_fill(context, fill_from_event(event["fill"]))
-                    continue
-                value = SimpleNamespace(
-                    schedule_id=event["schedule_id"],
-                    kind=ScheduleKind(event["kind"]),
-                    scheduled_at=datetime.fromisoformat(event["scheduled_at"]),
-                    bar_interval=event.get("bar_interval"),
-                )
-                if value.kind is ScheduleKind.BAR_CLOSE:
-                    await strategy.on_bar(context, value)
-                else:
-                    await strategy.on_timer(context, value)
+            await _run_events(strategy, context, router.runtime, stop_signal)
         finally:
             await strategy.on_stop(context)
             if not stop_signal.done():

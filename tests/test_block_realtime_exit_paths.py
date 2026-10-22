@@ -38,9 +38,24 @@ def stop(identifier="stop", **kwargs):
     return leaf(identifier, profit_condition("-3", operator="LTE"), **kwargs)
 
 
-def run_quote(harness, price="94"):
+async def warm_candle_cache(harness):
+    # Completed-candle evaluation owns market I/O. Quote callbacks consume its
+    # cache and must never wait for a candle lookup to select a stop-loss path.
+    for flow in harness.namespace["SELL_FLOWS"]:
+        for index, condition in enumerate(harness.namespace["_rule_conditions"](flow["sell_rule_tree"])):
+            if not harness.strategy._condition_requests(condition):
+                continue
+            await harness.strategy._rule_tree_result(
+                harness.ctx, "005930", {"id": f"warm-{index}", "kind": "condition", "condition": condition},
+                average_price=Decimal("100"), current_price=Decimal("100"), side="cache preparation",
+            )
+
+
+def run_quote(harness, price="94", *, warm_cache=True):
     async def exercise():
         await harness.prepare_live_position()
+        if warm_cache:
+            await warm_candle_cache(harness)
         await harness.strategy.on_quote(harness.ctx, harness.quote(price))
         await harness.strategy.on_quote(harness.ctx, harness.quote(price))
     asyncio.run(exercise())
@@ -112,7 +127,7 @@ def test_candle_only_truth_is_not_evaluated_on_quote_when_stop_is_false():
         "root", "ANY", leaf("candle", close_condition("150")), stop(),
         action=action("sell"),
     ))
-    run_quote(harness, "99")
+    run_quote(harness, "99", warm_cache=False)
     assert harness.orders == []
     assert harness.bar_calls == []
 

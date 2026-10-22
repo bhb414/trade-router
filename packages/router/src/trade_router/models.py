@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -240,6 +242,8 @@ class Position:
     market_price: Decimal | None = None
     strategy_quantity: Decimal | None = None
     name: str | None = None
+    buy_flow_quantities: dict[str, Decimal] = field(default_factory=dict)
+    buy_origin_lots: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if min(self.quantity, self.available_quantity, self.average_price) < 0:
@@ -248,6 +252,8 @@ class Position:
             raise ValueError("Available quantity cannot exceed total quantity.")
         if self.strategy_quantity is not None and self.strategy_quantity < 0:
             raise ValueError("Strategy quantity cannot be negative.")
+        if any(not value.is_finite() or value < 0 for value in self.buy_flow_quantities.values()):
+            raise ValueError("Buy flow quantities must be finite and non-negative.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,8 +343,35 @@ class OrderRequest:
     price: Decimal | None = None
     provider_options: dict[str, Any] = field(default_factory=dict)
     sell_position_scope: str = "STRATEGY"
+    buy_flow_id: str | None = None
+    sell_buy_flow_ids: tuple[str, ...] = ()
+    buy_rule_node_ids: tuple[str, ...] = ()
+    sell_buy_node_refs: tuple[dict[str, str], ...] = ()
 
     def __post_init__(self) -> None:
+        ids = (() if self.buy_flow_id is None else (self.buy_flow_id,)) + tuple(self.sell_buy_flow_ids) + tuple(self.buy_rule_node_ids)
+        if len(self.sell_buy_flow_ids) > 64 or len(set(self.sell_buy_flow_ids)) != len(self.sell_buy_flow_ids):
+            raise ValueError("Select at most 64 distinct buy flow IDs.")
+        if any(not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None for value in ids):
+            raise ValueError("Buy flow IDs must contain 1-128 letters, digits, underscores or hyphens.")
+        if self.buy_flow_id is not None and self.side is not OrderSide.BUY:
+            raise ValueError("Buy flow origin is only valid for buy orders.")
+        if len(self.buy_rule_node_ids) > 256 or len(set(self.buy_rule_node_ids)) != len(self.buy_rule_node_ids):
+            raise ValueError("At most 256 distinct buy rule node IDs are allowed.")
+        if self.buy_rule_node_ids and (self.side is not OrderSide.BUY or not self.buy_flow_id):
+            raise ValueError("Buy rule nodes require a buy flow origin.")
+        if len(self.sell_buy_node_refs) > 64:
+            raise ValueError("Select at most 64 buy rule nodes.")
+        refs = set()
+        for ref in self.sell_buy_node_refs:
+            if not isinstance(ref, dict) or set(ref) != {"flow_id", "node_id"} or any(not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None for value in ref.values()):
+                raise ValueError("Buy rule references require valid flow_id and node_id.")
+            key = (ref["flow_id"], ref["node_id"])
+            if key in refs:
+                raise ValueError("Buy rule references cannot repeat.")
+            refs.add(key)
+        if (self.sell_buy_flow_ids or self.sell_buy_node_refs) and (self.side is not OrderSide.SELL or self.sell_position_scope != "STRATEGY"):
+            raise ValueError("Linked buy flows are only valid for strategy sell orders.")
         if self.sell_position_scope not in {"STRATEGY", "ACCOUNT"}:
             raise ValueError("Sell position scope must be STRATEGY or ACCOUNT.")
         if self.side is not OrderSide.SELL and self.sell_position_scope != "STRATEGY":

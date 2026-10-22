@@ -232,7 +232,9 @@ class OptionalFlowTests(unittest.TestCase):
         harness = Harness(settings_for(buy_enabled=True, sell_enabled=False))
         harness.start()
         self.assertEqual(harness.schedule_ids(), ["condition-scan"])
-        harness.ctx.discovery.conditions.assert_awaited_once_with("test-user")
+        # Source validation runs with the first buy scan; startup must not
+        # block independent sell event registration on discovery I/O.
+        harness.ctx.discovery.conditions.assert_not_awaited()
         harness.ctx.market.subscribe_quotes.assert_not_awaited()
 
     def test_sell_only_keeps_exit_schedules_without_hts_discovery(self):

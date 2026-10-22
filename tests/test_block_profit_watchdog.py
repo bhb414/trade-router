@@ -14,6 +14,7 @@ from trade_router_studio.block_packages import block_package_from_source, render
 from test_block_sell_flows import (
     SellHarness, close_condition, condition_group, profit_condition, sell_flow, settings_for,
 )
+from test_block_realtime_exit_paths import warm_candle_cache
 
 
 def watchdog_harness(*, groups=None):
@@ -109,7 +110,8 @@ def test_fallback_does_not_evaluate_candle_only_branch_when_profit_is_false():
     assert harness.orders == []
 
 
-def test_fallback_keeps_and_conditions_instead_of_selling_on_profit_alone():
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_fallback_keeps_and_conditions_instead_of_selling_on_profit_alone(warm_cache):
     harness, _ = watchdog_harness(groups=[
         condition_group("profit", profit_condition()),
         condition_group("candle", close_condition("999")),
@@ -117,11 +119,15 @@ def test_fallback_keeps_and_conditions_instead_of_selling_on_profit_alone():
 
     async def exercise():
         await harness.prepare_live_position()
+        if warm_cache:
+            await warm_candle_cache(harness)
+        calls_before = len(harness.bar_calls)
         await tick(harness)
+        assert len(harness.bar_calls) == calls_before
 
     asyncio.run(exercise())
     assert len(harness.rest_calls) == 1
-    assert harness.bar_calls
+    assert bool(harness.bar_calls) is warm_cache
     assert harness.orders == []
 
 

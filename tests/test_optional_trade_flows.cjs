@@ -63,7 +63,7 @@ function harness(settings = {}) {
     "addBlockBuyFlow", "removeBlockBuyFlow", "addBlockSellFlow", "removeBlockSellFlow",
     "addBlockExecutionFlow", "removeBlockExecutionFlow",
     "settleBlockFieldEditsForRerender",
-    "normalizeManagedBlockSettings", "buildComposerTreeModel", "createComposerInspector",
+    "normalizeManagedBlockSettings", "blockSellTargetMode", "blockSellTargetSummary", "buildComposerTreeModel", "createComposerInspector",
     "createComposerTreeAddRow",
   ].forEach(name => vm.runInContext(functionSource(name), context));
   return { context, settings, setRunning: value => { running = value; }, renders: () => renders };

@@ -17,6 +17,17 @@ from trade_router import OrderStatus
 SEOUL = ZoneInfo("Asia/Seoul")
 
 
+def _origin_matches(flow_id: object, node_ids: object, request: dict[str, Any]) -> bool:
+    selected_flows = request.get("sell_buy_flow_ids") or ()
+    selected_nodes = request.get("sell_buy_node_refs") or ()
+    if not selected_flows and not selected_nodes:
+        return True
+    return flow_id in selected_flows or any(
+        ref.get("flow_id") == flow_id and ref.get("node_id") in (node_ids or ())
+        for ref in selected_nodes
+    )
+
+
 def _execution_timestamp(value: object) -> float:
     timestamp = datetime.fromisoformat(str(value))
     if timestamp.tzinfo is None:
@@ -85,6 +96,7 @@ class RuntimeStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self._lock = threading.RLock()
+        self._origin_balance_observations: dict[tuple[str, str], tuple[Decimal, float, float]] = {}
         self.recovery: dict[str, Any] | None = None
         self._connection = self._connect()
         try:
@@ -109,6 +121,13 @@ class RuntimeStore:
             self._connection.execute("PRAGMA synchronous=NORMAL")
             self._connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS buy_origin_adjustments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_alias TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS runtime_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     occurred_at TEXT NOT NULL,
@@ -855,21 +874,7 @@ class RuntimeStore:
             limit=1_000,
         )
 
-    def strategy_accounting_orders(
-        self,
-        strategy_id: str,
-        *,
-        account_alias: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Project fills onto their owners without transferring external inventory.
-
-        An explicit ACCOUNT sell consumes the submitting strategy's lots first,
-        then other strategy lots in acquisition order. Any remaining quantity
-        belongs to untracked account inventory and has no strategy cost basis.
-        Replaying individual fills in execution order preserves both ownership
-        and price attribution across partial fills and restarts.
-        Broker orders stay attributed to their submitting strategy in the ledger.
-        """
+    def _accounting_fill_events(self, *, account_alias: str | None = None) -> list[dict[str, Any]]:
         clauses = ["CAST(filled_quantity AS REAL) > 0"]
         values: list[Any] = []
         if account_alias is not None:
@@ -934,6 +939,24 @@ class RuntimeStore:
                     "accounting_at": str(original["updated_at"]),
                 })
         events.sort(key=lambda row: (_execution_timestamp(row["accounting_at"]), int(row["accounting_sequence"])))
+        return events
+
+    def strategy_accounting_orders(
+        self,
+        strategy_id: str,
+        *,
+        account_alias: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Project fills onto their owners without transferring external inventory.
+
+        An explicit ACCOUNT sell consumes the submitting strategy's lots first,
+        then other strategy lots in acquisition order. Any remaining quantity
+        belongs to untracked account inventory and has no strategy cost basis.
+        Replaying individual fills in execution order preserves both ownership
+        and price attribution across partial fills and restarts.
+        Broker orders stay attributed to their submitting strategy in the ledger.
+        """
+        events = self._accounting_fill_events(account_alias=account_alias)
         lots: dict[tuple[str, str], list[dict[str, Any]]] = {}
         attributed: list[dict[str, Any]] = []
         for sequence, row in enumerate(events):
@@ -948,13 +971,13 @@ class RuntimeStore:
             inventory = lots.setdefault(key, [])
             side = str(request.get("side") or "").upper()
             if side == "BUY":
-                inventory.append({"owner": owner, "quantity": quantity})
+                inventory.append({"owner": owner, "quantity": quantity, "buy_flow_id": request.get("buy_flow_id"), "node_ids": request.get("buy_rule_node_ids") or ()})
                 if owner == strategy_id:
                     attributed.append(row)
                 continue
             if side != "SELL":
                 continue
-            candidates = [lot for lot in inventory if lot["owner"] == owner]
+            candidates = [lot for lot in inventory if lot["owner"] == owner and _origin_matches(lot.get("buy_flow_id"), lot["node_ids"], request)]
             if request.get("sell_position_scope") == "ACCOUNT":
                 candidates += [lot for lot in inventory if lot["owner"] != owner]
             remaining = quantity
@@ -988,6 +1011,117 @@ class RuntimeStore:
                 projected["message"] = f"계좌 잔고 대상 전략({owner})의 매도로 이 전략 보유분 {allocated}주를 정리했습니다."
             attributed.append(projected)
         return list(reversed(attributed))
+
+    def strategy_buy_origin_lots(
+        self,
+        strategy_id: str,
+        *,
+        account_alias: str,
+        actual_quantities: dict[str, Decimal] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Replay confirmed fill origins, never assigning legacy/manual inventory.
+
+        Account-level sells consume their owner's lots first, then account FIFO.
+        A linked sell consumes only its selected origins. Observed external
+        reductions are remembered separately from trade accounting so a later
+        manual purchase cannot resurrect an already removed buy origin.
+        """
+        with self._lock, self._connection:
+            events = self._accounting_fill_events(account_alias=account_alias)
+            adjustments = self._fetchall(
+                "SELECT * FROM buy_origin_adjustments WHERE account_alias = ? ORDER BY id",
+                (account_alias,),
+            )
+            timeline = [(_execution_timestamp(row["accounting_at"]), 0, index, row) for index, row in enumerate(events)]
+            timeline += [(_execution_timestamp(row["observed_at"]), 1, int(row["id"]), row) for row in adjustments]
+            inventory: dict[str, list[dict[str, Any]]] = {}
+
+            def consume(candidates: list[dict[str, Any]], amount: Decimal) -> None:
+                for lot in candidates:
+                    taken = min(amount, lot["quantity"])
+                    lot["quantity"] -= taken
+                    amount -= taken
+                    if amount <= 0:
+                        break
+
+            for _, kind, _, row in sorted(timeline, key=lambda item: item[:3]):
+                if kind == 1:
+                    consume(inventory.get(str(row["code"]), []), Decimal(str(row["quantity"])))
+                    continue
+                request = row["request"]
+                code = str(request.get("code") or "")
+                lots = inventory.setdefault(code, [])
+                owner = str(row["strategy_id"])
+                quantity = Decimal(str(row["filled_quantity"]))
+                if request.get("side") == "BUY":
+                    lots.append({"owner": owner, "flow_id": request.get("buy_flow_id"), "node_ids": tuple(request.get("buy_rule_node_ids") or ()), "quantity": quantity})
+                elif request.get("side") == "SELL":
+                    selected = bool(request.get("sell_buy_flow_ids") or request.get("sell_buy_node_refs"))
+                    candidates = [lot for lot in lots if lot["owner"] == owner and _origin_matches(lot["flow_id"], lot["node_ids"], request)]
+                    if request.get("sell_position_scope") == "ACCOUNT" and not selected:
+                        candidates += [lot for lot in lots if lot["owner"] != owner]
+                    consume(candidates, quantity)
+
+            if actual_quantities is not None:
+                unresolved_codes = {str(row["request"].get("code") or "") for row in self.unresolved_orders(account_alias=account_alias)}
+                observed = _execution_timestamp(as_of.isoformat()) if as_of is not None else None
+                latest_by_code: dict[str, float] = {}
+                for timestamp, kind, _, row in timeline:
+                    code = str(row["code"] if kind else row["request"].get("code") or "")
+                    latest_by_code[code] = max(latest_by_code.get(code, 0), timestamp)
+                for code, lots in inventory.items():
+                    observation_key = (account_alias, code)
+                    actual = max(Decimal("0"), actual_quantities.get(code, Decimal("0")))
+                    missing = sum((lot["quantity"] for lot in lots), Decimal("0")) - actual
+                    if missing <= 0:
+                        self._origin_balance_observations.pop(observation_key, None)
+                        continue
+                    # Never persist an old balance or an unconfirmed pending
+                    # fill as an external sell. Returned quantities still obey
+                    # the broker snapshot's conservative cap.
+                    # KIS may return its one-second cached payload with a new
+                    # as_of value. Require two consistent observations beyond
+                    # that cache interval and a fill-settlement grace period.
+                    latest = latest_by_code.get(code, 0)
+                    if observed is not None and observed >= latest + 5 and code not in unresolved_codes:
+                        previous = self._origin_balance_observations.get(observation_key)
+                        if previous is not None and previous[:2] == (missing, latest) and observed >= previous[2] + 2:
+                            self._connection.execute(
+                                "INSERT INTO buy_origin_adjustments(account_alias, code, quantity, observed_at) VALUES (?, ?, ?, ?)",
+                                (account_alias, code, str(missing), as_of.isoformat()),
+                            )
+                            self._origin_balance_observations.pop(observation_key, None)
+                        elif previous is None or previous[:2] != (missing, latest):
+                            self._origin_balance_observations[observation_key] = (missing, latest, observed)
+                    else:
+                        self._origin_balance_observations.pop(observation_key, None)
+                    consume(lots, missing)
+
+            result: dict[str, list[dict[str, Any]]] = {}
+            for code, lots in inventory.items():
+                for lot in lots:
+                    flow_id = lot["flow_id"]
+                    if lot["owner"] != strategy_id or not flow_id or lot["quantity"] <= 0:
+                        continue
+                    result.setdefault(code, []).append({"flow_id": str(flow_id), "node_ids": lot["node_ids"], "quantity": lot["quantity"]})
+            return result
+
+    def strategy_buy_flow_quantities(
+        self, strategy_id: str, *, account_alias: str,
+        actual_quantities: dict[str, Decimal] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, dict[str, Decimal]]:
+        result: dict[str, dict[str, Decimal]] = {}
+        for code, lots in self.strategy_buy_origin_lots(
+            strategy_id, account_alias=account_alias,
+            actual_quantities=actual_quantities, as_of=as_of,
+        ).items():
+            quantities = result.setdefault(code, {})
+            for lot in lots:
+                flow_id = lot["flow_id"]
+                quantities[flow_id] = quantities.get(flow_id, Decimal("0")) + lot["quantity"]
+        return result
 
     def strategy_position_quantities(
         self,
@@ -1090,6 +1224,10 @@ class RuntimeStore:
         with self._lock, self._connection:
             self._connection.execute(
                 "UPDATE order_ledger SET account_alias = ? WHERE account_alias = ?",
+                (new, old),
+            )
+            self._connection.execute(
+                "UPDATE buy_origin_adjustments SET account_alias = ? WHERE account_alias = ?",
                 (new, old),
             )
             self._connection.execute(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -103,6 +104,62 @@ class SettingsTokenStore:
         await asyncio.to_thread(self._settings.delete_token, scope)
 
 
+class _FairPriorityGate:
+    """One request at a time, with bounded overtaking of older low-priority work."""
+
+    def __init__(self, *, max_overtakes: int = 8) -> None:
+        self._waiters: list[tuple[int, asyncio.Future[None]]] = []
+        self._owner: asyncio.Future[None] | None = None
+        self._overtakes = 0
+        self._max_overtakes = max(1, max_overtakes)
+        self._closed = False
+
+    def _wake_next(self) -> None:
+        if self._owner is not None or self._closed:
+            return
+        self._waiters = [item for item in self._waiters if not item[1].done()]
+        if not self._waiters:
+            self._overtakes = 0
+            return
+        index = 0 if self._overtakes >= self._max_overtakes else min(
+            range(len(self._waiters)), key=lambda i: self._waiters[i][0],
+        )
+        self._overtakes = self._overtakes + 1 if index else 0
+        _, self._owner = self._waiters.pop(index)
+        self._owner.set_result(None)
+
+    def _release(self, waiter: asyncio.Future[None]) -> None:
+        if self._owner is waiter:
+            self._owner = None
+        self._waiters = [item for item in self._waiters if item[1] is not waiter]
+        self._wake_next()
+
+    @asynccontextmanager
+    async def enter(self, priority: int):
+        if self._closed:
+            raise RuntimeError("Broker request gate is closed.")
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append((int(priority), waiter))
+        self._wake_next()
+        try:
+            await waiter
+        except BaseException:
+            # Cancellation can arrive just after the slot has been granted.
+            self._release(waiter)
+            raise
+        try:
+            yield
+        finally:
+            self._release(waiter)
+
+    def close(self) -> None:
+        self._closed = True
+        for _, waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_exception(RuntimeError("Broker request gate is closed."))
+        self._waiters.clear()
+
+
 class ConnectionRuntime:
     """Owns connection authentication and shared request throttling for Studio."""
 
@@ -123,8 +180,9 @@ class ConnectionRuntime:
         self._statuses: dict[str, dict[str, Any]] = {}
         self._approval_keys: dict[str, tuple[str, datetime]] = {}
         self._approval_locks: dict[str, asyncio.Lock] = {}
-        self._kis_request_locks: dict[str, asyncio.Lock] = {}
+        self._kis_request_gates: dict[str, _FairPriorityGate] = {}
         self._kis_last_request_completed: dict[str, float] = {}
+        self._closing = False
 
     async def check(self, connection_id: str) -> dict[str, Any]:
         connection = self._settings.get_connection(connection_id)
@@ -1768,6 +1826,9 @@ class ConnectionRuntime:
         return tuple(bars[-count:])
 
     async def close(self) -> None:
+        self._closing = True
+        for gate in self._kis_request_gates.values():
+            gate.close()
         await self._requests.close()
         if self._owns_http:
             await self._http.aclose()
@@ -1833,29 +1894,53 @@ class ConnectionRuntime:
         operation: Any,
         *,
         order_submission: bool = False,
-    ) -> httpx.Response:
-        """Serialize one KIS key and reserve a quiet window before an order.
+        priority: RequestPriority = RequestPriority.STRATEGY_DATA,
+        record_completion: bool = True,
+    ) -> Any:
+        """Prioritize one KIS key and reserve a quiet window before an order.
 
         KIS can return EGW00201 when a valid order immediately follows account
         or market-data REST traffic even though the documented aggregate rate
-        has not been exceeded. Holding the per-key lock during this short quiet
+        has not been exceeded. Holding the per-key gate during this short quiet
         window prevents Studio refreshes and strategy reads from racing the
         final submission boundary.
         """
 
-        lock = self._kis_request_locks.setdefault(rate_scope, asyncio.Lock())
-        async with lock:
+        if self._closing:
+            raise RuntimeError("Connection runtime is closing.")
+        gate = self._kis_request_gates.setdefault(rate_scope, _FairPriorityGate())
+        async with gate.enter(priority):
             if order_submission:
                 now = asyncio.get_running_loop().time()
                 last_completed = self._kis_last_request_completed.get(rate_scope)
                 if last_completed is not None:
                     await asyncio.sleep(max(0.0, 1.1 - (now - last_completed)))
             try:
-                return await operation()
+                # RequestManager shields accepted requests. If the caller is
+                # cancelled, retain this gate until that HTTP request finishes;
+                # otherwise a second request could race a still-active order.
+                task = asyncio.create_task(operation())
+                cancelled = False
+                while True:
+                    try:
+                        result = await asyncio.shield(task)
+                        break
+                    except asyncio.CancelledError:
+                        if task.cancelled():
+                            raise
+                        cancelled = True
+                    except BaseException:
+                        if cancelled:
+                            raise asyncio.CancelledError() from None
+                        raise
+                if cancelled:
+                    raise asyncio.CancelledError()
+                return result
             finally:
-                self._kis_last_request_completed[rate_scope] = (
-                    asyncio.get_running_loop().time()
-                )
+                if record_completion:
+                    self._kis_last_request_completed[rate_scope] = (
+                        asyncio.get_running_loop().time()
+                    )
 
     def _token_scope(self, connection: dict[str, Any]) -> TokenScopeKey:
         return TokenScopeKey(
@@ -2580,27 +2665,28 @@ class ConnectionRuntime:
 
         async def send() -> tuple[dict[str, Any], httpx.Response]:
             try:
-                response = await self._kis_guarded_request(
-                    rate_scope,
-                    lambda: self._http.get(
-                        url,
-                        headers={
-                            "Content-Type": "application/json; charset=UTF-8",
-                            "authorization": f"{token.token_type} {token.value}",
-                            "appkey": credentials["app_key"],
-                            "appsecret": credentials["app_secret"],
-                            "tr_id": tr_id,
-                            "custtype": "P",
-                            **({"tr_cont": tr_cont} if tr_cont else {}),
-                        },
-                        params=params,
-                    ),
+                response = await self._http.get(
+                    url,
+                    headers={
+                        "Content-Type": "application/json; charset=UTF-8",
+                        "authorization": f"{token.token_type} {token.value}",
+                        "appkey": credentials["app_key"],
+                        "appsecret": credentials["app_secret"],
+                        "tr_id": tr_id,
+                        "custtype": "P",
+                        **({"tr_cont": tr_cont} if tr_cont else {}),
+                    },
+                    params=params,
                 )
             except httpx.HTTPError as exc:
                 raise RouterError(
                     RouterErrorCode.INVALID_REQUEST,
                     "증권사 API 요청에 실패했습니다.",
                 ) from exc
+            finally:
+                # A cache hit does not send HTTP and must not extend the order
+                # quiet period. Record only actual read attempts here.
+                self._kis_last_request_completed[rate_scope] = asyncio.get_running_loop().time()
             payload = _safe_json(response)
             code = str(payload.get("msg_cd") or "")
             message = str(payload.get("msg1") or "증권사 조회 요청이 거부되었습니다.")
@@ -2632,6 +2718,9 @@ class ConnectionRuntime:
                 )
             return payload, response
 
+        # Quotes and account checks feed live exits; candle/search traffic
+        # must not occupy the next slot ahead of them.
+        priority = min(priority, RequestPriority.ACCOUNT) if operation == "market.quote" else priority
         intent = BrokerRequestIntent(
             connection_id=connection_id,
             operation=operation,
@@ -2644,7 +2733,13 @@ class ConnectionRuntime:
             cache_ttl=cache_ttl,
         )
         try:
-            return await self._requests.execute(intent, send)
+            # Admission must precede RequestManager's worker pool. Otherwise
+            # one active candle HTTP plus one candle waiting on this gate can
+            # occupy both workers and hide a queued stop-loss request from it.
+            return await self._kis_guarded_request(
+                rate_scope, lambda: self._requests.execute(intent, send),
+                priority=priority, record_completion=False,
+            )
         except RouterError as exc:
             if exc.code is RouterErrorCode.RATE_LIMITED and rate_limit_retries > 0:
                 await asyncio.sleep(
@@ -2706,21 +2801,17 @@ class ConnectionRuntime:
 
         async def send() -> tuple[dict[str, Any], httpx.Response]:
             try:
-                response = await self._kis_guarded_request(
-                    rate_scope,
-                    lambda: self._http.post(
-                        url,
-                        headers={
-                            "Content-Type": "application/json; charset=UTF-8",
-                            "authorization": f"{token.token_type} {token.value}",
-                            "appkey": credentials["app_key"],
-                            "appsecret": credentials["app_secret"],
-                            "tr_id": tr_id,
-                            "custtype": "P",
-                        },
-                        json=body,
-                    ),
-                    order_submission=True,
+                response = await self._http.post(
+                    url,
+                    headers={
+                        "Content-Type": "application/json; charset=UTF-8",
+                        "authorization": f"{token.token_type} {token.value}",
+                        "appkey": credentials["app_key"],
+                        "appsecret": credentials["app_secret"],
+                        "tr_id": tr_id,
+                        "custtype": "P",
+                    },
+                    json=body,
                 )
             except httpx.HTTPError as exc:
                 # The socket may have failed after KIS accepted the order.
@@ -2744,8 +2835,7 @@ class ConnectionRuntime:
                 )
             return payload, response
 
-        return await self._requests.execute(
-            BrokerRequestIntent(
+        intent = BrokerRequestIntent(
                 connection_id=connection_id,
                 operation="orders.change" if path.endswith("order-rvsecncl") else "orders.submit",
                 priority=RequestPriority.ORDER,
@@ -2757,8 +2847,10 @@ class ConnectionRuntime:
                 # must not cache or retry a broker order.
                 dedupe_key=None,
                 cache_ttl=0,
-            ),
-            send,
+            )
+        return await self._kis_guarded_request(
+            rate_scope, lambda: self._requests.execute(intent, send),
+            order_submission=True, priority=RequestPriority.ORDER,
         )
 
 

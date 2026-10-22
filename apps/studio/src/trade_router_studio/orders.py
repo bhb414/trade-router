@@ -1347,6 +1347,22 @@ class OrderService:
                     RouterErrorCode.RISK_LIMIT_EXCEEDED,
                     "매도 가능한 보유 수량보다 요청 수량이 큽니다.",
                 )
+            if request.sell_buy_flow_ids or request.sell_buy_node_refs:
+                origin_lots = self._store.strategy_buy_origin_lots(
+                    manifest.strategy_id, account_alias=account_alias,
+                    actual_quantities={item.instrument.code: item.quantity for item in balance.positions},
+                    as_of=balance.as_of,
+                ).get(request.instrument.code, [])
+                linked_quantity = sum((lot["quantity"] for lot in origin_lots if (
+                    lot["flow_id"] in request.sell_buy_flow_ids
+                    or any(ref["flow_id"] == lot["flow_id"] and ref["node_id"] in lot["node_ids"] for ref in request.sell_buy_node_refs)
+                )), Decimal("0"))
+                if request.quantity > linked_quantity:
+                    raise RouterError(
+                        RouterErrorCode.RISK_LIMIT_EXCEEDED,
+                        "연결한 매수 조건으로 체결된 보유 수량보다 매도 요청 수량이 큽니다.",
+                        details={"linked_quantity": str(linked_quantity)},
+                    )
             amount = (request.price or position.market_price or position.average_price) * request.quantity
 
         max_order = _optional_decimal(limits.get("max_order_amount"))
@@ -1403,6 +1419,10 @@ def _request_payload(
         "route": request.route.value,
         "provider_options": request.provider_options,
         "sell_position_scope": request.sell_position_scope,
+        "buy_flow_id": request.buy_flow_id,
+        "sell_buy_flow_ids": list(request.sell_buy_flow_ids),
+        "buy_rule_node_ids": list(request.buy_rule_node_ids),
+        "sell_buy_node_refs": list(request.sell_buy_node_refs),
         "reserved_amount": str(reserved_amount),
     }
 
@@ -1410,7 +1430,7 @@ def _request_payload(
 def _same_request(stored: dict[str, object], request: OrderRequest) -> bool:
     comparison = _request_payload(request, reserved_amount=Decimal("0"))
     comparison.pop("reserved_amount")
-    normalized = {"sell_position_scope": "STRATEGY", **stored}
+    normalized = {"sell_position_scope": "STRATEGY", "buy_flow_id": None, "sell_buy_flow_ids": [], "buy_rule_node_ids": [], "sell_buy_node_refs": [], **stored}
     return all(normalized.get(key) == value for key, value in comparison.items())
 
 
@@ -1529,6 +1549,10 @@ def _order_from_row(row: dict[str, object]) -> Order:
         price=(Decimal(str(payload["price"])) if payload.get("price") is not None else None),
         provider_options=dict(payload.get("provider_options") or {}),
         sell_position_scope=str(payload.get("sell_position_scope") or "STRATEGY"),
+        buy_flow_id=payload.get("buy_flow_id"),
+        sell_buy_flow_ids=tuple(payload.get("sell_buy_flow_ids") or ()),
+        buy_rule_node_ids=tuple(payload.get("buy_rule_node_ids") or ()),
+        sell_buy_node_refs=tuple(payload.get("sell_buy_node_refs") or ()),
     )
     return Order(
         id=str(row["id"]),
@@ -1587,6 +1611,10 @@ def _order_event_payload(row: dict[str, Any]) -> dict[str, Any]:
             "route": order.request.route.value,
             "provider_options": order.request.provider_options,
             "sell_position_scope": order.request.sell_position_scope,
+            "buy_flow_id": order.request.buy_flow_id,
+            "sell_buy_flow_ids": list(order.request.sell_buy_flow_ids),
+            "buy_rule_node_ids": list(order.request.buy_rule_node_ids),
+            "sell_buy_node_refs": list(order.request.sell_buy_node_refs),
         },
     }
 

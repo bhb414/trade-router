@@ -54,7 +54,7 @@ function harness(settings = {}) {
     "blockBuyFlows", "blockSellFlows", "blockExecutionFlows", "blockFlowNodePrefix", "blockPackageFields",
     "blockSellPositionScopeField", "blockSellPositionScopeDefinition", "blockFieldOptions",
     "normalizeBlockPackageValue", "applyBlockFieldEdit", "createBlockFieldControl", "currentBlockModel",
-    "normalizeManagedBlockSettings", "buildComposerTreeModel", "loadBlockEditorData",
+    "normalizeManagedBlockSettings", "blockSellTargetMode", "blockSellTargetSummary", "buildComposerTreeModel", "loadBlockEditorData",
   ].forEach(name => vm.runInContext(functionSource(name), context));
   return { context, settings, setRunning: value => { running = value; }, renders: () => renders };
 }

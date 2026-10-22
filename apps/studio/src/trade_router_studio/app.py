@@ -8,6 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal
 import json
 import os
+import re
 from pathlib import Path
 import time
 from typing import Literal
@@ -150,11 +151,29 @@ class OrderSubmissionRegistration(BaseModel):
     price: Decimal | None = Field(default=None, gt=0)
     provider_options: dict[str, object] = Field(default_factory=dict)
     sell_position_scope: Literal["STRATEGY", "ACCOUNT"] = "STRATEGY"
+    buy_flow_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    sell_buy_flow_ids: list[str] = Field(default_factory=list, max_length=64)
+    buy_rule_node_ids: list[str] = Field(default_factory=list, max_length=256)
+    sell_buy_node_refs: list[dict[str, str]] = Field(default_factory=list, max_length=64)
 
     @model_validator(mode="after")
     def validate_sell_scope(self) -> "OrderSubmissionRegistration":
         if self.side is not OrderSide.SELL and self.sell_position_scope != "STRATEGY":
             raise ValueError("계좌 잔고 대상은 매도 주문에만 지정할 수 있습니다.")
+        if self.buy_flow_id is not None and self.side is not OrderSide.BUY:
+            raise ValueError("매수 출처는 매수 주문에만 지정할 수 있습니다.")
+        if self.sell_buy_flow_ids and (self.side is not OrderSide.SELL or self.sell_position_scope != "STRATEGY"):
+            raise ValueError("연결한 매수 조건은 이 전략의 매도 주문에만 지정할 수 있습니다.")
+        if len(set(self.sell_buy_flow_ids)) != len(self.sell_buy_flow_ids) or any(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None for value in self.sell_buy_flow_ids):
+            raise ValueError("연결한 매수 조건 ID가 올바르지 않습니다.")
+        # Keep HTTP and SDK validation identical, including node references.
+        OrderRequest(
+            instrument=InstrumentId(self.code), side=self.side, order_type=self.order_type,
+            quantity=self.quantity, client_order_id=self.client_order_id,
+            route=self.route, price=self.price, sell_position_scope=self.sell_position_scope,
+            buy_flow_id=self.buy_flow_id, sell_buy_flow_ids=tuple(self.sell_buy_flow_ids),
+            buy_rule_node_ids=tuple(self.buy_rule_node_ids), sell_buy_node_refs=tuple(self.sell_buy_node_refs),
+        )
         return self
 
 
@@ -2514,6 +2533,10 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 price=body.price,
                 provider_options=dict(body.provider_options),
                 sell_position_scope=body.sell_position_scope,
+                buy_flow_id=body.buy_flow_id,
+                sell_buy_flow_ids=tuple(body.sell_buy_flow_ids),
+                buy_rule_node_ids=tuple(body.buy_rule_node_ids),
+                sell_buy_node_refs=tuple(body.sell_buy_node_refs),
             )
             order = await order_engine().submit(
                 strategy_name=session.strategy_name,
@@ -3316,6 +3339,19 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             if manifest is not None
             else {}
         )
+        buy_origin_lots = (
+            journal().strategy_buy_origin_lots(
+                manifest.strategy_id, account_alias=account,
+                actual_quantities={position.instrument.code: position.quantity for position in balance.positions},
+                as_of=balance.as_of,
+            )
+            if manifest is not None else {}
+        )
+        buy_flow_quantities = {}
+        for code, lots in buy_origin_lots.items():
+            quantities = buy_flow_quantities.setdefault(code, {})
+            for lot in lots:
+                quantities[lot["flow_id"]] = quantities.get(lot["flow_id"], Decimal("0")) + lot["quantity"]
         journal().remember_instrument_names(
             {
                 position.instrument.code: position.name
@@ -3360,6 +3396,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                         )
                     ),
                     "name": position.name,
+                    "buy_origin_lots": [
+                        {"flow_id": lot["flow_id"], "node_ids": list(lot["node_ids"]), "quantity": str(lot["quantity"])}
+                        for lot in buy_origin_lots.get(position.instrument.code, [])
+                    ],
+                    "buy_flow_quantities": {
+                        flow_id: str(quantity)
+                        for flow_id, quantity in buy_flow_quantities.get(position.instrument.code, {}).items()
+                    },
                 }
                 for position in balance.positions
             ],
@@ -4255,6 +4299,10 @@ def _order_payload(order: Order) -> dict[str, object]:
             "route": order.request.route.value,
             "provider_options": order.request.provider_options,
             "sell_position_scope": order.request.sell_position_scope,
+            "buy_flow_id": order.request.buy_flow_id,
+            "sell_buy_flow_ids": list(order.request.sell_buy_flow_ids),
+            "buy_rule_node_ids": list(order.request.buy_rule_node_ids),
+            "sell_buy_node_refs": list(order.request.sell_buy_node_refs),
         },
     }
 

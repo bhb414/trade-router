@@ -316,13 +316,20 @@ def test_non_hts_flows_do_not_inherit_unused_top_level_discovery_requirements():
     assert "rankings" not in harness.strategy.config.required_capabilities["primary"]
 
 
-def test_every_hts_flow_validates_its_selected_condition_at_startup():
+def test_hts_identity_is_validated_in_buy_lane_without_stopping_exits():
     harness = Harness(settings_for([
         flow(expected_condition_name="장초반"),
         flow("midday", expected_condition_name="잘못된 이름"),
     ]))
-    with pytest.raises(RuntimeError, match="이름"):
-        asyncio.run(harness.strategy.on_start(harness.ctx))
+    async def exercise():
+        await harness.strategy.on_start(harness.ctx)
+        await harness.tick()
+        harness.now = at("10:00:00")
+        before = len(harness.order_calls)
+        await harness.tick("midday")
+        assert len(harness.order_calls) == before
+        assert any("HTS 조건식 ID·이름" in message for message in harness.logs)
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("change", [
@@ -696,6 +703,7 @@ def test_one_portfolio_and_sell_flow_manage_buys_from_both_time_windows():
 
     asyncio.run(exercise())
     assert {order["code"] for order in harness.sell_calls} == {"005930", "000660"}
+    # The post-fill balance confirms these complete exits have no remainder.
     assert harness.ctx.state.get("strategy_positions") == {}
 
 

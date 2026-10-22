@@ -47,7 +47,7 @@ function harness(kind = "buy") {
   [
     "orderTypeLabel", "blockOrderTypeOptions", "blockOrderTypeHint", "blockFieldOptions",
     "createBlockRuleActionEditor", "updateBlockRuleAction", "newBlockOrderAction", "nextBlockRuleId",
-    "collectComposerRuleDefinitions", "walkBlockRule", "blockRuleConditionNodes",
+    "blockSellFlows", "blockSellFlow", "blockSellTargetMode", "collectComposerRuleDefinitions", "walkBlockRule", "blockRuleConditionNodes",
     "tradeHistoryTable", "renderOrders", "orderStatusPresentation",
   ].forEach(name => vm.runInContext(functionSource(name), context));
   return { context, root, commits: () => commits };

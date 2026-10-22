@@ -1962,7 +1962,7 @@ def test_managed_block_strategy_uses_realtime_quote_for_take_profit() -> None:
             "code": "079650",
             "quantity": Decimal("5"),
             "route": "KRX",
-            "client_order_id": "live-exit-079650-20261016100000000000-sell",
+                "client_order_id": "live-exit-default-079650-20261016100000000000-sell",
         }
     ]
 
