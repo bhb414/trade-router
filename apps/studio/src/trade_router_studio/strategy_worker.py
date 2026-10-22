@@ -6,7 +6,9 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ from trade_router import (
 from trade_router.client import fill_from_event, orderbook_from_event, quote_from_event, _order_from_payload
 
 from trade_router_studio.event_bus import RuntimeEventBuffer
+from trade_router_studio.file_io import read_shared_text, replace_snapshot
 
 
 class StrategyLogger:
@@ -36,7 +39,21 @@ class StrategyLogger:
 
 
 class StrategyState:
-    def __init__(self, strategy_name: str) -> None:
+    """Durable snapshots, with a recovery journal for Windows sharing locks.
+
+    set() never acknowledges an in-memory-only update. Normally it atomically
+    replaces the main snapshot; when that path is held open, the same fsynced
+    snapshot is committed to a journal before returning. Only its promotion is
+    retried off the event loop. Revisions prevent an obsolete journal from
+    reviving state after a newer main snapshot was committed.
+    """
+
+    _REVISION_KEY = "__trade_router_state_revision__"
+    _RETRY_SECONDS = 0.1
+    _CLOSE_TIMEOUT = 1.5
+    _WARNING_SECONDS = 30.0
+
+    def __init__(self, strategy_name: str, logger: StrategyLogger | None = None) -> None:
         root = Path(os.environ["TRADE_ROUTER_HOME"])
         safe_name = "".join(
             character if character.isalnum() or character in "-_" else "_"
@@ -44,28 +61,188 @@ class StrategyState:
         )
         self._path = root / "data" / "strategy-state" / f"{safe_name}.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._values = self._load()
+        self._pending_path = self._path.with_suffix(".json.pending")
+        self._log = logger or StrategyLogger()
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._writer: threading.Thread | None = None
+        self._closed = False
+        self._close_deadline: float | None = None
+        self._error: BaseException | None = None
+        self._last_warning = 0.0
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
+        self.failure: asyncio.Future[BaseException] | None = (
+            self._loop.create_future() if self._loop is not None else None
+        )
+        self._values, self._revision = self._read_snapshot(self._path)
+        self._persisted_revision = self._revision
+        self._pending_revision: int | None = None
+        if self._pending_path.exists():
+            pending, revision = self._read_snapshot(self._pending_path, required=True)
+            self._pending_revision = revision
+            if revision > self._revision:
+                self._values, self._revision = pending, revision
+                self._log.warning("이전 실행의 전략 상태 저장 기록을 복구했습니다.")
+            with self._lock:
+                if not self._promote_pending_locked():
+                    self._start_writer_locked()
 
     def get(self, key: str, default: Any = None) -> Any:
+        self._raise_failure()
         return self._values.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        self._values[key] = value
-        temporary = self._path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(self._values, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self._path)
+        if key == self._REVISION_KEY:
+            raise ValueError("Reserved strategy state key.")
+        with self._lock:
+            self._raise_failure()
+            if self._closed:
+                raise RuntimeError("Strategy state is closed.")
+            values = {**self._values, key: value}
+            revision = self._revision + 1
+            # Validate/serialize before touching the committed in-memory state.
+            serialized = json.dumps(
+                {**values, self._REVISION_KEY: revision}, ensure_ascii=False, indent=2,
+            )
+            temporary = self._write_snapshot(serialized)
+            try:
+                try:
+                    replace_snapshot(temporary, self._path)
+                except PermissionError:
+                    # Unlike the displayed/main snapshot, nobody keeps this
+                    # journal open. Failure here must propagate to the worker.
+                    replace_snapshot(temporary, self._pending_path)
+                    self._pending_revision = revision
+                    self._warn_pending_locked()
+                    self._start_writer_locked()
+                else:
+                    self._persisted_revision = revision
+                    if self._pending_revision is not None:
+                        if not self._promote_pending_locked():
+                            self._start_writer_locked()
+                self._values, self._revision = values, revision
+            finally:
+                # Never remove a committed journal/main snapshot on failure.
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    def _load(self) -> dict[str, Any]:
-        if not self._path.exists():
-            return {}
+    def _write_snapshot(self, serialized: str) -> Path:
+        fd, name = tempfile.mkstemp(prefix=self._path.name + ".", suffix=".tmp", dir=self._path.parent)
+        temporary = Path(name)
         try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        return payload if isinstance(payload, dict) else {}
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return temporary
+
+    def _read_snapshot(self, path: Path, *, required: bool = False) -> tuple[dict[str, Any], int]:
+        try:
+            payload = json.loads(read_shared_text(path))
+            if not isinstance(payload, dict):
+                raise ValueError("Strategy state must be an object.")
+            revision = payload.pop(self._REVISION_KEY, 0)
+            if (not isinstance(revision, int) or isinstance(revision, bool)
+                    or revision < (1 if required else 0)):
+                raise ValueError("Invalid strategy state revision.")
+            return payload, revision
+        except FileNotFoundError as exc:
+            if not required:
+                return {}, 0
+            raise RuntimeError("전략 상태 복구 기록을 읽지 못했습니다. 기존 파일을 보존합니다.") from exc
+        except (OSError, ValueError) as exc:
+            # An unreadable main file is not revision zero: promoting an older
+            # leftover journal would resurrect obsolete holdings/order state.
+            description = "전략 상태 복구 기록" if required else "기존 전략 상태 파일"
+            raise RuntimeError(f"{description}을 읽지 못했습니다. 기존 파일을 보존합니다.") from exc
+
+    def _promote_pending_locked(self) -> bool:
+        if self._pending_revision is None:
+            return True
+        try:
+            if self._pending_revision <= self._persisted_revision:
+                # A newer normal save won. An old journal is cleanup-only and
+                # must never replace it, including after a crash/restart.
+                self._pending_path.unlink(missing_ok=True)
+            else:
+                replace_snapshot(self._pending_path, self._path)
+                self._persisted_revision = self._pending_revision
+        except PermissionError:
+            self._warn_pending_locked()
+            return False
+        self._pending_revision = None
+        return True
+
+    def _warn_pending_locked(self) -> None:
+        now = time.monotonic()
+        if self._last_warning == 0.0 or now - self._last_warning >= self._WARNING_SECONDS:
+            self._last_warning = now
+            self._log.warning(
+                "전략 상태 파일이 다른 작업에 사용 중입니다. 변경 내용은 복구 기록에 저장했으며 "
+                "매도 감시를 유지하면서 파일 반영을 재시도합니다."
+            )
+
+    def _start_writer_locked(self) -> None:
+        if self._writer is None:
+            self._writer = threading.Thread(
+                target=self._retry_pending, name="trade-router-state-writer", daemon=True,
+            )
+            self._writer.start()
+        self._wake.set()
+
+    def _retry_pending(self) -> None:
+        try:
+            while True:
+                self._wake.wait(self._RETRY_SECONDS)
+                self._wake.clear()
+                with self._lock:
+                    clean = self._promote_pending_locked()
+                    if self._closed:
+                        if clean or time.monotonic() >= (self._close_deadline or 0.0):
+                            return
+                if clean:
+                    # Sleep until the next locked save or close, with no polling.
+                    self._wake.wait()
+        except BaseException as exc:
+            with self._lock:
+                self._error = exc
+            self._log.error(f"전략 상태 저장 기록을 반영하지 못했습니다: {exc}")
+            if self._loop is not None and self.failure is not None:
+                def report(error: BaseException = exc) -> None:
+                    if self.failure is not None and not self.failure.done():
+                        self.failure.set_result(error)
+                try:
+                    self._loop.call_soon_threadsafe(report)
+                except RuntimeError:
+                    pass
+
+    def _raise_failure(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("전략 상태 저장에 실패했습니다. 복구 기록을 확인하세요.") from self._error
+
+    def close(self) -> None:
+        """Flush promotion briefly; a locked but durable journal survives exit."""
+        with self._lock:
+            self._closed = True
+            self._close_deadline = time.monotonic() + self._CLOSE_TIMEOUT
+            self._wake.set()
+            writer = self._writer
+        if writer is not None:
+            writer.join(self._CLOSE_TIMEOUT + self._RETRY_SECONDS * 2)
+        if self._pending_revision is not None:
+            self._log.warning("전략 상태 복구 기록을 보존했습니다. 다음 실행에서 이어서 복구합니다.")
+        self._raise_failure()
 
 
 async def _dispatch_event(strategy: Strategy, context: StrategyContext, event: dict[str, Any]) -> None:
@@ -175,10 +352,16 @@ async def _run_events(strategy: Strategy, context: StrategyContext, runtime: Any
                 await dispatcher.submit(event)
 
     receiver = asyncio.create_task(receive(), name="strategy-events")
+    state_failure = getattr(getattr(context, "state", None), "failure", None)
+    waiters = {stop_signal, receiver, dispatcher.failure}
+    if state_failure is not None:
+        waiters.add(state_failure)
     try:
         done, _ = await asyncio.wait(
-            {stop_signal, receiver, dispatcher.failure}, return_when=asyncio.FIRST_COMPLETED,
+            waiters, return_when=asyncio.FIRST_COMPLETED,
         )
+        if state_failure is not None and state_failure in done:
+            raise state_failure.result()
         if stop_signal not in done:
             if dispatcher.failure in done:
                 raise dispatcher.failure.result()
@@ -197,7 +380,14 @@ async def run(path: Path) -> None:
         raise RuntimeError("Strategy class must define a StrategyConfig named 'config'.")
 
     logger = StrategyLogger()
-    state = StrategyState(path.name)
+    state = StrategyState(path.name, logger)
+    try:
+        await _run_with_state(strategy, config, logger, state)
+    finally:
+        await asyncio.to_thread(state.close)
+
+
+async def _run_with_state(strategy: Strategy, config: Any, logger: StrategyLogger, state: StrategyState) -> None:
     async with AsyncTradeRouter(strategy=config) as router:
         context = StrategyContext(
             config=config,

@@ -52,6 +52,7 @@ from .block_packages import (
 from .connections import ConnectionRuntime
 from .diagnostics import build_diagnostics, snapshot_manager
 from .event_bus import StrategyEventBus
+from .file_io import read_shared_text
 from .instrument_catalog import InstrumentCatalog
 from .paths import WorkspacePaths
 from .runtime_scheduler import RuntimeScheduler, schedule_from_dict
@@ -380,7 +381,7 @@ def _workspace_instrument_names(
     names: dict[str, str] = {}
     for path in paths:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(read_shared_text(path))
         except (OSError, ValueError, TypeError):
             continue
         values = payload.get("instrument_names", {}) if isinstance(payload, dict) else {}
