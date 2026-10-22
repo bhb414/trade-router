@@ -1624,7 +1624,7 @@ function blockSellPositionScopeField() {
 function blockSellPositionScopeDefinition(settings) {
   const accountScope = settings.sell_position_scope === "ACCOUNT";
   return {
-    id: "sellTargets", title: "보유종목 대상 범위", meta: "보유종목 직접 선택 · 기존 시간 방식에 적용",
+    id: "sellTargets", title: "보유종목 대상 범위", meta: "보유종목 직접 선택에 적용",
     tone: "target", logic: "대상", logicTone: "universe", width: 460,
     fields: [blockSellPositionScopeField()],
     summary: [accountScope ? "계좌 전체 보유종목" : "이 전략 보유종목"],
@@ -1645,7 +1645,7 @@ const BLOCK_BUY_FLOW_FIELDS = [
 
 const BLOCK_SELL_FLOW_FIELDS = [
   "target_mode", "buy_flow_ids", "buy_node_refs",
-  "sell_scan_seconds", "sell_start_time", "sell_end_time", "sell_condition_groups", "sell_rule_tree",
+  "operating_start_time", "operating_end_time", "sell_scan_seconds", "sell_condition_groups", "sell_rule_tree",
 ];
 
 function blockBuyFlows() {
@@ -1689,19 +1689,18 @@ function blockSellFlowFields(flow) {
       return {
         id: `sell-flow:${flow.id}:${settingKey}`, flowKind: "sell", flowId: flow.id,
         settingKey, sourceName,
-        label: ({ name: "흐름 이름", target_mode: "매도 대상 방식", buy_flow_ids: "연결할 매수 흐름 · 조건", sell_scan_seconds: "봉 조건 확인 간격(초)" })[settingKey] || label,
+        label: ({ name: "흐름 이름", target_mode: "매도 대상 방식", buy_flow_ids: "연결할 매수 흐름 · 조건", operating_start_time: "작동 시작", operating_end_time: "작동 종료", sell_scan_seconds: "봉 조건 확인 간격(초)" })[settingKey] || label,
         category, type: settingKey === "buy_flow_ids" ? "flow_ids" : settingKey === "buy_node_refs" ? "node_refs" : BLOCK_PACKAGE_FIELD_TYPES[settingKey] || "string", value: flow[settingKey],
       };
     });
 }
 
 function blockSellTargetMode(flow) {
-  return flow?.target_mode || "LEGACY_TIME";
+  return flow?.target_mode === "BUY_FLOWS" ? "BUY_FLOWS" : "POSITION_SCOPE";
 }
 
 function blockSellTargetSummary(flow, settings = state.blockPackage?.settings || {}) {
   const mode = blockSellTargetMode(flow);
-  if (mode === "LEGACY_TIME") return `기존 시간 방식 · ${flow.sell_start_time}–${flow.sell_end_time}`;
   if (mode === "POSITION_SCOPE") return settings.sell_position_scope === "ACCOUNT" ? "계좌 전체 보유종목" : "이 전략 보유종목";
   const ids = Array.isArray(flow.buy_flow_ids) ? flow.buy_flow_ids : [];
   const refs = Array.isArray(flow.buy_node_refs) ? flow.buy_node_refs : [];
@@ -1737,16 +1736,14 @@ function blockSellFlowVisibleFields(flow) {
   return blockSellFlowFields(flow).filter(field => {
     if (field.settingKey === "buy_node_refs") return false;
     if (field.settingKey === "buy_flow_ids") return mode === "BUY_FLOWS";
-    if (["sell_start_time", "sell_end_time"].includes(field.settingKey)) return mode === "LEGACY_TIME";
     return true;
   });
 }
 
 function blockSellFlowDescription(flow) {
   const mode = blockSellTargetMode(flow);
-  if (mode === "LEGACY_TIME") return "이전 설정의 매도 시간대를 유지하고 있습니다. '연결한 매수 흐름'으로 바꾸고 대상을 선택하면 시간 제한 없이 해당 매수로 체결된 수량을 관리합니다. 연결 기록이 없는 기존 보유분은 자동 배정하지 않습니다.";
-  if (mode === "POSITION_SCOPE") return "보유종목 대상 범위에서 지정한 전체 종목을 시간 제한 없이 관리합니다. 다른 매도 흐름과 대상이 겹쳐도 미체결 매도가 있는 종목은 중복 주문하지 않습니다.";
-  return "선택한 매수 흐름 전체 또는 개별 IF·조건 묶음을 통해 실제로 체결된 수량만 시간 제한 없이 관리합니다. 여러 대상을 함께 선택할 수 있고 겹친 체결 수량은 한 번만 계산합니다. 연결 기록이 없는 기존 보유분은 자동 포함하지 않습니다.";
+  if (mode === "POSITION_SCOPE") return "보유종목 대상 범위에서 지정한 전체 종목을 아래 작동 시간에 관리합니다. 다른 매도 흐름과 대상이 겹쳐도 미체결 매도가 있는 종목은 중복 주문하지 않습니다.";
+  return "선택한 매수 흐름 전체 또는 개별 IF·조건 묶음을 통해 실제로 체결된 수량만 아래 작동 시간에 관리합니다. 매수 시간이 끝나도 매도 작동 시간에는 계속 판단합니다. 여러 대상을 함께 선택할 수 있고 겹친 체결 수량은 한 번만 계산합니다. 연결 기록이 없는 기존 보유분은 자동 포함하지 않습니다.";
 }
 
 function blockFlow(kind, flowId) {
@@ -1881,7 +1878,7 @@ function addBlockSellFlow() {
     name: `매도 흐름 ${flows.length + 1}`,
     target_mode: "BUY_FLOWS", buy_flow_ids: [], buy_node_refs: [],
     sell_scan_seconds: previous?.sell_scan_seconds || settings.buy_scan_seconds || 30,
-    sell_start_time: "00:00", sell_end_time: "23:59:59",
+    operating_start_time: "08:00", operating_end_time: "20:00",
     sell_condition_groups: [newConditionGroup("sell")],
     sell_rule_tree: newBlockRuleRoot("sell", [newBlockRuleCondition("sell")], true),
   };
@@ -1933,7 +1930,6 @@ function blockFieldOptions(field) {
     return [
       { value: "BUY_FLOWS", label: "연결한 매수 흐름·조건의 체결 수량" },
       { value: "POSITION_SCOPE", label: "보유종목 범위에서 직접 선택" },
-      ...(blockSellTargetMode(flow) === "LEGACY_TIME" ? [{ value: "LEGACY_TIME", label: "기존 시간 방식 유지" }] : []),
     ];
   }
   if (field.settingKey === "sell_position_scope") {
@@ -2045,7 +2041,7 @@ function blockFieldOptions(field) {
 }
 
 function normalizeBlockPackageValue(field, value) {
-  if (field.settingKey === "target_mode" && !["BUY_FLOWS", "POSITION_SCOPE", "LEGACY_TIME"].includes(value)) {
+  if (field.settingKey === "target_mode" && !["BUY_FLOWS", "POSITION_SCOPE"].includes(value)) {
     throw new Error("매도 대상 방식을 선택하세요.");
   }
   if (field.type === "flow_ids") {
@@ -2058,6 +2054,11 @@ function normalizeBlockPackageValue(field, value) {
   }
   if (field.settingKey === "sell_position_scope" && !["STRATEGY", "ACCOUNT"].includes(value)) {
     throw new Error("매도 대상을 선택하세요.");
+  }
+  if (["operating_start_time", "operating_end_time"].includes(field.settingKey)) {
+    const normalized = String(value).trim();
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(normalized)) throw new Error(`${field.label}을 시:분 또는 시:분:초로 입력하세요.`);
+    return normalized;
   }
   if (field.type === "boolean") return value === true || value === "true";
   if (field.type === "number") {
@@ -2119,7 +2120,7 @@ function applyBlockFieldEdit(fieldId, value, { render = true } = {}) {
         if (heading) heading.textContent = flowKind === "sell" ? `${target.name} · ${blockSellTargetSummary(target)}` : `${start}–${end}  ${target.name}`;
         const badge = panel?.querySelector(".schedule-section-badge");
         const seconds = target[`${flowKind}_scan_seconds`];
-        if (badge) badge.textContent = `${seconds}초마다`;
+        if (badge) badge.textContent = flowKind === "sell" ? `${target.operating_start_time}–${target.operating_end_time}` : `${seconds}초마다`;
       }
     }
     if (render) {
@@ -2211,7 +2212,7 @@ function createBlockFieldControl(field, disabled) {
   } else {
     control = document.createElement("input");
     control.type = field.type === "date" ? "date"
-      : field.flowId && ["buy_start_time", "buy_end_time", "sell_start_time", "sell_end_time", "execution_start_time", "execution_end_time"].includes(field.settingKey) ? "time"
+      : field.flowId && ["buy_start_time", "buy_end_time", "operating_start_time", "operating_end_time", "execution_start_time", "execution_end_time"].includes(field.settingKey) ? "time"
         : ["number", "decimal"].includes(field.type) ? "number" : "text";
     if (control.type === "time") control.step = "1";
     if (["number", "decimal"].includes(field.type)) control.step = "any";
@@ -2651,7 +2652,7 @@ function composerRuleDropPlan(reference, placement) {
     source.strategy !== state.selected
     || source.kind !== reference.kind
     || (source.flowId || null) !== (reference.flowId || null)
-  ) return { tree: null, error: "같은 시간대 흐름 안에서만 조건을 이동할 수 있습니다." };
+  ) return { tree: null, error: "같은 흐름 안에서만 조건을 이동할 수 있습니다." };
   return rewriteBlockRuleMove(
     blockRuleTree(source.kind, source.flowId), source.nodeId, reference.nodeId,
     placement, source.kind.toUpperCase(),
@@ -5497,11 +5498,18 @@ function normalizeManagedBlockSettings(settings) {
   settings.sell_flows.forEach((flow, index) => {
     flow.id ||= `sell-flow-${index + 1}`;
     flow.name ||= `매도 흐름 ${index + 1}`;
+    // Old timed exits retain their window. Linked/position exits in v0.1.71
+    // ignored sell_start/end_time, so those stale fields must not narrow them.
+    const legacyTime = !flow.target_mode || flow.target_mode === "LEGACY_TIME";
+    if (legacyTime) flow.target_mode = "POSITION_SCOPE";
+    flow.operating_start_time ??= legacyTime ? (flow.sell_start_time ?? "09:00") : "08:00";
+    flow.operating_end_time ??= legacyTime ? (flow.sell_end_time ?? "15:20") : "20:00";
+    delete flow.sell_start_time;
+    delete flow.sell_end_time;
     const fallbacks = {
-      target_mode: "LEGACY_TIME", buy_flow_ids: [], buy_node_refs: [],
+      target_mode: "POSITION_SCOPE", buy_flow_ids: [], buy_node_refs: [],
       sell_scan_seconds: settings.sell_scan_seconds || settings.buy_scan_seconds || 30,
-      sell_start_time: settings.sell_start_time || "09:00",
-      sell_end_time: settings.sell_end_time || "15:20",
+      operating_start_time: "08:00", operating_end_time: "20:00",
       sell_condition_groups: settings.sell_condition_groups || [],
       sell_rule_tree: settings.sell_rule_tree || null,
     };
@@ -5681,7 +5689,7 @@ function buildComposerTreeModel(settings) {
       kind: "branch",
       id: prefix,
       title: flow.name || `매도 흐름 ${flowIndex + 1}`,
-      badge: blockSellTargetMode(flow) === "LEGACY_TIME" ? "기존 시간 방식" : blockSellTargetMode(flow) === "BUY_FLOWS" ? "매수 연결" : "보유종목",
+      badge: `${flow.operating_start_time}–${flow.operating_end_time}`,
       tone: "sell",
       nodeId: `${prefix}-schedule`,
       children: [
@@ -5736,7 +5744,7 @@ function buildComposerTreeModel(settings) {
       description: sellFlows.length
         ? (sellFlows.some(flow => blockSellTargetMode(flow) !== "BUY_FLOWS")
           ? `매수 체결분 연결 또는 직접 선택 · 직접 선택 범위: ${settings.sell_position_scope === "ACCOUNT" ? "계좌 전체 보유종목" : "이 전략 보유종목"}`
-          : "매수 흐름·조건별 체결 수량 · 시간 제한 없이 매도")
+          : "매수 흐름·조건별 체결 수량 · 설정한 작동 시간에 매도 판단")
         : "흐름 없음 · 자동 매도하지 않음",
       children: [
         ...(sellFlows.some(flow => blockSellTargetMode(flow) !== "BUY_FLOWS") ? [{ kind: "node", nodeId: "sellTargets" }] : []),
@@ -6521,7 +6529,26 @@ function createScheduleSection({ key, title, summary = "", badge = "", tone = ""
 function createScheduleFields(fields, disabled) {
   const grid = document.createElement("div");
   grid.className = "schedule-fields-grid";
-  fields.forEach(field => grid.append(createBlockFieldControl(field, disabled)));
+  const hours = fields.filter(field => field.flowKind === "sell" && ["operating_start_time", "operating_end_time"].includes(field.settingKey));
+  let hoursAdded = false;
+  fields.forEach(field => {
+    if (!hours.includes(field)) {
+      grid.append(createBlockFieldControl(field, disabled));
+      return;
+    }
+    if (hoursAdded) return;
+    hoursAdded = true;
+    const section = document.createElement("fieldset");
+    section.className = "block-sell-operating-hours";
+    const title = document.createElement("legend");
+    title.textContent = "작동 시간";
+    const hint = document.createElement("p");
+    hint.className = "block-buy-flow-hint";
+    hint.textContent = "한국 시각 · 시작 포함, 종료 제외. 실시간 시세와 봉 조건 판단에 동일하게 적용합니다. 종료 시 강제 청산하거나 이미 요청한 주문을 자동 취소하지 않습니다.";
+    section.append(title, hint);
+    hours.forEach(hour => section.append(createBlockFieldControl(hour, disabled)));
+    grid.append(section);
+  });
   return grid;
 }
 
@@ -6681,7 +6708,7 @@ function renderConditionSchedule(parsed, running, snapshot) {
         key: `sell-flow:${flow.id}`,
         title: `${flow.name} · ${blockSellTargetSummary(flow)}`,
         summary: `해당 체결 수량 → 매도 조건 ${groups.length}개 → 주문`,
-        badge: blockSellTargetMode(flow) === "LEGACY_TIME" ? "기존 시간 방식" : "매수와 별도 판단", tone: "sell", open: index === 0, action: remove,
+        badge: `${flow.operating_start_time}–${flow.operating_end_time}`, tone: "sell", open: index === 0, action: remove,
       });
       panel.content.append(createScheduleFields(
         blockSellFlowVisibleFields(flow), running,
@@ -6848,11 +6875,11 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
     ];
     nodes.push({
       id: `${prefix}-schedule`, title: flow.name || `매도 흐름 ${flowIndex + 1}`,
-      meta: blockSellTargetMode(flow) === "LEGACY_TIME" ? "기존 시간 방식 · 연결 방식으로 전환 가능" : "매수 조회와 별도 판단 · 시간 제한 없음",
-      tone: "sell", logic: blockSellTargetMode(flow) === "LEGACY_TIME" ? "시간" : "연결", logicTone: "sell", width: 460,
+      meta: "매수 조회와 별도 판단 · 실시간·봉 판단에 같은 작동 시간 적용",
+      tone: "sell", logic: blockSellTargetMode(flow) === "BUY_FLOWS" ? "연결" : "대상", logicTone: "sell", width: 460,
       fields: blockSellFlowVisibleFields(flow),
       flowKind: "sell", flowId: flow.id,
-      summary: [blockSellTargetSummary(flow), scheduleMeta],
+      summary: [blockSellTargetSummary(flow), `작동 ${flow.operating_start_time}–${flow.operating_end_time}`, scheduleMeta],
       description: blockSellFlowDescription(flow),
       actions: scheduleActions,
     });

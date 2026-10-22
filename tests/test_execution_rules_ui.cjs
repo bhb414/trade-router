@@ -218,7 +218,7 @@ test("execution AND/OR joins and drag reordering retain condition data and actio
   assert.equal(moved.action.id, actionId);
   assert.equal(moved.condition, a.condition);
   context.state.blockRuleDrag = { strategy: "test-strategy", kind: "execution", flowId: flow.id, nodeId: b.id };
-  assert.match(context.composerRuleDropPlan({ kind: "buy", flowId: flow.id, nodeId: c.id }, "after").error, /같은 시간대/);
+  assert.match(context.composerRuleDropPlan({ kind: "buy", flowId: flow.id, nodeId: c.id }, "after").error, /같은 흐름/);
   const saved = JSON.stringify(settings.execution_flows);
   settings.execution_flows = JSON.parse(saved);
   assert.equal(JSON.stringify(settings.execution_flows), saved);

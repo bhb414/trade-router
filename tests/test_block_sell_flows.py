@@ -507,8 +507,8 @@ def test_timer_dispatch_still_routes_interval_and_daily_sell_flows() -> None:
         ))
         await daily.strategy.on_start(daily.ctx)
         await daily.strategy.on_timer(daily.ctx, SimpleNamespace(
-            schedule_id="condition-sell-early-daily-1",
-            scheduled_at=daily.now, kind=ScheduleKind.DAILY,
+            schedule_id="condition-sell-early-live",
+            scheduled_at=daily.now, kind=ScheduleKind.INTERVAL,
         ))
 
     asyncio.run(exercise())
@@ -591,8 +591,13 @@ def test_sell_flows_survive_api_save_export_and_import(tmp_path: Path) -> None:
         for original, restored_flow in zip(flows, exported_flows, strict=True):
             assert {
                 key: restored_flow[key]
-                for key in original
-            } == original
+                for key in original if key not in {"sell_start_time", "sell_end_time"}
+            } == {key: value for key, value in original.items()
+                  if key not in {"sell_start_time", "sell_end_time"}}
+            assert restored_flow["target_mode"] == "POSITION_SCOPE"
+            assert restored_flow["operating_start_time"] == original["sell_start_time"]
+            assert restored_flow["operating_end_time"] == original["sell_end_time"]
+            assert "sell_start_time" not in restored_flow and "sell_end_time" not in restored_flow
             assert restored_flow["sell_rule_tree"]["id"] == "legacy-sell-root"
             assert restored_flow["sell_rule_tree"]["action"]["side"] == "SELL"
 

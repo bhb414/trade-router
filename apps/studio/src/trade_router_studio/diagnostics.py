@@ -220,6 +220,12 @@ def _tree(raw, depth=0):
 
 def _sell_settings(config):
     flows = config.get("sell_flows") or [config]
+    def operating_window(flow):
+        legacy = flow.get("target_mode", "LEGACY_TIME") == "LEGACY_TIME"
+        return (
+            _clock(flow.get("operating_start_time", flow.get("sell_start_time", "09:00") if legacy else "08:00")),
+            _clock(flow.get("operating_end_time", flow.get("sell_end_time", "15:20") if legacy else "20:00")),
+        )
     return {
         "sell_enabled": config.get("sell_enabled") is True,
         "position_scope": _enum(config.get("sell_position_scope"), {"STRATEGY", "ACCOUNT"}),
@@ -227,11 +233,11 @@ def _sell_settings(config):
         "route": _enum(config.get("route"), {"KRX", "NXT", "SOR", "AUTO"}),
         "sell_order_type": _enum(config.get("sell_order_type"), {"MARKET", "LIMIT", "BEST_LIMIT"}),
         "flows": [{"flow": index + 1,
-                   "target_mode": _enum(flow.get("target_mode", "LEGACY_TIME"), {"BUY_FLOWS", "POSITION_SCOPE", "LEGACY_TIME"}),
+                   "target_mode": _enum("POSITION_SCOPE" if flow.get("target_mode", "LEGACY_TIME") == "LEGACY_TIME" else flow.get("target_mode"), {"BUY_FLOWS", "POSITION_SCOPE"}),
                    "linked_flow_count": min(len(flow.get("buy_flow_ids") or []), 64),
                    "linked_node_count": min(len(flow.get("buy_node_refs") or []), 64),
-                   "start": _clock(flow.get("sell_start_time")) if flow.get("target_mode", "LEGACY_TIME") == "LEGACY_TIME" else None,
-                   "end_exclusive": _clock(flow.get("sell_end_time")) if flow.get("target_mode", "LEGACY_TIME") == "LEGACY_TIME" else None,
+                   "start": operating_window(flow)[0],
+                   "end_exclusive": operating_window(flow)[1],
                    "scan_seconds": _number(flow.get("sell_scan_seconds", 30), 1, 86400),
                    "rules": _tree(flow.get("sell_rule_tree")),
                    "legacy_groups": [[_condition(condition) for condition in group.get("conditions", [])[:20]]

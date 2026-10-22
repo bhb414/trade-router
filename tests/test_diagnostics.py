@@ -11,7 +11,7 @@ import pytest
 
 from trade_router_studio.app import create_app
 from trade_router_studio.block_packages import DEFAULT_CONDITION_BOLLINGER_SETTINGS, compile_block_strategy
-from trade_router_studio.diagnostics import build_diagnostics, MAX_LOGS, SEOUL, _reason, _number, _cost_projection
+from trade_router_studio.diagnostics import build_diagnostics, MAX_LOGS, SEOUL, _reason, _number, _cost_projection, _sell_settings
 from test_studio import workspace
 
 
@@ -21,6 +21,17 @@ SECRETS = ["PRIVATE_API_KEY_SENTINEL", "PRIVATE_TOKEN_SENTINEL", "12345678-91",
            "PRIVATE_STRATEGY_ID", "PRIVATE_PROVIDER_ORDER_ID", "PRIVATE_CLIENT_ORDER_ID",
            "C:\\Users\\PRIVATE_USER\\profile", "https://private.example:9999",
            "192.168.91.33", "987654321.876", "PRIVATE_INSTRUMENT_CODE"]
+
+
+@pytest.mark.parametrize("flow, expected", [
+    ({"sell_start_time": "16:00:00", "sell_end_time": "19:59:00"}, ("POSITION_SCOPE", "16:00:00", "19:59:00")),
+    ({"target_mode": "BUY_FLOWS", "sell_start_time": "00:00", "sell_end_time": "23:59:59"}, ("BUY_FLOWS", "08:00", "20:00")),
+    ({"target_mode": "POSITION_SCOPE", "operating_start_time": "10:10:01", "operating_end_time": "14:20:30"}, ("POSITION_SCOPE", "10:10:01", "14:20:30")),
+])
+def test_diagnostics_reports_operating_window_for_old_and_new_sell_rules(flow, expected):
+    settings = _sell_settings({"sell_enabled": True, "sell_flows": [flow]})
+    exported = settings["flows"][0]
+    assert (exported["target_mode"], exported["start"], exported["end_exclusive"]) == expected
 
 
 def unpack(content):

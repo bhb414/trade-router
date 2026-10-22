@@ -572,16 +572,32 @@ class BlockSellFlow(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$", min_length=1, max_length=64)
     name: str = Field(default="매도 흐름", min_length=1, max_length=80)
-    target_mode: Literal["BUY_FLOWS", "POSITION_SCOPE", "LEGACY_TIME"] = "LEGACY_TIME"
+    target_mode: Literal["BUY_FLOWS", "POSITION_SCOPE"] = "POSITION_SCOPE"
     buy_flow_ids: list[str] = Field(default_factory=list, max_length=64)
     buy_node_refs: list[BlockBuyNodeRef] = Field(default_factory=list, max_length=64)
     sell_scan_seconds: int = Field(default=30, ge=1, le=86_400)
-    sell_start_time: str = "09:00"
-    sell_end_time: str = "15:20"
+    operating_start_time: str = "08:00"
+    operating_end_time: str = "20:00"
     sell_condition_groups: list[BlockConditionGroup] = Field(default_factory=list, max_length=8)
     sell_rule_tree: BlockLogicNode | None = None
 
-    _validate_times = field_validator("sell_start_time", "sell_end_time")(
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_operating_hours(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        if value.get("target_mode", "LEGACY_TIME") == "LEGACY_TIME":
+            value["target_mode"] = "POSITION_SCOPE"
+            value.setdefault("operating_start_time", value.get("sell_start_time", "09:00"))
+            value.setdefault("operating_end_time", value.get("sell_end_time", "15:20"))
+        # v0.1.71 ignored these clocks for explicit origin/holding targets.
+        # Do not accidentally activate them while normalizing those exports.
+        value.pop("sell_start_time", None)
+        value.pop("sell_end_time", None)
+        return value
+
+    _validate_times = field_validator("operating_start_time", "operating_end_time")(
         _validate_clock
     )
 
@@ -591,10 +607,10 @@ class BlockSellFlow(BaseModel):
         if any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", value) for value in self.buy_flow_ids):
             raise ValueError("연결 매수 흐름 ID가 올바르지 않습니다.")
         self.buy_node_refs = list({(ref.flow_id, ref.node_id): ref for ref in self.buy_node_refs}.values())
-        if self.target_mode == "LEGACY_TIME" and time.fromisoformat(self.sell_start_time) >= time.fromisoformat(
-            self.sell_end_time
+        if time.fromisoformat(self.operating_start_time) >= time.fromisoformat(
+            self.operating_end_time
         ):
-            raise ValueError("매도 흐름의 시작 시간은 종료 시간보다 빨라야 합니다.")
+            raise ValueError("매도 작동 시작 시간은 종료 시간보다 빨라야 합니다.")
         if self.sell_rule_tree is None and not self.sell_condition_groups:
             raise ValueError("매도 흐름에는 조건 계층이나 기존 조건 블록이 필요합니다.")
         identifiers = [group.id for group in self.sell_condition_groups]
@@ -764,7 +780,7 @@ class ConditionBollingerBlockSettings(BaseModel):
             raise ValueError("Per-symbol budget cannot exceed total operating budget.")
         if self.buy_enabled and time.fromisoformat(self.buy_start_time) >= time.fromisoformat(self.buy_end_time):
             raise ValueError("Buy start time must be earlier than buy end time.")
-        if self.sell_enabled and time.fromisoformat(self.sell_start_time) >= time.fromisoformat(self.sell_end_time):
+        if self.sell_enabled and not self.sell_flows and time.fromisoformat(self.sell_start_time) >= time.fromisoformat(self.sell_end_time):
             raise ValueError("Sell start time must be earlier than sell end time.")
         close_times = [
             time.fromisoformat(self.close_time),
@@ -1125,8 +1141,9 @@ CONFIGURED_SELL_FLOWS = tuple(json.loads(SELL_FLOWS_JSON))
 EXECUTION_FLOWS = tuple(json.loads(EXECUTION_FLOWS_JSON))
 RAW_SELL_FLOWS = () if not SELL_ENABLED else CONFIGURED_SELL_FLOWS or ({
     "id": "default", "name": "매도 흐름",
+    "target_mode": "POSITION_SCOPE",
     "sell_scan_seconds": BUY_SCAN_SECONDS,
-    "sell_start_time": SELL_START_TIME, "sell_end_time": SELL_END_TIME,
+    "operating_start_time": SELL_START_TIME, "operating_end_time": SELL_END_TIME,
     "sell_condition_groups": SELL_CONDITION_GROUPS, "sell_rule_tree": SELL_RULE_TREE,
 },)
 
@@ -2105,11 +2122,14 @@ class ManagedBlockStrategy(Strategy):
         if not complete_only:
             return int(local.timestamp()) // 5
         if interval == "1d":
-            return local.date()
+            # Match the provider's completed-day boundary. A morning snapshot
+            # contains yesterday's candle; it must expire when today closes.
+            market_close = time(15, 30) if MARKET_VENUE == "KRX" else time(20, 0)
+            return local.date(), local.time().replace(tzinfo=None) >= market_close
         seconds = int(interval[:-1]) * (60 if interval.endswith("m") else 3600)
         return int(local.timestamp()) // seconds
 
-    async def _warm_exit_bars(self, ctx, code, tree):
+    async def _warm_exit_bars(self, ctx, code, tree, *, active=None):
         if not hasattr(self, "_exit_bar_cache"):
             self._exit_bar_cache = {}
         requirements = {}
@@ -2117,6 +2137,8 @@ class ManagedBlockStrategy(Strategy):
             for key, required in self._condition_requests(condition).items():
                 requirements[key] = max(required, requirements.get(key, 0))
         for key, required in requirements.items():
+            if active is not None and not active():
+                return
             period = self._bar_cache_period(key, datetime.now(SEOUL))
             cached = self._exit_bar_cache.get((code, key))
             if cached is not None and cached[0] == period and cached[1] >= required:
@@ -2128,15 +2150,18 @@ class ManagedBlockStrategy(Strategy):
                 continue
             self._exit_bar_cache[(code, key)] = (period, required, bars)
 
-    async def _prefetch_exit_history(self, ctx):
+    async def _prefetch_exit_history(self, ctx, scheduled_at=None):
         self._ensure_live_state()
         # Warm every bar guard, even when an earlier profit IF is currently
         # false. This work runs only in the independent candle lane.
+        scheduled_at = scheduled_at or datetime.now(SEOUL)
         tracked = ctx.state.get("strategy_positions", {})
         for code, position in tuple(self._live_positions.items()):
             for flow in self._active_sell_flows(datetime.now(SEOUL)):
-                if self._sell_available_quantity(position, tracked, flow) > 0:
-                    await self._warm_exit_bars(ctx, code, flow["sell_rule_tree"])
+                def active():
+                    return self._sell_flow_event_is_active(flow, scheduled_at)
+                if active() and self._sell_available_quantity(position, tracked, flow) > 0:
+                    await self._warm_exit_bars(ctx, code, flow["sell_rule_tree"], active=active)
 
     @staticmethod
     def _buy_origin_options(flow, matched_conditions, action):
@@ -2591,15 +2616,20 @@ class ManagedBlockStrategy(Strategy):
 
     @staticmethod
     def _sell_flow_is_active(flow, at):
-        if flow.get("target_mode", "LEGACY_TIME") != "LEGACY_TIME":
-            return flow.get("target_mode") != "BUY_FLOWS" or bool(
-                flow.get("buy_flow_ids") or flow.get("buy_node_refs")
-            )
-        local_time = at.astimezone(SEOUL).time().replace(tzinfo=None)
+        if at.tzinfo is None:
+            return False
+        local = at.astimezone(SEOUL)
+        if local.weekday() >= 5:
+            return False
+        if flow.get("target_mode") == "BUY_FLOWS" and not (
+            flow.get("buy_flow_ids") or flow.get("buy_node_refs")
+        ):
+            return False
+        local_time = local.time().replace(tzinfo=None)
         return (
-            time.fromisoformat(flow["sell_start_time"])
+            time.fromisoformat(flow["operating_start_time"])
             <= local_time
-            < time.fromisoformat(flow["sell_end_time"])
+            < time.fromisoformat(flow["operating_end_time"])
         )
 
     @classmethod
@@ -2608,9 +2638,7 @@ class ManagedBlockStrategy(Strategy):
 
     @staticmethod
     def _sell_schedule_window(flow):
-        if flow.get("target_mode", "LEGACY_TIME") == "LEGACY_TIME":
-            return flow["sell_start_time"], flow["sell_end_time"]
-        return "08:00", "20:00"
+        return flow["operating_start_time"], flow["operating_end_time"]
 
     @classmethod
     def _sell_flow_event_is_active(cls, flow, scheduled_at, at=None):
@@ -2762,9 +2790,9 @@ class ManagedBlockStrategy(Strategy):
                 if CONFIGURED_SELL_FLOWS
                 else "condition-sell"
             )
-            if not bar_sell_sources or (flow.get("target_mode", "LEGACY_TIME") != "LEGACY_TIME" and any(
+            if not bar_sell_sources or any(
                 item["bar_interval"] == "1d" for item in bar_sell_sources
-            )) or any(
+            ) or any(
                 item["bar_data_mode"] == "INCLUDE_CURRENT"
                 for item in bar_sell_sources
             ):
@@ -2781,25 +2809,19 @@ class ManagedBlockStrategy(Strategy):
                     item["bar_interval"] for item in bar_sell_sources
                 ))
                 for index, interval in enumerate(intervals, start=1):
-                    suffix = "daily" if interval == "1d" else "bars"
-                    schedule_id = f"{schedule_prefix}-{suffix}-{index}"
+                    schedule_id = f"{schedule_prefix}-bars-{index}"
                     self._sell_flow_schedules[schedule_id] = flow
-                    if interval == "1d":
-                        ctx.scheduler.daily_at(
-                            window[0], schedule_id=schedule_id,
-                        )
-                    else:
-                        ctx.scheduler.on_bar_close(
-                            interval,
-                            schedule_id=schedule_id,
-                            between=window,
-                        )
+                    ctx.scheduler.on_bar_close(
+                        interval,
+                        schedule_id=schedule_id,
+                        between=window,
+                    )
             target_text = (
                 "실제 매수 체결 출처 연결 · 선택 범위의 합집합 수량"
                 if flow.get("target_mode") == "BUY_FLOWS"
                 else "선택 보유 범위"
             )
-            ctx.log.info(f"매도 흐름 {flow['name']}: {target_text} · 조건 판단 · 주문 가능 거래시간 적용")
+            ctx.log.info(f"매도 흐름 {flow['name']}: {target_text} · 작동 {window[0]} 이상 {window[1]} 미만 (한국시간) · 실시간·봉 판단 공통")
 
         live_profit_flows = tuple(
             flow for flow in SELL_FLOWS
@@ -2860,10 +2882,10 @@ class ManagedBlockStrategy(Strategy):
 
     async def on_timer(self, ctx, event):
         if event.schedule_id == "sell-condition-prefetch":
-            await self._prefetch_exit_history(ctx)
+            await self._prefetch_exit_history(ctx, event.scheduled_at)
             return
         if event.schedule_id == "live-profit-watchdog":
-            await self._check_live_profit_fallback(ctx)
+            await self._check_live_profit_fallback(ctx, event.scheduled_at)
             return
         execution_flow_id = getattr(self, "_execution_flow_schedules", {}).get(event.schedule_id)
         if execution_flow_id is not None:
@@ -3121,12 +3143,14 @@ class ManagedBlockStrategy(Strategy):
     async def _on_bar_locked(self, ctx, event, flow):
         if not SELL_FLOWS:
             return
-        if not self._sell_flow_event_is_active(
-            flow, event.scheduled_at, datetime.now(SEOUL)
-        ):
+        def active():
+            return self._sell_flow_event_is_active(flow, event.scheduled_at)
+        if not active():
             return
         try:
             balance = await ctx.account.balance()
+            if not active():
+                return
             open_orders = await ctx.account.open_orders()
         except RouterError as exc:
             ctx.log.warning(f"매도 판단 보류 [{exc.code.value}]: {exc.message} · 다음 완성 봉에서 재시도합니다.")
@@ -3134,6 +3158,8 @@ class ManagedBlockStrategy(Strategy):
         tracked, positions, pending_codes = await self._refresh_live_positions(ctx, balance, open_orders)
         sell_targets = self._sell_target_quantities(balance, tracked)
         for code in sell_targets:
+            if not active():
+                return
             position = positions.get(code)
             if position is None or position.quantity <= 0:
                 tracked.pop(code, None)
@@ -3147,7 +3173,9 @@ class ManagedBlockStrategy(Strategy):
                 continue
             if code in self._sell_submitting or self._sell_available_quantity(position, tracked, flow) <= 0:
                 continue
-            await self._warm_exit_bars(ctx, code, flow["sell_rule_tree"])
+            await self._warm_exit_bars(ctx, code, flow["sell_rule_tree"], active=active)
+            if not active():
+                return
             average_price = position.average_price
             should_sell, matched_conditions, action = await self._rule_tree_result(
                 ctx,
@@ -3200,6 +3228,9 @@ class ManagedBlockStrategy(Strategy):
                     order_route = await self._effective_order_route(
                         ctx, code, order_at, current_price=limit_price
                     )
+                order_at = datetime.now(SEOUL)
+                if not self._sell_flow_event_is_active(flow, event.scheduled_at, order_at):
+                    return
                 if not self._order_type_session_is_open(order_at, order_route, order_type):
                     continue
                 blocked_reason = self._order_session_block_reason(
@@ -3318,14 +3349,18 @@ class ManagedBlockStrategy(Strategy):
             allowed_venues.update(("KRX", "NXT"))
         return venue is None or venue in allowed_venues
 
-    async def _check_live_profit_fallback(self, ctx):
+    async def _check_live_profit_fallback(self, ctx, scheduled_at=None):
         self._ensure_live_state()
         now = datetime.now(SEOUL)
-        if not any(
-            self._is_live_profit_condition(condition)
-            for flow in self._active_sell_flows(now)
-            for condition in _rule_conditions(flow["sell_rule_tree"])
-        ):
+        scheduled_at = scheduled_at or now
+        def active():
+            return any(
+                self._sell_flow_event_is_active(flow, scheduled_at)
+                and any(self._is_live_profit_condition(condition)
+                        for condition in _rule_conditions(flow["sell_rule_tree"]))
+                for flow in SELL_FLOWS
+            )
+        if not active():
             return
         def needs_quote(code):
             last_tick = self._last_live_quote_at.get(code)
@@ -3358,6 +3393,8 @@ class ManagedBlockStrategy(Strategy):
             self._account_sell_reconcile_at = datetime.now(SEOUL) + timedelta(seconds=30)
         try:
             balance = await ctx.account.balance()
+            if not active():
+                return
             open_orders = await ctx.account.open_orders()
             await self._refresh_live_positions(ctx, balance, open_orders)
         except RouterError as exc:
@@ -3366,6 +3403,8 @@ class ManagedBlockStrategy(Strategy):
             )
             return
         for code in tuple(self._live_positions):
+            if not active():
+                return
             if not needs_quote(code):
                 continue
             try:
@@ -3400,7 +3439,10 @@ class ManagedBlockStrategy(Strategy):
         self._ensure_live_state()
         if not self._live_quote_is_usable(quote, websocket=websocket):
             return
-        active_flows = self._active_sell_flows(quote.received_at)
+        active_flows = tuple(
+            flow for flow in SELL_FLOWS
+            if self._sell_flow_event_is_active(flow, quote.received_at)
+        )
         if not active_flows:
             return
         code = quote.instrument.code
@@ -3445,7 +3487,7 @@ class ManagedBlockStrategy(Strategy):
         matched_conditions = None
         matched_action = None
         for flow in candidate_flows:
-            if self._sell_available_quantity(position, tracked, flow) <= 0:
+            if not self._sell_flow_event_is_active(flow, quote.received_at) or self._sell_available_quantity(position, tracked, flow) <= 0:
                 continue
             should_sell, flow_matches, flow_action = await self._rule_tree_result(
                 ctx,
@@ -3494,6 +3536,9 @@ class ManagedBlockStrategy(Strategy):
                 order_route = await self._effective_order_route(
                     ctx, code, order_at, current_price=quote.price
                 )
+            order_at = datetime.now(SEOUL)
+            if not self._sell_flow_event_is_active(matched_flow, quote.received_at, order_at):
+                return
             if not self._order_type_session_is_open(order_at, order_route, order_type):
                 return
             blocked_reason = self._order_session_block_reason(

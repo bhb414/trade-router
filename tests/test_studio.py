@@ -1094,7 +1094,7 @@ def test_managed_block_normalizes_hourly_bars_and_rejects_position_only_buy_metr
         raise AssertionError("Position-only metrics must be rejected in buy conditions.")
 
 
-def test_managed_block_supports_daily_bars_at_the_sell_start_time() -> None:
+def test_managed_block_supports_daily_bars_repeated_within_operating_hours() -> None:
     for venue in ("KRX", "NXT", "INTEGRATED"):
         payload = DEFAULT_CONDITION_BOLLINGER_SETTINGS.model_dump(mode="json")
         payload["market_venue"] = venue
@@ -1104,9 +1104,9 @@ def test_managed_block_supports_daily_bars_at_the_sell_start_time() -> None:
         normalized = ConditionBollingerBlockSettings.model_validate(payload)
         source = render_block_strategy(normalized)
         assert normalized.sell_condition_groups[0].conditions[2].right_bar_interval == "1d"
-        assert "ctx.scheduler.daily_at(" in source
-        assert 'suffix = "daily" if interval == "1d" else "bars"' in source
-        assert 'schedule_id = f"{schedule_prefix}-{suffix}-{index}"' in source
+        assert 'item["bar_interval"] == "1d" for item in bar_sell_sources' in source
+        assert 'schedule_id = f"{schedule_prefix}-live"' in source
+        assert 'schedule_id = f"{schedule_prefix}-bars-{index}"' in source
         assert "await self.on_bar(ctx, event)" in source
 
 

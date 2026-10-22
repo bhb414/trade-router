@@ -369,8 +369,8 @@ test("drop proposals never cross strategies, time flows, or buy/sell sides", () 
   const reference = { kind: "buy", flowId: "flow-a", nodeId: "B" };
   context.blockRuleTree = () => logic("ANY", [condition("A"), condition("B")]);
   assert.equal(context.composerRuleDropPlan(reference, "after").error, "");
-  assert.match(context.composerRuleDropPlan({ ...reference, kind: "sell" }, "after").error, /같은 시간대 흐름/);
-  assert.match(context.composerRuleDropPlan({ ...reference, flowId: "flow-b" }, "after").error, /같은 시간대 흐름/);
+  assert.match(context.composerRuleDropPlan({ ...reference, kind: "sell" }, "after").error, /같은 흐름/);
+  assert.match(context.composerRuleDropPlan({ ...reference, flowId: "flow-b" }, "after").error, /같은 흐름/);
   context.state.selected = "strategy-b";
-  assert.match(context.composerRuleDropPlan(reference, "after").error, /같은 시간대 흐름/);
+  assert.match(context.composerRuleDropPlan(reference, "after").error, /같은 흐름/);
 });

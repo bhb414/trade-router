@@ -102,7 +102,8 @@ def test_linked_schedule_uses_market_window_and_legacy_keeps_saved_window():
     schedules = [kwargs for _, _, kwargs in harness.scheduler.calls
                  if kwargs["schedule_id"].startswith("condition-sell")]
     assert schedules[0]["between"] == ("08:00", "20:00")
-    assert harness.strategy._sell_schedule_window(sell_flow()) == ("09:00", "10:00")
+    migrated = settings_for([sell_flow()]).sell_flows[0].model_dump(mode="json")
+    assert harness.strategy._sell_schedule_window(migrated) == ("09:00", "10:00")
 
 
 def test_buy_source_discovery_cannot_hold_startup_exit_registration():
