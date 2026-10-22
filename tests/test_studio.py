@@ -1555,7 +1555,7 @@ def test_workspace_api_creates_and_saves_strategy(tmp_path: Path) -> None:
         )[1].split("function blockLayoutIdentity", 1)[0]
         assert "nodes: {}" in clone_layout_source
         assert "layout?.nodes" not in clone_layout_source
-        assert "() => persistBlockLayout(strategyName, layout)" in static_script.text
+        assert "persistBlockLayout(strategyName, layout);" in static_script.text
         assert "BLOCK_VIEWPORT_COORD_LIMIT = 20000" in static_script.text
         assert "focusComposerInspector" in static_script.text
         assert "closeComposerInspector" in static_script.text

@@ -6042,8 +6042,13 @@ function bindBlockCanvasPan(world) {
     window.clearTimeout(canvas._blockViewPersistTimer);
     const strategyName = state.selected;
     const layout = state.blockPackage?.layout;
+    canvas._blockViewPersistLayout = layout;
     canvas._blockViewPersistTimer = window.setTimeout(
-      () => persistBlockLayout(strategyName, layout),
+      () => {
+        canvas._blockViewPersistTimer = null;
+        canvas._blockViewPersistLayout = null;
+        persistBlockLayout(strategyName, layout);
+      },
       180,
     );
   };
@@ -6104,7 +6109,8 @@ function setBlockZoom(nextZoom) {
 function fitBlockGraph() {
   const world = elements.blockCanvas.querySelector(".block-canvas-world");
   const tree = world?.querySelector(".composer-fixed-tree");
-  if (!world || !tree || !state.blockPackage) return;
+  const bounds = visibleBlockCanvasBounds();
+  if (!world || !tree || !state.blockPackage || !bounds || bounds.width <= 92 || bounds.height <= 92) return;
   const minX = tree.offsetLeft;
   const minY = tree.offsetTop;
   const maxX = minX + Math.max(tree.offsetWidth, tree.scrollWidth);
@@ -6121,6 +6127,85 @@ function fitBlockGraph() {
   viewport.y = (elements.blockCanvas.clientHeight - (maxY - minY) * zoom) / 2 - minY * zoom;
   applyBlockViewport(world);
   persistBlockLayout();
+}
+
+function visibleBlockCanvasBounds() {
+  const canvas = elements.blockCanvas;
+  if (!canvas || state.view !== "strategy" || state.strategyTab !== "blocks"
+    || canvas.closest("[hidden]") || canvas.clientWidth <= 0 || canvas.clientHeight <= 0) return null;
+  const bounds = canvas.getBoundingClientRect();
+  return bounds.width > 0 && bounds.height > 0 ? bounds : null;
+}
+
+function recoverEmptyBlockViewport(world, tree) {
+  const canvas = elements.blockCanvas;
+  const bounds = visibleBlockCanvasBounds();
+  if (!bounds || !state.blockPackage || !canvas.contains(world) || !world.contains(tree)
+    || canvas.classList.contains("panning") || state.blockRulePointerDrag || state.blockRuleDrag
+    || (canvas._blockViewPersistTimer != null && canvas._blockViewPersistLayout === state.blockPackage.layout)) return false;
+  const rows = Array.from(tree.querySelectorAll(".composer-tree-row, .composer-tree-flow, .composer-tree-add-row"));
+  const measured = rows.map(row => row.getBoundingClientRect()).filter(row => row.width > 0 && row.height > 0);
+  if (!measured.length || measured.some(row => row.right > bounds.left && row.left < bounds.right
+    && row.bottom > bounds.top && row.top < bounds.bottom)) return false;
+  const treeWidth = Math.max(tree.offsetWidth, tree.scrollWidth);
+  if (!(treeWidth > 0)) return false;
+  const viewport = ensureBlockLayout().viewport;
+  const firstRowY = (measured[0].top - bounds.top - viewport.y) / viewport.zoom;
+  const padding = Math.min(24, bounds.width / 10, bounds.height / 10);
+  const zoom = Math.max(BLOCK_ZOOM_MIN, Math.min(1, (bounds.width - padding * 2) / treeWidth));
+  viewport.zoom = zoom;
+  viewport.x = Math.max(padding, (bounds.width - treeWidth * zoom) / 2) - tree.offsetLeft * zoom;
+  viewport.y = padding - firstRowY * zoom;
+  applyBlockViewport(world);
+  // Only this browser's view is persisted; conditions, dirty state and order
+  // permissions do not participate in recovering an off-screen tree.
+  persistBlockLayout();
+  return true;
+}
+
+function currentBlockViewportRecovery(context) {
+  const canvas = elements.blockCanvas;
+  return canvas?._blockViewportRecovery === context && context.package === state.blockPackage
+    && context.strategy === state.selected && context.openToken === state.strategyOpenToken
+    && canvas.querySelector(".block-canvas-world") === context.world;
+}
+
+function scheduleBlockViewportRecovery() {
+  const context = elements.blockCanvas?._blockViewportRecovery;
+  if (!context || !currentBlockViewportRecovery(context) || context.frame != null) return;
+  const previousView = JSON.stringify(context.package.layout?.viewport);
+  context.frame = window.requestAnimationFrame(() => {
+    context.frame = null;
+    if (!currentBlockViewportRecovery(context)
+      || JSON.stringify(context.package.layout?.viewport) !== previousView) return;
+    recoverEmptyBlockViewport(context.world, context.tree);
+  });
+}
+
+function bindBlockViewportRecovery(world, tree) {
+  const canvas = elements.blockCanvas;
+  canvas._blockViewportRecovery?.cleanup();
+  const context = {
+    world, tree, package: state.blockPackage, strategy: state.selected,
+    openToken: state.strategyOpenToken, frame: null, observer: null,
+  };
+  const resized = () => {
+    if (currentBlockViewportRecovery(context)) scheduleBlockViewportRecovery();
+  };
+  context.cleanup = () => {
+    if (context.frame != null) window.cancelAnimationFrame(context.frame);
+    context.observer?.disconnect();
+    window.removeEventListener("resize", resized);
+    if (canvas._blockViewportRecovery === context) canvas._blockViewportRecovery = null;
+  };
+  canvas._blockViewportRecovery = context;
+  if (typeof window.ResizeObserver === "function") {
+    context.observer = new window.ResizeObserver(resized);
+    context.observer.observe(canvas);
+  } else {
+    window.addEventListener("resize", resized);
+  }
+  scheduleBlockViewportRecovery();
 }
 
 function resetBlockGraphLayout() {
@@ -6630,8 +6715,10 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
   elements.blockCanvas._ruleConnectorObserver?.observe(tree);
   bindBlockCanvasPan(world);
   applyBlockViewport(world);
+  bindBlockViewportRecovery(world, tree);
   state.blockGraphRedraw = null;
   window.requestAnimationFrame(() => {
+    if (elements.blockCanvas.querySelector(".block-canvas-world") !== world) return;
     world.style.width = `${Math.max(1120, tree.scrollWidth + tree.offsetLeft + 180)}px`;
     world.style.height = `${Math.max(1100, tree.scrollHeight + tree.offsetTop + 180)}px`;
     positionComposerRuleConnectors(tree);
@@ -6646,6 +6733,7 @@ function renderConditionBollingerBlocks(parsed, running, inspectorSnapshot = nul
 
 function renderStrategyBlocks() {
   if (!elements.blockCanvas || !flushBlockFieldEdits(false)) return;
+  elements.blockCanvas._blockViewportRecovery?.cleanup();
   if (state.blockRulePointerDrag || state.blockRuleDrag) finishComposerRuleDrag();
   const source = elements.editor.value;
   const parsed = currentBlockModel();
@@ -6787,6 +6875,7 @@ function setStrategyTab(tab) {
     renderStrategyBlocks();
   }
   syncBlockEditorFocus();
+  if (tab === "blocks") scheduleBlockViewportRecovery();
 }
 
 function configureStrategyTabs() {
@@ -6807,6 +6896,7 @@ function showWorkspaceView(view) {
   elements.strategyView.hidden = view !== "strategy";
   elements.dashboardButton.classList.toggle("active", view === "dashboard");
   syncBlockEditorFocus();
+  if (view === "strategy") scheduleBlockViewportRecovery();
 }
 
 function updateControls() {
