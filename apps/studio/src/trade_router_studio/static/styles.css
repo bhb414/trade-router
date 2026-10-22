@@ -1353,6 +1353,12 @@ kbd { margin-left: 5px; color: inherit; opacity: .62; font-size: 9px; font-famil
 .system-action-row strong { margin-bottom: 4px; font-size: 13px; }
 .system-action-row span { color: var(--muted); font-size: 11px; line-height: 1.45; }
 .system-action-row.danger-row { border-color: #edcbd0; background: #fffafa; }
+.diagnostics-row { align-items: start; }
+.diagnostics-row span + span { margin-top: 8px; }
+.diagnostics-controls { display: grid; gap: 7px; min-width: 145px; }
+.diagnostics-controls label { color: var(--muted); font-size: 11px; }
+.diagnostics-controls select { width: 100%; min-height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; background: var(--panel); color: inherit; }
+#diagnostics-status { color: #315f8c; }
 .settings-grid { display: grid; grid-template-columns: minmax(250px, 300px) minmax(360px, 1fr); gap: 14px; align-items: stretch; }
 .settings-detail {
   min-width: 0;

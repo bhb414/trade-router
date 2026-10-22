@@ -1937,6 +1937,7 @@ class ManagedBlockStrategy(Strategy):
 
     async def _rule_tree_result(
         self, ctx, code, tree, *, average_price=None, current_price=None, side,
+        require_live_profit=False,
     ):
         """Evaluate a parenthesized rule tree and select one branch action.
 
@@ -1944,6 +1945,12 @@ class ManagedBlockStrategy(Strategy):
         requires every child and keeps the first child action, falling back to
         the group's own action.  Evaluation is side-effect free; callers submit
         at most one selected order after account and duplicate-order checks.
+
+        A quote-triggered exit additionally needs a complete passing path with
+        a live profit condition. That path may be a later OR branch, even when
+        an earlier candle branch already selected the action. Track the live
+        proof separately so branch order cannot suppress a satisfied stop loss
+        or bypass an AND guard on the profit branch.
         """
         if not tree:
             return False, [], None
@@ -1989,6 +1996,7 @@ class ManagedBlockStrategy(Strategy):
                     matched,
                     [condition] if matched else [],
                     node.get("action") if matched else None,
+                    matched and self._is_live_profit_condition(condition),
                 )
 
             children = node.get("children", ())
@@ -2000,37 +2008,45 @@ class ManagedBlockStrategy(Strategy):
                 # condition can never become an unconditional order.
                 action = node.get("action")
                 if depth == 0 and action and action.get("side") == "BUY":
-                    return True, [], action
-                return False, [], None
+                    return True, [], action, False
+                return False, [], None, False
 
             operator = node.get("operator", "ALL")
             if operator == "ANY":
+                selected = None
                 for child in children:
-                    matched, branch_conditions, branch_action = await evaluate(
+                    matched, branch_conditions, branch_action, live_match = await evaluate(
                         child, depth + 1,
                     )
                     if matched:
-                        return (
-                            True,
-                            branch_conditions,
-                            branch_action or node.get("action"),
-                        )
-                return False, [], None
+                        if selected is None:
+                            selected = (
+                                True, branch_conditions,
+                                branch_action or node.get("action"),
+                            )
+                        if not require_live_profit or live_match:
+                            return (*selected, live_match)
+                return (*selected, False) if selected is not None else (False, [], None, False)
 
             matched_conditions = []
             selected_action = None
+            live_match = False
             for child in children:
-                matched, branch_conditions, branch_action = await evaluate(
+                matched, branch_conditions, branch_action, branch_live_match = await evaluate(
                     child, depth + 1,
                 )
                 if not matched:
-                    return False, [], None
+                    return False, [], None, False
                 matched_conditions.extend(branch_conditions)
+                live_match = live_match or branch_live_match
                 if selected_action is None and branch_action is not None:
                     selected_action = branch_action
-            return True, matched_conditions, selected_action or node.get("action")
+            return True, matched_conditions, selected_action or node.get("action"), live_match
 
-        return await evaluate(tree)
+        matched, matched_conditions, action, live_match = await evaluate(tree)
+        if require_live_profit and not live_match:
+            return False, [], None
+        return matched, matched_conditions, action
 
     @classmethod
     def _expression_summary(cls, expression):
@@ -3226,11 +3242,9 @@ class ManagedBlockStrategy(Strategy):
                 average_price=position.average_price,
                 current_price=quote.price,
                 side=f"{flow['name']} 실시간 매도",
+                require_live_profit=True,
             )
-            if should_sell and flow_action is not None and any(
-                self._is_live_profit_condition(condition)
-                for condition in flow_matches
-            ):
+            if should_sell and flow_action is not None:
                 matched_flow = flow
                 matched_conditions = flow_matches
                 matched_action = flow_action

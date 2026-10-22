@@ -305,6 +305,24 @@
               </div>
               <button class="button" id="update-button" type="button">업데이트 확인</button>
             </div>
+            <div class="system-action-row diagnostics-row">
+              <div>
+                <strong>진단 자료 내보내기</strong>
+                <span>매매가 동작하지 않은 이유를 확인할 수 있도록 현재 상태와 최근 기록을 ZIP으로 저장합니다.</span>
+                <span>포함: 익명화한 전략 조건·실행 상태·주문 상태·오류 분류.<br>제외: API 키·계좌번호·HTS ID·이름·개인 경로·금액·수량·원본 로그.</span>
+                <span>문제 발생 직후, 앱을 종료하기 전에 저장해 주세요. 재시작하면 일부 전략 로그는 사라집니다.</span>
+                <span id="diagnostics-status" role="status" aria-live="polite">자동 전송하지 않습니다. 저장한 ZIP과 문제가 생긴 시각을 함께 보내주세요.</span>
+              </div>
+              <div class="diagnostics-controls">
+                <label for="diagnostics-hours">기록 기간</label>
+                <select id="diagnostics-hours">
+                  <option value="24">최근 24시간</option>
+                  <option value="72" selected>최근 3일</option>
+                  <option value="168">최근 7일</option>
+                </select>
+                <button class="button" id="diagnostics-export-button" type="button">진단 ZIP 저장</button>
+              </div>
+            </div>
             <div class="system-action-row">
               <div>
                 <strong>프로그램 재시작</strong>

@@ -7385,6 +7385,55 @@ async function waitForRestart(previousInstanceId, timeoutMilliseconds = 30000) {
   return false;
 }
 
+async function exportDiagnostics() {
+  const button = document.querySelector("#diagnostics-export-button");
+  const period = document.querySelector("#diagnostics-hours");
+  const status = document.querySelector("#diagnostics-status");
+  if (button.disabled) return;
+  const hours = [24, 72, 168].includes(Number(period.value)) ? Number(period.value) : 72;
+  button.disabled = true;
+  period.disabled = true;
+  button.textContent = "자료 준비 중…";
+  status.textContent = "개인정보를 제외한 진단 자료를 준비하고 있습니다.";
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 60000);
+  let objectUrl = null;
+  let link = null;
+  try {
+    const response = await fetch(`/api/system/diagnostics/export?hours=${hours}`, {
+      cache: "no-store", credentials: "same-origin", signal: controller.signal,
+    });
+    if (!response.ok || !response.headers.get("Content-Type")?.includes("application/zip")) {
+      throw new Error("진단 자료를 준비하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    }
+    const blob = await response.blob();
+    if (!blob.size) throw new Error("진단 파일이 비어 있습니다. 다시 시도해 주세요.");
+    const proposedName = response.headers.get("Content-Disposition")?.match(/filename="?([^";]+)"?/i)?.[1];
+    const filename = /^trade-router-diagnostics-\d{8}-\d{6}\.zip$/.test(proposedName || "")
+      ? proposedName : "trade-router-diagnostics.zip";
+    objectUrl = URL.createObjectURL(blob);
+    link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    status.textContent = "ZIP 다운로드를 요청했습니다. 이 파일과 문제가 생긴 시각을 함께 보내주세요. 현재 설정과 당시 상태는 다를 수 있습니다.";
+  } catch (error) {
+    const message = error.name === "AbortError"
+      ? "준비 시간이 초과됐습니다. 기록 기간을 줄여 다시 시도해 주세요."
+      : "진단 파일을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.";
+    status.textContent = message;
+    notify(message, true);
+  } finally {
+    window.clearTimeout(timeout);
+    link?.remove();
+    if (objectUrl) window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+    button.disabled = false;
+    period.disabled = false;
+    button.textContent = "진단 ZIP 저장";
+  }
+}
+
 function activateSettingsTab(tabName) {
   document.querySelectorAll("[data-settings-tab]").forEach(button => {
     button.classList.toggle("active", button.dataset.settingsTab === tabName);
@@ -8271,6 +8320,7 @@ document.querySelector("#shutdown-button").addEventListener("click", async () =>
 document.querySelector("#settings-button").addEventListener("click", () => {
   openSettings().catch(error => notify(error.message, true));
 });
+document.querySelector("#diagnostics-export-button").addEventListener("click", exportDiagnostics);
 document.querySelectorAll("[data-activity-tab]").forEach(button => {
   button.addEventListener("click", () => selectActivityTab(button.dataset.activityTab));
 });

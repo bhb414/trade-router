@@ -24,7 +24,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
@@ -49,6 +49,7 @@ from .block_packages import (
     compile_block_strategy,
 )
 from .connections import ConnectionRuntime
+from .diagnostics import build_diagnostics, snapshot_manager
 from .event_bus import StrategyEventBus
 from .instrument_catalog import InstrumentCatalog
 from .paths import WorkspacePaths
@@ -2108,6 +2109,34 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 for item in conditions
             ]
         }
+
+    @app.get("/api/system/diagnostics/export")
+    async def export_diagnostics(
+        request: Request, hours: int = Query(default=72, ge=1, le=168),
+    ) -> Response:
+        # This local download never contacts a broker or uploads the archive.
+        # Refuse cross-site browser requests as well as relying on normal CORS.
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            raise HTTPException(status_code=403, detail="앱 설정에서 진단 자료를 저장해 주세요.")
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+            raise HTTPException(status_code=403, detail="앱 설정에서 진단 자료를 저장해 주세요.")
+        realtime_states = await realtime.snapshot()
+        connection_states = [
+            {"id": item["id"], "state": connection_runtime.status(item["id"]).get("state")}
+            for item in settings.list_connections()
+        ]
+        content, filename = await asyncio.to_thread(
+            build_diagnostics,
+            version=__version__, manager=snapshot_manager(manager), store=journal(),
+            permissions=order_engine().permission_snapshot(), accounts=settings.list_accounts(),
+            connection_states=connection_states, realtime_states=realtime_states,
+            manifests=sessions.manifests(), hours=hours,
+        )
+        return Response(content, media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+        })
 
     @app.get("/api/system/doctor")
     async def system_doctor() -> dict[str, object]:
