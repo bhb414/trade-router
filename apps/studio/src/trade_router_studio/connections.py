@@ -1045,6 +1045,7 @@ class ConnectionRuntime:
         *,
         state: str = "all",
         business_date: date | None = None,
+        fresh: bool = False,
     ) -> tuple[AccountOrder, ...]:
         """Return today's normalized orders for reconciliation.
 
@@ -1062,7 +1063,13 @@ class ConnectionRuntime:
         connection = self._settings.get_connection(account["connection_id"])
         day = business_date or datetime.now(SEOUL).date()
         if connection["provider"] == "namuh":
-            ordered = await self._namuh_account_orders(account, connection, day)
+            ordered = await self._namuh_account_orders(
+                account,
+                connection,
+                day,
+                cache_ttl=0 if fresh else 1.0,
+                fresh=fresh,
+            )
             if normalized_state == "open":
                 return tuple(
                     item
@@ -1082,12 +1089,15 @@ class ConnectionRuntime:
         account_number = self._settings.get_account_number(account["id"])
         target = ConnectionTarget(connection["target"])
         if normalized_state == "open":
-            return await self._kis_open_orders(account, connection, day)
+            return await self._kis_open_orders(
+                account, connection, day, fresh=fresh
+            )
         tr_id = "VTTC0081R" if target is ConnectionTarget.PAPER else "TTTC0081R"
         day_text = day.strftime("%Y%m%d")
         fk100 = ""
         nk100 = ""
         rows: list[dict[str, Any]] = []
+        fresh_token = uuid4().hex if fresh else ""
         for page in range(10):
             payload, response = await self._kis_get(
                 connection,
@@ -1116,8 +1126,9 @@ class ConnectionRuntime:
                 dedupe_key=(
                     f"{connection['id']}:orders:{account['id']}:{day_text}:"
                     f"{fk100}:{nk100}"
+                    + (f":fresh:{fresh_token}" if fresh else "")
                 ),
-                cache_ttl=1.0,
+                cache_ttl=0 if fresh else 1.0,
                 tr_cont="N" if page else "",
             )
             output = payload.get("output1")
@@ -1149,6 +1160,8 @@ class ConnectionRuntime:
         account: dict[str, Any],
         connection: dict[str, Any],
         business_date: date,
+        *,
+        fresh: bool = False,
     ) -> tuple[AccountOrder, ...]:
         """Read the broker's authoritative amend/cancel-eligible order list."""
 
@@ -1168,8 +1181,11 @@ class ConnectionRuntime:
             operation="account.open_orders",
             priority=RequestPriority.RECONCILIATION,
             group="account",
-            dedupe_key=f"{connection['id']}:open-orders:{account['id']}",
-            cache_ttl=1.0,
+            dedupe_key=(
+                f"{connection['id']}:open-orders:{account['id']}"
+                + (f":fresh:{uuid4().hex}" if fresh else "")
+            ),
+            cache_ttl=0 if fresh else 1.0,
         )
         rows = payload.get("output")
         if not isinstance(rows, list):
@@ -1371,7 +1387,11 @@ class ConnectionRuntime:
             raise RouterError(
                 RouterErrorCode.ORDER_STATUS_UNKNOWN,
                 "증권사가 성공 응답을 보냈지만 주문번호를 확인하지 못했습니다.",
-                details={"correlation_id": _correlation_id(response)},
+                details={
+                    "correlation_id": _correlation_id(response),
+                    "unknown_origin": "success_without_order_id",
+                    "exception_type": "MissingProviderOrderId",
+                },
             )
         return ProviderOrderAck(
             provider_order_id=provider_order_id,
@@ -2179,6 +2199,7 @@ class ConnectionRuntime:
         day: date,
         *,
         cache_ttl: float = 1.0,
+        fresh: bool = False,
     ) -> tuple[AccountOrder, ...]:
         input_payload = {
             "orr_dt": day.strftime("%Y%m%d"),
@@ -2191,6 +2212,7 @@ class ConnectionRuntime:
         cts = ""
         cts_flag = ""
         seen: set[str] = set()
+        fresh_token = uuid4().hex if fresh else ""
         for _ in range(10):
             payload, response = await self._namuh_post(
                 connection,
@@ -2202,6 +2224,7 @@ class ConnectionRuntime:
                 dedupe_key=(
                     f"{connection['id']}:orders:{account['id']}:"
                     f"{day.isoformat()}:{cts}"
+                    + (f":fresh:{fresh_token}" if fresh else "")
                 ),
                 cache_ttl=cache_ttl,
                 cts=cts,
@@ -2225,17 +2248,7 @@ class ConnectionRuntime:
                 break
             seen.add(next_cts)
             cts, cts_flag = next_cts, next_flag
-        parsed = tuple(
-            order
-            for row in rows
-            if isinstance(row, dict)
-            and (order := _parse_namuh_account_order(row, account["alias"], day))
-            is not None
-        )
-        unique = {order.provider_order_id: order for order in parsed}
-        return tuple(
-            sorted(unique.values(), key=lambda item: item.ordered_at, reverse=True)
-        )
+        return _normalize_namuh_account_orders(rows, account["alias"], day)
 
     async def _namuh_buying_power(
         self,
@@ -2368,7 +2381,11 @@ class ConnectionRuntime:
             raise RouterError(
                 RouterErrorCode.ORDER_STATUS_UNKNOWN,
                 str(payload.get("rsp_msg") or "NAMUH 주문번호를 확인하지 못했습니다."),
-                details={"correlation_id": _correlation_id(response)},
+                details={
+                    "correlation_id": _correlation_id(response),
+                    "unknown_origin": "success_without_order_id",
+                    "exception_type": "MissingProviderOrderId",
+                },
             )
         return ProviderOrderAck(
             provider_order_id=provider_order_id,
@@ -2587,6 +2604,10 @@ class ConnectionRuntime:
                         else RouterErrorCode.INVALID_REQUEST
                     ),
                     "증권사 API 요청에 실패했습니다.",
+                    # Safe transport classification is useful to the order
+                    # reconciler even for history reads; never retain URLs,
+                    # bodies, headers or raw exception messages.
+                    details=_safe_order_transport_details(exc),
                 ) from exc
             payload = _safe_json(response)
             code = str(payload.get("error_code") or payload.get("rsp_cd") or "")
@@ -2599,6 +2620,14 @@ class ConnectionRuntime:
                 raise RouterError(RouterErrorCode.AUTHENTICATION_FAILED, message)
             if response.status_code == 429:
                 raise RouterError(RouterErrorCode.RATE_LIMITED, message)
+            if group == "order" and (
+                response.status_code == 408 or response.status_code >= 500
+            ):
+                raise RouterError(
+                    RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                    "주문 응답을 확정하지 못해 증권사 주문내역 확인이 필요합니다.",
+                    details=_safe_order_http_status_details(response.status_code),
+                )
             if response.status_code != 200:
                 suffix = f" [{code}]" if code else ""
                 raise RouterError(
@@ -2682,6 +2711,7 @@ class ConnectionRuntime:
                 raise RouterError(
                     RouterErrorCode.INVALID_REQUEST,
                     "증권사 API 요청에 실패했습니다.",
+                    details=_safe_order_transport_details(exc),
                 ) from exc
             finally:
                 # A cache hit does not send HTTP and must not extend the order
@@ -2819,6 +2849,7 @@ class ConnectionRuntime:
                 raise RouterError(
                     RouterErrorCode.ORDER_STATUS_UNKNOWN,
                     "주문 응답을 받지 못해 접수 여부를 확인해야 합니다.",
+                    details=_safe_order_transport_details(exc),
                 ) from exc
             payload = _safe_json(response)
             code = str(payload.get("msg_cd") or "")
@@ -2827,6 +2858,12 @@ class ConnectionRuntime:
                 raise RouterError(RouterErrorCode.AUTHENTICATION_FAILED, message)
             if response.status_code == 429:
                 raise RouterError(RouterErrorCode.RATE_LIMITED, message)
+            if response.status_code == 408 or response.status_code >= 500:
+                raise RouterError(
+                    RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                    "주문 응답을 확정하지 못해 증권사 주문내역 확인이 필요합니다.",
+                    details=_safe_order_http_status_details(response.status_code),
+                )
             if response.status_code != 200 or str(payload.get("rt_cd", "0")) != "0":
                 suffix = f" [{code}]" if code else ""
                 raise RouterError(
@@ -2852,6 +2889,37 @@ class ConnectionRuntime:
             rate_scope, lambda: self._requests.execute(intent, send),
             order_submission=True, priority=RequestPriority.ORDER,
         )
+
+
+def _safe_order_transport_details(exc: BaseException) -> dict[str, object]:
+    """Return only diagnostic categories that cannot expose request secrets."""
+
+    details: dict[str, object] = {
+        "unknown_origin": "transport_error",
+        "exception_type": type(exc).__name__,
+    }
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        raw_winerror = getattr(current, "winerror", None)
+        try:
+            winerror = int(raw_winerror)
+        except (TypeError, ValueError):
+            winerror = None
+        if winerror is not None and -1_000_000 <= winerror <= 1_000_000:
+            details["winerror"] = winerror
+            break
+        current = current.__cause__ or current.__context__
+    return details
+
+
+def _safe_order_http_status_details(status_code: int) -> dict[str, object]:
+    return {
+        "unknown_origin": "http_status_unknown",
+        "exception_type": "HTTPStatusError",
+        "http_status": status_code,
+    }
 
 
 def _safe_json(response: httpx.Response) -> dict[str, Any]:
@@ -3004,6 +3072,11 @@ def _parse_kis_account_order(
         route = OrderRoute(route_text)
     except ValueError:
         route = OrderRoute.AUTO
+    original_provider_order_id = str(
+        row.get("orgn_odno") or row.get("ORGN_ODNO") or ""
+    ).strip()
+    if original_provider_order_id in {"", "0", provider_order_id}:
+        original_provider_order_id = None
 
     return AccountOrder(
         provider_order_id=provider_order_id,
@@ -3023,6 +3096,7 @@ def _parse_kis_account_order(
             default=Decimal("0"),
         ),
         route=route,
+        original_provider_order_id=original_provider_order_id,
     )
 
 
@@ -3043,7 +3117,6 @@ def _normalize_kis_account_orders(
     parsed: dict[str, AccountOrder] = {}
     source_rows: dict[str, dict[str, Any]] = {}
     cancelled_by_original: dict[str, Decimal] = {}
-    cancellation_time: dict[str, datetime] = {}
 
     for row in rows:
         order = _parse_kis_account_order(row, account_alias, fallback_date)
@@ -3065,15 +3138,24 @@ def _normalize_kis_account_orders(
         )
         if not is_cancellation:
             continue
+        # A rejected cancellation child proves only that an attempt was made;
+        # folding its requested quantity into the original would incorrectly
+        # close a still-live order.
+        if order.status is OrderStatus.REJECTED:
+            continue
         quantity = _kis_cancelled_quantity(row)
         if quantity <= 0:
-            quantity = _decimal(row.get("ord_qty"), default=Decimal("0"))
+            requested_cancel = _decimal(
+                row.get("ord_qty"), default=Decimal("0")
+            )
+            rejected_cancel = _decimal(
+                row.get("rjct_qty"), default=Decimal("0")
+            )
+            quantity = max(Decimal("0"), requested_cancel - rejected_cancel)
+        if quantity <= 0:
+            continue
         cancelled_by_original[original_id] = (
             cancelled_by_original.get(original_id, Decimal("0")) + quantity
-        )
-        cancellation_time[original_id] = max(
-            cancellation_time.get(original_id, order.ordered_at),
-            order.ordered_at,
         )
 
     child_ids: set[str] = set()
@@ -3113,14 +3195,14 @@ def _normalize_kis_account_orders(
             requested_quantity=original.requested_quantity,
             filled_quantity=original.filled_quantity,
             remaining_quantity=remaining,
-            ordered_at=max(
-                original.ordered_at,
-                cancellation_time.get(original_id, original.ordered_at),
-            ),
+            # Matching is anchored to the original broker acceptance time.
+            # A later cancellation child must not widen/move that window.
+            ordered_at=original.ordered_at,
             provider=original.provider,
             price=original.price,
             average_fill_price=original.average_fill_price,
             route=original.route,
+            original_provider_order_id=original.original_provider_order_id,
         )
 
     return tuple(
@@ -3204,6 +3286,14 @@ def _parse_namuh_account_order(
         route = OrderRoute(route_text)
     except ValueError:
         route = OrderRoute.AUTO
+    original_provider_order_id = _normalize_namuh_order_id(
+        row.get("org_mkt_orr_no")
+        or row.get("org_itg_orr_no")
+        or row.get("org_orr_no")
+        or row.get("orgordno")
+    )
+    if original_provider_order_id in {"", "0", provider_order_id}:
+        original_provider_order_id = None
     return AccountOrder(
         provider_order_id=provider_order_id,
         account_alias=account_alias,
@@ -3214,13 +3304,126 @@ def _parse_namuh_account_order(
         requested_quantity=requested,
         filled_quantity=filled,
         remaining_quantity=remaining,
-        ordered_at=datetime.combine(fallback_date, time(), tzinfo=SEOUL),
+        ordered_at=_namuh_order_time(row, fallback_date),
         provider="namuh",
         price=_decimal(row.get("orr_pr"), default=Decimal("0")),
         average_fill_price=_decimal(
             row.get("cns_avg_uit_pr"), default=Decimal("0")
         ),
         route=route,
+        original_provider_order_id=original_provider_order_id,
+    )
+
+
+def _normalize_namuh_account_orders(
+    rows: list[dict[str, Any]],
+    account_alias: str,
+    fallback_date: date,
+) -> tuple[AccountOrder, ...]:
+    """Fold accepted NAMUH cancel children into their tracked parent order."""
+
+    parsed: dict[str, AccountOrder] = {}
+    cancelled_by_original: dict[str, Decimal] = {}
+    cancel_child_ids: set[str] = set()
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        order = _parse_namuh_account_order(row, account_alias, fallback_date)
+        if order is None:
+            continue
+        parsed[order.provider_order_id] = order
+        original_id = str(order.original_provider_order_id or "").strip()
+        if not original_id or original_id == order.provider_order_id:
+            continue
+        labels = " ".join(
+            str(row.get(key) or "")
+            for key in (
+                "orr_dit_cd_nm",
+                "orr_dvsn_cd_nm",
+                "orr_tp_cd_nm",
+                "nmn_pr_tp_cd_nm",
+            )
+        )
+        confirmed_cancel = _decimal(
+            row.get("can_qty")
+            or row.get("cncl_qty")
+            or row.get("tot_can_qty"),
+            default=Decimal("0"),
+        )
+        if (
+            order.status is OrderStatus.REJECTED
+            or (confirmed_cancel <= 0 and "취소" not in labels)
+        ):
+            continue
+        if confirmed_cancel <= 0:
+            rejected_cancel = _decimal(
+                row.get("rjt_qty") or row.get("orr_rjt_qty"),
+                default=Decimal("0"),
+            )
+            confirmed_cancel = max(
+                Decimal("0"), order.requested_quantity - rejected_cancel
+            )
+        if confirmed_cancel <= 0:
+            continue
+        cancelled_by_original[original_id] = (
+            cancelled_by_original.get(original_id, Decimal("0"))
+            + confirmed_cancel
+        )
+        cancel_child_ids.add(order.provider_order_id)
+
+    for original_id, cancelled_quantity in cancelled_by_original.items():
+        original = parsed.get(original_id)
+        if original is None:
+            continue
+        remaining = min(
+            original.remaining_quantity,
+            max(
+                Decimal("0"),
+                original.requested_quantity
+                - original.filled_quantity
+                - cancelled_quantity,
+            ),
+        )
+        status = (
+            OrderStatus.CANCELLED
+            if remaining <= 0
+            else (
+                OrderStatus.PARTIALLY_FILLED
+                if original.filled_quantity > 0
+                else OrderStatus.ACKNOWLEDGED
+            )
+        )
+        parsed[original_id] = AccountOrder(
+            provider_order_id=original.provider_order_id,
+            account_alias=original.account_alias,
+            instrument=original.instrument,
+            side=original.side,
+            order_type=original.order_type,
+            status=status,
+            requested_quantity=original.requested_quantity,
+            filled_quantity=original.filled_quantity,
+            remaining_quantity=remaining,
+            # Preserve the original acceptance time for response-loss
+            # reconciliation; the cancel child can arrive minutes later.
+            ordered_at=original.ordered_at,
+            provider=original.provider,
+            price=original.price,
+            average_fill_price=original.average_fill_price,
+            route=original.route,
+            original_provider_order_id=original.original_provider_order_id,
+        )
+
+    return tuple(
+        sorted(
+            (
+                order
+                for provider_id, order in parsed.items()
+                if provider_id not in cancel_child_ids
+            ),
+            key=lambda item: item.ordered_at,
+            reverse=True,
+        )
     )
 
 
@@ -3244,6 +3447,44 @@ def _kis_order_time(row: dict[str, Any], fallback_date: date) -> datetime:
     except ValueError:
         clock = time()
     return datetime.combine(day, clock, tzinfo=SEOUL)
+
+
+def _namuh_order_time(row: dict[str, Any], fallback_date: date) -> datetime:
+    """Parse NAMUH daily-order timestamps when the response supplies them."""
+
+    date_text = "".join(
+        character
+        for character in str(row.get("orr_dt") or row.get("ord_dt") or "")
+        if character.isdigit()
+    )
+    time_text = "".join(
+        character
+        for character in str(
+            row.get("orr_tm")
+            or row.get("orr_tmd")
+            or row.get("orr_time")
+            or row.get("ord_tmd")
+            or row.get("ord_time")
+            or ""
+        )
+        if character.isdigit()
+    )
+    if len(time_text) == 5:
+        time_text = f"0{time_text}"
+    try:
+        day = (
+            datetime.strptime(date_text[:8], "%Y%m%d").date()
+            if len(date_text) >= 8
+            else fallback_date
+        )
+        if len(time_text) >= 6:
+            clock = datetime.strptime(time_text[:6], "%H%M%S").time()
+            return datetime.combine(day, clock, tzinfo=SEOUL)
+    except ValueError:
+        pass
+    # Without a broker-supplied time the order stays manual-link-only: midnight
+    # intentionally cannot satisfy the conservative automatic match window.
+    return datetime.combine(fallback_date, time(), tzinfo=SEOUL)
 
 
 def _minute_interval(value: str) -> int:

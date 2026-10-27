@@ -12,7 +12,7 @@ EXCEPTION_TYPES = frozenset({
     "BrokenPipeError", "CancelledError", "JSONDecodeError", "InvalidOperation",
     "RouterError", "ReadTimeout", "ConnectTimeout", "ConnectError", "ReadError",
     "RemoteProtocolError", "HTTPStatusError", "WebSocketDisconnect",
-    "RuntimeStoreRestartRequired",
+    "RuntimeStoreRestartRequired", "MissingProviderOrderId",
 })
 FAILURE_AREAS = frozenset({"STATE_PERSISTENCE", "STATE_RECOVERY", "RUNTIME_DATABASE", "UNKNOWN"})
 EXIT_REASONS = frozenset({"USER_STOPPED", "PROCESS_COMPLETED", "PROCESS_FAILED", "PROCESS_EXITED"})

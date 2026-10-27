@@ -21,6 +21,8 @@ from trade_router import (
     OrderStatus,
     Position,
     Quote,
+    RouterError,
+    RouterErrorCode,
     ScheduleKind,
     TokenScopeKey,
     Venue,
@@ -40,6 +42,7 @@ from trade_router_studio.block_packages import (
     render_block_strategy,
 )
 from trade_router_studio.connections import _minute_interval
+from trade_router_studio.orders import OrderService
 from trade_router_studio.runtime_scheduler import _bar_interval_seconds
 from trade_router_studio import paths as paths_module
 from trade_router_studio.paths import (
@@ -66,6 +69,28 @@ def workspace(root: Path) -> WorkspacePaths:
         data=root / "data",
         config=root / "config",
     )
+
+
+def seed_unknown_order(app, *, client_order_id: str = "unknown-http") -> str:
+    store = app.state.runtime_store
+    row, _created = store.reserve_order(
+        strategy_id="unknown-http-strategy",
+        account_alias="unknown-http-account",
+        client_order_id=client_order_id,
+        request={
+            "instrument": "005930",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "quantity": "1",
+            "route": "KRX",
+        },
+    )
+    store.update_order(
+        row["id"],
+        status=OrderStatus.UNKNOWN_RECONCILING,
+        message="접수 여부 확인 필요",
+    )
+    return str(row["id"])
 
 
 def test_workspace_replaces_only_the_obsolete_bundled_example(tmp_path: Path) -> None:
@@ -2020,6 +2045,239 @@ def test_status_reports_automatic_runtime_database_recovery(tmp_path: Path) -> N
     recovery = response.json()["database_recovery"]
     assert recovery["message"].startswith("실행 기록 DB 손상을 자동 복구했습니다.")
     assert Path(recovery["backup_path"], "runtime.sqlite3").is_file()
+
+
+def test_unknown_order_reconcile_endpoint_calls_safe_service_method(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    async def reconcile_unknown_order(_self, order_id: str):
+        calls.append(order_id)
+        return {
+            "order": {"id": order_id, "status": "FILLED"},
+            "resolved": True,
+            "match_result": "linked",
+            "candidate_count": 1,
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(
+        OrderService,
+        "reconcile_unknown_order",
+        reconcile_unknown_order,
+    )
+    app = create_app(workspace(tmp_path / "workspace"))
+    with TestClient(app) as client:
+        order_id = seed_unknown_order(app)
+        response = client.post(f"/api/runtime/orders/{order_id}/reconcile")
+        missing = client.post("/api/runtime/orders/order-does-not-exist/reconcile")
+
+    assert response.status_code == 200
+    assert response.json()["resolved"] is True
+    assert calls == [order_id]
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "ORDER_NOT_FOUND"
+
+
+def test_runtime_orders_can_isolate_account_unknowns_for_recovery(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "workspace"))
+
+    with TestClient(app) as client:
+        store = app.state.runtime_store
+
+        def reserve(
+            client_id: str,
+            *,
+            account: str,
+            strategy: str,
+            status: OrderStatus,
+        ) -> str:
+            row, _ = store.reserve_order(
+                strategy_id=strategy,
+                account_alias=account,
+                client_order_id=client_id,
+                request={
+                    "instrument": "005930",
+                    "side": "BUY",
+                    "order_type": "MARKET",
+                    "quantity": "1",
+                    "route": "KRX",
+                },
+            )
+            store.update_order(str(row["id"]), status=status)
+            return str(row["id"])
+
+        target = reserve(
+            "same-account-unknown",
+            account="account-a",
+            strategy="old-strategy",
+            status=OrderStatus.UNKNOWN_RECONCILING,
+        )
+        reserve(
+            "other-account-unknown",
+            account="account-b",
+            strategy="old-strategy",
+            status=OrderStatus.UNKNOWN_RECONCILING,
+        )
+        open_order = reserve(
+            "same-account-ack",
+            account="account-a",
+            strategy="current-strategy",
+            status=OrderStatus.ACKNOWLEDGED,
+        )
+        unknown = client.get(
+            "/api/runtime/orders",
+            params={
+                "account_alias": "account-a",
+                "unknown_only": "true",
+                "limit": 1000,
+            },
+        )
+        unresolved = client.get(
+            "/api/runtime/orders",
+            params={
+                "account_alias": "account-a",
+                "unresolved_only": "true",
+                "limit": 1000,
+            },
+        )
+
+    assert unknown.status_code == 200
+    assert [row["id"] for row in unknown.json()] == [target]
+    assert {row["id"] for row in unresolved.json()} == {target, open_order}
+
+
+def test_unknown_order_resolution_endpoint_requires_explicit_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, str | None]] = []
+
+    async def resolve_unknown_order(
+        _self,
+        order_id: str,
+        *,
+        action: str,
+        provider_order_id: str | None = None,
+        confirmation: str = "",
+    ):
+        calls.append(
+            {
+                "order_id": order_id,
+                "action": action,
+                "provider_order_id": provider_order_id,
+                "confirmation": confirmation,
+            }
+        )
+        return {
+            "order": {"id": order_id, "status": "REJECTED"},
+            "resolved": True,
+            "match_result": "not_accepted",
+            "candidate_count": 0,
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(OrderService, "resolve_unknown_order", resolve_unknown_order)
+    app = create_app(workspace(tmp_path / "workspace"))
+    with TestClient(app) as client:
+        order_id = seed_unknown_order(app)
+        invalid_link = client.post(
+            f"/api/runtime/orders/{order_id}/resolve",
+            json={"action": "LINK", "confirmation": "HTS_LINK_CONFIRMED"},
+        )
+        invalid_not_accepted = client.post(
+            f"/api/runtime/orders/{order_id}/resolve",
+            json={
+                "action": "NOT_ACCEPTED",
+                "provider_order_id": "broker-1",
+                "confirmation": "HTS_NOT_ACCEPTED",
+            },
+        )
+        linked = client.post(
+            f"/api/runtime/orders/{order_id}/resolve",
+            json={
+                "action": "LINK",
+                "provider_order_id": "broker-1",
+                "confirmation": "HTS_LINK_CONFIRMED",
+            },
+        )
+        not_accepted = client.post(
+            f"/api/runtime/orders/{order_id}/resolve",
+            json={
+                "action": "NOT_ACCEPTED",
+                "confirmation": "HTS_NOT_ACCEPTED",
+            },
+        )
+
+    assert invalid_link.status_code == 422
+    assert invalid_not_accepted.status_code == 422
+    assert linked.status_code == 200
+    assert not_accepted.status_code == 200
+    assert calls == [
+        {
+            "order_id": order_id,
+            "action": "LINK",
+            "provider_order_id": "broker-1",
+            "confirmation": "HTS_LINK_CONFIRMED",
+        },
+        {
+            "order_id": order_id,
+            "action": "NOT_ACCEPTED",
+            "provider_order_id": None,
+            "confirmation": "HTS_NOT_ACCEPTED",
+        },
+    ]
+
+
+def test_unknown_order_resolution_maps_conflicts_and_redacts_internal_errors(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def conflict(_self, _order_id: str):
+        raise RouterError(
+            RouterErrorCode.ORDER_STATUS_UNKNOWN,
+            "일치 후보가 두 개라 자동 연결할 수 없습니다.",
+            details={"candidate_count": 2},
+        )
+
+    monkeypatch.setattr(OrderService, "reconcile_unknown_order", conflict)
+    app = create_app(workspace(tmp_path / "conflict-workspace"))
+    with TestClient(app) as client:
+        order_id = seed_unknown_order(app)
+        response = client.post(f"/api/runtime/orders/{order_id}/reconcile")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ORDER_STATUS_UNKNOWN"
+    assert response.json()["detail"]["details"] == {"candidate_count": 2}
+
+    async def fail_with_secret(_self, _order_id: str):
+        raise RuntimeError("secret-app-key-must-not-leak")
+
+    monkeypatch.setattr(
+        OrderService,
+        "reconcile_unknown_order",
+        fail_with_secret,
+    )
+    failing_app = create_app(workspace(tmp_path / "failure-workspace"))
+    with TestClient(failing_app) as client:
+        order_id = seed_unknown_order(failing_app, client_order_id="internal-error")
+        failed = client.post(f"/api/runtime/orders/{order_id}/reconcile")
+        events = client.get(
+            "/api/runtime/events",
+            params={"source": "system"},
+        ).json()
+
+    assert failed.status_code == 500
+    assert failed.json()["detail"]["error_type"] == "RuntimeError"
+    assert "secret-app-key" not in failed.text
+    assert events[0]["event_type"] == "order.unknown_resolution_error"
+    assert events[0]["details"]["source_kind"] == "system"
+    assert events[0]["details"]["exception_type"] == "RuntimeError"
+    assert "secret-app-key" not in str(events[0])
 
 
 def test_block_editor_condition_options_use_connection_runtime(tmp_path: Path) -> None:

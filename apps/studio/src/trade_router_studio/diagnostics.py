@@ -13,11 +13,12 @@ from zoneinfo import ZoneInfo
 from trade_router import OrderStatus, RouterErrorCode
 
 from .block_packages import block_package_from_source
-from .process_diagnostics import safe_exit_details
+from .process_diagnostics import EXCEPTION_TYPES, safe_exit_details
 
 SEOUL = ZoneInfo("Asia/Seoul")
 MAX_STRATEGIES = 50
 MAX_HISTORY = 1000
+MAX_CRITICAL_HISTORY = 1000
 MAX_LOGS = 500
 MAX_EXITS = 200
 ERROR_CODES = {item.value for item in RouterErrorCode}
@@ -32,6 +33,7 @@ EVENT_TYPES = {
     "order.submitting", "order.acknowledged", "order.partially_filled", "order.filled",
     "order.rejected", "order.unknown", "order.cancelled", "order.cancel_pending",
     "order.amended", "order.reconcile_error", "order.unknown_reconciling",
+    "order.reconciled", "order.manually_resolved", "order.unknown_resolution_error",
 } | {
     f"service.{service}.{operation}.{outcome}"
     for service, operations in {
@@ -41,6 +43,44 @@ EVENT_TYPES = {
     }.items()
     for operation in operations for outcome in ("success", "error")
 }
+CRITICAL_ORDER_EVENT_TYPES = (
+    "order.submitting", "order.acknowledged", "order.partially_filled",
+    "order.filled", "order.rejected", "order.unknown", "order.cancelled",
+    "order.cancel_pending", "order.amended", "order.reconcile_error",
+    "order.unknown_reconciling", "order.reconciled", "order.manually_resolved",
+    "order.unknown_resolution_error", "service.order.submit.success",
+    "service.order.submit.error",
+)
+EVENT_REASONS = {
+    "order.unknown": "ORDER_STATUS_UNKNOWN",
+    "order.unknown_reconciling": "ORDER_STATUS_UNKNOWN",
+    "order.reconcile_error": "ORDER_RECONCILE_ERROR",
+    "order.unknown_resolution_error": "ORDER_RECONCILE_ERROR",
+}
+SOURCE_KINDS = frozenset({"system", "strategy", "account"})
+UNKNOWN_ORIGINS = frozenset({
+    "transport_error", "success_without_order_id", "restart_submitting",
+    "unexpected_adapter_error", "legacy_unknown", "amend_exception",
+    "cancel_exception", "http_status_unknown",
+})
+FAILURE_PHASES = frozenset({"submit", "modify", "reconcile"})
+MATCH_RESULTS = frozenset({
+    "not_checked", "none", "ambiguous", "unique", "linked", "not_accepted",
+    "ambiguous_modification", "modification_pending", "linked_modification",
+    "manual_required_no_order_time", "amendment_successor_missing",
+    "manual_required_missing_parent_relation", "manual_linked_modification",
+    "auto_cancel_reconciled", "manual_modification_not_accepted",
+    "realtime_rejected", "broker_amendment_rejected",
+    "manual_required_legacy_modification", "legacy_modification_pending",
+    "amendment_rejected_parent_missing",
+})
+RESOLUTIONS = frozenset({
+    "auto_linked", "manual_linked", "manual_not_accepted",
+    "auto_amendment_linked", "broker_terminal",
+    "manual_modification_not_accepted", "realtime_rejected",
+    "manual_amendment_linked", "auto_cancel_reconciled",
+    "broker_amendment_rejected",
+})
 # Match diagnostic meaning, not text to retain. No substring from a message is exported.
 REASONS = (
     ("사용자 요청으로 전략을 중지", "USER_STOPPED"),
@@ -124,17 +164,62 @@ def _cost_projection(rates):
         sell_fee is not None and tax is not None and sell_fee + tax < 1)}
 
 
-def _reason(message, details=None):
+def _reason(message, details=None, *, event_type=None):
     text = str(message or "")[:8192]
     details = details if isinstance(details, dict) else {}
     error = next((details.get(key) for key in ("error_code", "code")
                   if isinstance(details.get(key), str) and details.get(key) in ERROR_CODES), None)
     if error is None:
         error = next((code for code in sorted(ERROR_CODES) if f"[{code}]" in text), None)
-    reason = next((reason for pattern, reason in REASONS if pattern in text), "UNCLASSIFIED")
+    reason = EVENT_REASONS.get(event_type)
+    if reason is None:
+        reason = next((reason for pattern, reason in REASONS if pattern in text), "UNCLASSIFIED")
     if reason == "UNCLASSIFIED" and "실시간 현재가" in text and "매도 요청:" in text:
         reason = "LIVE_EXIT_ORDER_ATTEMPT"
     return {"reason": reason, "error_code": error}
+
+
+def _integer(value, low=0, high=1_000_000):
+    if type(value) is int and low <= value <= high:
+        return value
+    return None
+
+
+def _safe_unknown_fields(raw, *, provider_id_present=None):
+    """Project only bounded enums/counters from uncertain-order metadata."""
+
+    source = raw if isinstance(raw, dict) else {}
+    present = provider_id_present
+    if type(present) is not bool:
+        present = source.get("provider_id_present")
+    if type(present) is not bool:
+        present = None
+    exception_type = source.get("exception_type")
+    winerror = source.get("winerror")
+    return {
+        "provider_id_present": present,
+        "unknown_origin": _enum(source.get("unknown_origin"), UNKNOWN_ORIGINS, None),
+        "failure_phase": _enum(source.get("failure_phase"), FAILURE_PHASES, None),
+        "exception_type": (
+            exception_type
+            if isinstance(exception_type, str) and exception_type in EXCEPTION_TYPES
+            else None
+        ),
+        "winerror": (
+            winerror if type(winerror) is int and 0 <= winerror <= 65535 else None
+        ),
+        "http_status": _integer(source.get("http_status"), 100, 599),
+        "first_unknown_at": _timestamp(source.get("first_unknown_at")),
+        "reconcile_attempt_count": _integer(source.get("reconcile_attempt_count")),
+        "last_reconcile_at": _timestamp(source.get("last_reconcile_at")),
+        "candidate_count": _integer(source.get("candidate_count"), 0, 10_000),
+        "match_result": _enum(source.get("match_result"), MATCH_RESULTS, None),
+        "resolution": _enum(
+            source.get("resolution") or source.get("modification_resolution"),
+            RESOLUTIONS,
+            None,
+        ),
+    }
 
 
 class _Ids:
@@ -326,47 +411,91 @@ def build_diagnostics(*, version, manager, store, permissions, accounts,
     raw_orders = store.orders(limit=MAX_HISTORY)
     # An old unresolved order can still block a new stop-loss outside the history window.
     unresolved = store.unresolved_orders()
-    pending_rows = [{"order": ids.get("order", item.get("id")),
-                     "strategy": ids.get("strategy", item.get("strategy_id")),
-                     "account": ids.get("account", item.get("account_alias")),
-                     "status": _enum(item.get("status"), {state.value for state in OrderStatus})}
-                    for item in unresolved[:MAX_HISTORY]]
+    pending_rows = []
+    for item in unresolved[:MAX_HISTORY]:
+        request = item.get("request") or {}
+        metadata = item.get("provider_metadata") or {}
+        pending_rows.append({
+            "order": ids.get("order", item.get("id")),
+            "strategy": ids.get("strategy", item.get("strategy_id")),
+            "account": ids.get("account", item.get("account_alias")),
+            "instrument": ids.get("instrument", request.get("code")),
+            "created_at": _timestamp(item.get("created_at")),
+            "updated_at": _timestamp(item.get("updated_at")),
+            "status": _enum(item.get("status"), {state.value for state in OrderStatus}),
+            "side": _enum(request.get("side"), {"BUY", "SELL"}),
+            "order_type": _enum(request.get("order_type"), {"MARKET", "LIMIT", "BEST_LIMIT"}),
+            "route": _enum(request.get("route"), {"KRX", "NXT", "SOR", "AUTO"}),
+            **_safe_unknown_fields(
+                metadata,
+                provider_id_present=bool(item.get("provider_order_id")),
+            ),
+        })
     order_rows = []
     for item in recent(raw_orders, "updated_at"):
         request = item.get("request") or {}
+        metadata = item.get("provider_metadata") or {}
+        status = _enum(item.get("status"), {state.value for state in OrderStatus})
         order_rows.append({"order": ids.get("order", item.get("id")),
                            "strategy": ids.get("strategy", item.get("strategy_id")),
                            "account": ids.get("account", item.get("account_alias")),
                            "instrument": ids.get("instrument", request.get("code")),
                            "created_at": _timestamp(item.get("created_at")),
                            "updated_at": _timestamp(item.get("updated_at")),
-                           "status": _enum(item.get("status"), {state.value for state in OrderStatus}),
+                           "status": status,
                            "side": _enum(request.get("side"), {"BUY", "SELL"}),
                            "order_type": _enum(request.get("order_type"), {"MARKET", "LIMIT", "BEST_LIMIT"}),
                            "route": _enum(request.get("route"), {"KRX", "NXT", "SOR", "AUTO"}),
-                           **_reason(item.get("message"))})
+                           **_safe_unknown_fields(
+                               metadata,
+                               provider_id_present=bool(item.get("provider_order_id")),
+                           ),
+                           **_reason(
+                               item.get("message"),
+                               event_type=("order.unknown" if status == OrderStatus.UNKNOWN_RECONCILING.value else None),
+                           )})
     raw_events = store.events(limit=MAX_HISTORY)
 
     def project_event(item):
         details = item.get("details") or {}
+        event_type = item.get("event_type")
+        source = item.get("source")
+        source_kind = details.get("source_kind")
+        if source_kind not in SOURCE_KINDS:
+            source_kind = (
+                "system" if source == "system"
+                or event_type == "order.unknown_resolution_error"
+                else "account" if event_type == "order.reconcile_error"
+                else "strategy"
+            )
         projected = {"at": _timestamp(item.get("occurred_at")),
-                           "strategy": None if item.get("source") == "system" else ids.get("strategy", item.get("source")),
-                           "event": _enum(item.get("event_type"), EVENT_TYPES),
+                           "source_kind": source_kind,
+                           "strategy": ids.get("strategy", source) if source_kind == "strategy" else None,
+                           "account": ids.get("account", source) if source_kind == "account" else None,
+                           "event": _enum(event_type, EVENT_TYPES),
                            "duration_ms": _number(details.get("duration_ms"), 0, 3600000),
                            "order": ids.get("order", details.get("order_id")),
-                           **_reason(item.get("message"), details)}
-        if item.get("event_type") == "strategy.process_exit":
+                           **_safe_unknown_fields(details),
+                           **_reason(item.get("message"), details, event_type=event_type)}
+        if event_type == "strategy.process_exit":
             summary = safe_exit_details(details)
             projected.update(summary)
             projected["reason"] = summary["exit_reason"]
         return projected
 
     event_rows = [project_event(item) for item in recent(raw_events, "occurred_at")]
+    raw_critical_events = store.events(
+        limit=MAX_CRITICAL_HISTORY,
+        event_types=CRITICAL_ORDER_EVENT_TYPES,
+    )
+    critical_event_rows = [
+        project_event(item) for item in recent(raw_critical_events, "occurred_at")
+    ]
     # Busy quote polling must not crowd the actual stop reason out of an export.
     raw_exits = store.events(limit=MAX_EXITS, event_types=("strategy.process_exit",))
     exit_rows = [project_event(item) for item in recent(raw_exits, "occurred_at")]
     data = {
-        "schema_version": 1, "app_version": version,
+        "schema_version": 2, "app_version": version,
         "exported_at": now.isoformat(),
         "history_window": {"from": cutoff.isoformat(), "to": now.isoformat(), "hours": hours},
         "current_snapshot": {"at": now.isoformat(), "strategies": strategies, "accounts": account_rows,
@@ -379,12 +508,17 @@ def build_diagnostics(*, version, manager, store, permissions, accounts,
                                            "subscriptions": _number(item.get("subscriptions"), 0, 10000),
                                            "last_received_at": _timestamp(item.get("last_received_at"))}
                                           for item in realtime_states[:100]]},
-        "history": {"orders": order_rows, "events": event_rows, "strategy_logs": logs,
+        "history": {"orders": order_rows, "events": event_rows,
+                    "critical_order_events": critical_event_rows, "strategy_logs": logs,
                     "strategy_exits": exit_rows},
         "coverage": {"strategy_limit": MAX_STRATEGIES, "strategy_limit_reached": len(rows) > MAX_STRATEGIES,
                      "unresolved_orders": {"limit": MAX_HISTORY, "read": len(unresolved), "limit_reached": len(unresolved) >= MAX_HISTORY},
                      "orders": {"limit": MAX_HISTORY, "read": len(raw_orders), "exported": len(order_rows), "limit_reached": len(raw_orders) >= MAX_HISTORY},
                      "events": {"limit": MAX_HISTORY, "read": len(raw_events), "exported": len(event_rows), "limit_reached": len(raw_events) >= MAX_HISTORY},
+                     "critical_order_events": {"limit": MAX_CRITICAL_HISTORY,
+                                               "read": len(raw_critical_events),
+                                               "exported": len(critical_event_rows),
+                                               "limit_reached": len(raw_critical_events) >= MAX_CRITICAL_HISTORY},
                      "strategy_exits": {"limit": MAX_EXITS, "read": len(raw_exits), "exported": len(exit_rows), "limit_reached": len(raw_exits) >= MAX_EXITS},
                      "strategy_logs": history_meta,
                      "raw_messages_excluded": True,
@@ -395,7 +529,8 @@ def build_diagnostics(*, version, manager, store, permissions, accounts,
 diagnostics.json은 허용한 항목만 추출한 자료입니다. 원본 로그/DB/설정/전략 소스는 포함하지 않습니다.
 포함: 앱 버전, 시각, 익명 ID, 현재 실행·주문 허용 상태, 저장된 매도 시간·조건구조·수익률 기준,
 주문 상태와 시각, 고정 오류 분류, 위험 한도 설정 여부, 실시간 구독수와 연결 수신 시각,
-프로세스 종료 코드·사용자 중지 여부·허용된 예외 종류·Windows 오류 번호·고정 실패 영역.
+프로세스 종료 코드·사용자 중지 여부·허용된 예외 종류·Windows 오류 번호·고정 실패 영역,
+미확정 주문의 실패 단계·안전한 예외 종류·조정 횟수·후보 수·해결 방식과 중요 주문 이벤트.
 제외: API 키·토큰·계좌번호·HTS ID·연결주소·사용자 경로·별칭/이름·종목명/코드,
 보유수량·금액·자산·실주문번호·원문 오류/로그·전략 소스. 숫자 조건 중 수익률 기준 외 직접 값도 제외합니다.
 

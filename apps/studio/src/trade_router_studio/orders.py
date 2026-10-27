@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Protocol
 from zoneinfo import ZoneInfo
@@ -28,6 +28,10 @@ from .sessions import StrategyManifest
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
+UNKNOWN_ORDER_EARLY_TOLERANCE = timedelta(seconds=10)
+UNKNOWN_ORDER_LATE_TOLERANCE = timedelta(seconds=10)
+UNKNOWN_NOT_ACCEPTED_CONFIRMATION = "HTS_NOT_ACCEPTED"
+UNKNOWN_LINK_CONFIRMATION = "HTS_LINK_CONFIRMED"
 
 
 class OrderGateway(Protocol):
@@ -53,6 +57,7 @@ class OrderGateway(Protocol):
         *,
         state: str = "all",
         business_date: object | None = None,
+        fresh: bool = False,
     ) -> tuple[object, ...]: ...
 
     async def submit_order(
@@ -151,6 +156,1158 @@ class OrderService:
         async with self._account_lock(account_alias):
             return await self._reconcile_account(account_alias)
 
+    async def reconcile_unknown_order(self, order_id: str) -> dict[str, object]:
+        """Try to attach one unambiguous broker order without resubmitting it."""
+
+        row = self._require_unknown_order(order_id)
+        account_alias = str(row["account_alias"])
+        async with self._account_lock(account_alias):
+            # Reload after waiting for the account lock. A background tracker or
+            # realtime notice may have resolved the row in the meantime.
+            row = self._require_unknown_order(order_id)
+            broker_orders, open_provider_ids = await self._broker_orders_for_row(
+                row, fresh=True
+            )
+            by_provider_id = _orders_by_provider_id(broker_orders)
+            provider_order_id = str(row.get("provider_order_id") or "")
+            if provider_order_id:
+                metadata = dict(row.get("provider_metadata") or {})
+                if not metadata.get("uncertain_modification"):
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        "증권사 주문번호가 있는 미확정 주문에는 정정·취소 조정 정보가 필요합니다.",
+                    )
+                working_row, broker_order, candidates, metadata_updates = (
+                    self._uncertain_modification_snapshot(
+                        row,
+                        broker_orders,
+                        by_provider_id=by_provider_id,
+                        open_provider_ids=open_provider_ids,
+                    )
+                )
+                unresolved_message = _uncertain_modification_message(
+                    metadata_updates
+                )
+            else:
+                candidates = self._unknown_order_candidates(row, broker_orders)
+                if len(candidates) == 1:
+                    working_row = row
+                    broker_order = candidates[0]
+                    metadata_updates = {
+                        **_unknown_reconcile_metadata(
+                            row, candidate_count=1, match_result="linked"
+                        ),
+                        "resolution": "auto_linked",
+                    }
+                else:
+                    manual_time_candidates = (
+                        self._unknown_manual_time_candidates(row, broker_orders)
+                        if not candidates
+                        else ()
+                    )
+                    if manual_time_candidates:
+                        candidates = manual_time_candidates
+                    working_row = row
+                    broker_order = None
+                    metadata_updates = _unknown_reconcile_metadata(
+                        row,
+                        candidate_count=len(candidates),
+                        match_result=(
+                            "manual_required_no_order_time"
+                            if manual_time_candidates
+                            else "none" if not candidates else "ambiguous"
+                        ),
+                    )
+                unresolved_message = (
+                    "증권사 주문시각이 없어 자동 연결할 수 없습니다. HTS 주문번호를 확인해 수동 연결하세요."
+                    if metadata_updates.get("match_result")
+                    == "manual_required_no_order_time"
+                    else _unknown_candidate_message(len(candidates))
+                )
+
+            if broker_order is None:
+                changed = self._store.update_order(
+                    order_id,
+                    status=OrderStatus.UNKNOWN_RECONCILING,
+                    provider_metadata=metadata_updates,
+                    message=unresolved_message,
+                )
+                self._reconciled_accounts.discard(account_alias)
+                await self._publish_order(changed)
+                return _unknown_reconcile_result(changed, candidates)
+
+            changed, fill = self._apply_broker_snapshot(
+                working_row,
+                broker_order,
+                by_provider_id=by_provider_id,
+                open_provider_ids=open_provider_ids,
+                provider_metadata_updates=metadata_updates,
+            )
+            if changed["status"] != OrderStatus.UNKNOWN_RECONCILING.value:
+                self._store.record(
+                    source=str(row["strategy_id"]),
+                    event_type="order.reconciled",
+                    message=(
+                        "증권사 주문내역에서 정정·취소 상태를 안전하게 조정했습니다."
+                        if provider_order_id
+                        else "증권사 주문내역의 유일한 일치 주문을 자동 연결했습니다."
+                    ),
+                    details={
+                        "order_id": order_id,
+                        "provider_order_id": str(
+                            getattr(broker_order, "provider_order_id", "")
+                        ),
+                        "resolution": str(
+                            dict(changed.get("provider_metadata") or {}).get("resolution")
+                            or dict(changed.get("provider_metadata") or {}).get(
+                                "modification_resolution"
+                            )
+                            or "reconciled"
+                        ),
+                    },
+                )
+            await self._publish_order(changed)
+            if fill is not None and self._event_publisher is not None:
+                await self._event_publisher(
+                    str(row["strategy_id"]),
+                    {"event_type": "fill", "fill": fill},
+                    None,
+                )
+            return _unknown_reconcile_result(changed, candidates)
+
+    async def resolve_unknown_order(
+        self,
+        order_id: str,
+        *,
+        action: str,
+        provider_order_id: str | None = None,
+        confirmation: str = "",
+    ) -> dict[str, object]:
+        """Resolve an unknown submit through a verified link or explicit non-acceptance.
+
+        ``LINK`` never trusts the supplied id alone: the broker order must be
+        present in that order's business-day history and its immutable request
+        fields must match. ``NOT_ACCEPTED`` is terminal only after an exact
+        confirmation token and a fresh history query with no unlinked match.
+        """
+
+        normalized_action = action.strip().upper()
+        if normalized_action not in {"LINK", "NOT_ACCEPTED"}:
+            raise RouterError(
+                RouterErrorCode.INVALID_REQUEST,
+                "미확정 주문 해결 방식은 LINK 또는 NOT_ACCEPTED여야 합니다.",
+            )
+        row = self._require_unknown_order(order_id)
+        account_alias = str(row["account_alias"])
+        async with self._account_lock(account_alias):
+            row = self._require_unknown_order(order_id)
+            # A manual resolution must be based on a broker round trip.  A
+            # short-lived cached snapshot can otherwise miss an order accepted
+            # immediately after the previous reconciliation request.
+            broker_orders, open_provider_ids = await self._broker_orders_for_row(
+                row, fresh=True
+            )
+            by_provider_id = _orders_by_provider_id(broker_orders)
+
+            if row.get("provider_order_id"):
+                metadata = dict(row.get("provider_metadata") or {})
+                modification_kind = str(
+                    metadata.get("uncertain_modification") or ""
+                )
+                pending = metadata.get("pending_modification")
+                if not modification_kind:
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        "정정·취소 미확정 정보가 없는 주문입니다.",
+                    )
+                legacy_modification = not isinstance(pending, dict)
+                if normalized_action == "LINK":
+                    if modification_kind != "amend":
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            "증권사 주문번호 연결은 정정 주문에만 사용할 수 있습니다.",
+                        )
+                    if confirmation != UNKNOWN_LINK_CONFIRMATION:
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            f"정정 주문 연결에는 {UNKNOWN_LINK_CONFIRMATION} 확인 문구가 필요합니다.",
+                        )
+                    clean_provider_id = str(provider_order_id or "").strip()
+                    original_provider_id = str(row["provider_order_id"])
+                    if not clean_provider_id or clean_provider_id == original_provider_id:
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            "연결할 정정 주문의 새 증권사 주문번호가 필요합니다.",
+                        )
+                    broker_order = by_provider_id.get(clean_provider_id)
+                    if broker_order is None:
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            "해당 영업일의 증권사 주문내역에서 정정 주문번호를 찾지 못했습니다.",
+                        )
+                    linked = self._store.order_by_provider_id(
+                        account_alias,
+                        clean_provider_id,
+                        business_date=_order_business_date(row).isoformat(),
+                    )
+                    if linked is not None and str(linked["id"]) != order_id:
+                        raise RouterError(
+                            RouterErrorCode.IDEMPOTENCY_CONFLICT,
+                            "이 증권사 주문번호는 이미 다른 주문에 연결되어 있습니다.",
+                        )
+                    broker_parent = str(
+                        getattr(
+                            broker_order, "original_provider_order_id", ""
+                        )
+                        or ""
+                    ).strip()
+                    if (
+                        legacy_modification
+                        and broker_parent != original_provider_id
+                    ):
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            "구버전 정정 주문은 증권사 원주문 번호가 현재 주문과 명시적으로 일치해야 연결할 수 있습니다.",
+                        )
+                    if (
+                        not legacy_modification
+                        and broker_parent
+                        and broker_parent != original_provider_id
+                    ):
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            "선택한 정정 주문의 원주문 번호가 현재 주문과 일치하지 않습니다.",
+                        )
+                    if (
+                        getattr(broker_order, "status", None)
+                        is OrderStatus.REJECTED
+                        or (
+                            not legacy_modification
+                            and not _broker_order_matches_pending_modification(
+                                row,
+                                broker_order,
+                                pending,
+                                enforce_time_window=False,
+                            )
+                        )
+                    ):
+                        raise RouterError(
+                            RouterErrorCode.INVALID_REQUEST,
+                            "증권사 정정 주문의 종목·방향·수량·주문유형 또는 가격이 요청과 일치하지 않습니다.",
+                        )
+                    if (
+                        legacy_modification
+                        and not _legacy_amendment_fill_semantics_are_safe(
+                            row,
+                            by_provider_id.get(original_provider_id),
+                        )
+                    ):
+                        raise RouterError(
+                            RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                            "구버전 정정 주문의 체결수량이 누적값인지 정정 이후 값인지 구분할 수 없어 안전하게 연결할 수 없습니다.",
+                        )
+                    working = (
+                        _row_for_linked_legacy_amendment(row, broker_order)
+                        if legacy_modification
+                        else _row_for_linked_amendment(row, broker_order)
+                    )
+                    resolved_metadata = dict(
+                        working.get("provider_metadata") or {}
+                    )
+                    resolved_metadata.update(
+                        {
+                            "match_result": "manual_linked_modification",
+                            "resolution": "manual_amendment_linked",
+                            "modification_resolution": "manual_amendment_linked",
+                        }
+                    )
+                    working["provider_metadata"] = resolved_metadata
+                    changed, fill = self._apply_broker_snapshot(
+                        working,
+                        broker_order,
+                        by_provider_id=by_provider_id,
+                        open_provider_ids=open_provider_ids,
+                        provider_metadata_updates=resolved_metadata,
+                    )
+                    self._store.record(
+                        source=str(row["strategy_id"]),
+                        event_type="order.manually_resolved",
+                        message="사용자가 검증된 정정 주문번호를 원주문에 연결했습니다.",
+                        details={
+                            "order_id": order_id,
+                            "provider_order_id": clean_provider_id,
+                            "resolution": "manual_amendment_linked",
+                        },
+                    )
+                    await self._publish_order(changed)
+                    if fill is not None and self._event_publisher is not None:
+                        await self._event_publisher(
+                            str(row["strategy_id"]),
+                            {"event_type": "fill", "fill": fill},
+                            None,
+                        )
+                    return _unknown_reconcile_result(
+                        changed, (broker_order,)
+                    )
+
+                if confirmation != UNKNOWN_NOT_ACCEPTED_CONFIRMATION:
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        f"정정·취소 미접수 확정에는 {UNKNOWN_NOT_ACCEPTED_CONFIRMATION} 확인 문구가 필요합니다.",
+                    )
+                candidates = (
+                    self._legacy_uncertain_amendment_candidates(
+                        row, broker_orders
+                    )
+                    if legacy_modification and modification_kind == "amend"
+                    else self._uncertain_modification_candidates(
+                        row,
+                        broker_orders,
+                        require_parent_relation=False,
+                        include_missing_time=True,
+                    )
+                )
+                blocking_candidates = tuple(
+                    candidate
+                    for candidate in candidates
+                    if getattr(candidate, "status", None)
+                    is not OrderStatus.REJECTED
+                )
+                if blocking_candidates:
+                    raise RouterError(
+                        RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                        "응답 시간대에 일치하는 정정 주문 후보가 있어 미접수 확정을 중단했습니다.",
+                        details={"candidate_count": len(blocking_candidates)},
+                    )
+                if modification_kind == "cancel" or legacy_modification:
+                    (
+                        auto_working,
+                        auto_broker_order,
+                        _,
+                        auto_metadata,
+                    ) = self._uncertain_modification_snapshot(
+                        row,
+                        broker_orders,
+                        by_provider_id=by_provider_id,
+                        open_provider_ids=open_provider_ids,
+                    )
+                    # A fresh snapshot that already reflects the requested
+                    # reduction is affirmative evidence of acceptance. Never
+                    # let an operator's stale HTS observation restore the
+                    # pre-cancel effective quantity in that case.
+                    auto_resolution = str(
+                        auto_metadata.get("modification_resolution") or ""
+                    )
+                    accepted_auto_resolutions = {"auto_cancel_reconciled"}
+                    if modification_kind == "cancel":
+                        accepted_auto_resolutions.add("broker_terminal")
+                    if legacy_modification:
+                        accepted_auto_resolutions.update(
+                            {"broker_terminal", "broker_amendment_rejected"}
+                        )
+                    if (
+                        auto_broker_order is not None
+                        and auto_resolution in accepted_auto_resolutions
+                    ):
+                        changed, fill = self._apply_broker_snapshot(
+                            auto_working,
+                            auto_broker_order,
+                            by_provider_id=by_provider_id,
+                            open_provider_ids=open_provider_ids,
+                            provider_metadata_updates=auto_metadata,
+                        )
+                        self._store.record(
+                            source=str(row["strategy_id"]),
+                            event_type="order.reconciled",
+                            message="증권사 주문내역에 반영된 취소 수량을 확인해 자동 조정했습니다.",
+                            details={
+                                "order_id": order_id,
+                                "provider_order_id": str(
+                                    getattr(
+                                        auto_broker_order,
+                                        "provider_order_id",
+                                        "",
+                                    )
+                                ),
+                                "resolution": str(
+                                    auto_metadata.get(
+                                        "modification_resolution"
+                                    )
+                                    or "broker_terminal"
+                                ),
+                            },
+                        )
+                        await self._publish_order(changed)
+                        if fill is not None and self._event_publisher is not None:
+                            await self._event_publisher(
+                                str(row["strategy_id"]),
+                                {"event_type": "fill", "fill": fill},
+                                None,
+                            )
+                        return _unknown_reconcile_result(changed, ())
+                original = by_provider_id.get(str(row["provider_order_id"]))
+                if original is None:
+                    raise RouterError(
+                        RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                        "원주문을 증권사 주문내역에서 확인하지 못해 미접수 확정을 중단했습니다.",
+                    )
+                original_status = _reconciled_order_status(
+                    original, open_provider_ids=open_provider_ids
+                )
+                if original_status not in {
+                    OrderStatus.ACKNOWLEDGED,
+                    OrderStatus.PARTIALLY_FILLED,
+                }:
+                    raise RouterError(
+                        RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                        "원주문이 이미 종료 상태여서 정정·취소 미접수 확인과 모순됩니다.",
+                        details={"broker_status": original_status.value},
+                    )
+                resolved_metadata = _resolved_modification_metadata(
+                    row, resolution="manual_modification_not_accepted"
+                )
+                working = dict(row)
+                working["provider_metadata"] = resolved_metadata
+                changed, fill = self._apply_broker_snapshot(
+                    working,
+                    original,
+                    by_provider_id=by_provider_id,
+                    open_provider_ids=open_provider_ids,
+                    provider_metadata_updates=resolved_metadata,
+                )
+                self._store.record(
+                    source=str(row["strategy_id"]),
+                    event_type="order.manually_resolved",
+                    message="사용자가 HTS에서 정정·취소 미접수를 확인하여 원주문 상태를 복원했습니다.",
+                    details={
+                        "order_id": order_id,
+                        "resolution": "manual_modification_not_accepted",
+                    },
+                )
+                await self._publish_order(changed)
+                if fill is not None and self._event_publisher is not None:
+                    await self._event_publisher(
+                        str(row["strategy_id"]),
+                        {"event_type": "fill", "fill": fill},
+                        None,
+                    )
+                return _unknown_reconcile_result(changed, ())
+
+            if normalized_action == "LINK":
+                if confirmation != UNKNOWN_LINK_CONFIRMATION:
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        f"주문 연결에는 {UNKNOWN_LINK_CONFIRMATION} 확인 문구가 필요합니다.",
+                    )
+                clean_provider_id = str(provider_order_id or "").strip()
+                if not clean_provider_id:
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        "연결할 증권사 주문번호가 필요합니다.",
+                    )
+                broker_order = by_provider_id.get(clean_provider_id)
+                if broker_order is None:
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        "해당 영업일의 증권사 주문내역에서 주문번호를 찾지 못했습니다.",
+                    )
+                linked = self._store.order_by_provider_id(
+                    account_alias,
+                    clean_provider_id,
+                    business_date=_order_business_date(row).isoformat(),
+                )
+                if linked is not None and str(linked["id"]) != order_id:
+                    raise RouterError(
+                        RouterErrorCode.IDEMPOTENCY_CONFLICT,
+                        "이 증권사 주문번호는 이미 다른 주문에 연결되어 있습니다.",
+                    )
+                if not _broker_order_matches_unknown(
+                    row, broker_order, enforce_time_window=False
+                ):
+                    raise RouterError(
+                        RouterErrorCode.INVALID_REQUEST,
+                        "증권사 주문의 종목·방향·수량·주문유형 또는 가격이 원주문과 일치하지 않습니다.",
+                    )
+                changed, fill = self._apply_broker_snapshot(
+                    row,
+                    broker_order,
+                    by_provider_id=by_provider_id,
+                    open_provider_ids=open_provider_ids,
+                    provider_metadata_updates={
+                        **_unknown_reconcile_metadata(
+                            row, candidate_count=1, match_result="linked"
+                        ),
+                        "resolution": "manual_linked",
+                    },
+                )
+                self._store.record(
+                    source=str(row["strategy_id"]),
+                    event_type="order.manually_resolved",
+                    message="사용자가 검증된 증권사 주문번호를 연결했습니다.",
+                    details={
+                        "order_id": order_id,
+                        "provider_order_id": clean_provider_id,
+                        "resolution": "manual_linked",
+                    },
+                )
+                await self._publish_order(changed)
+                if fill is not None and self._event_publisher is not None:
+                    await self._event_publisher(
+                        str(row["strategy_id"]),
+                        {"event_type": "fill", "fill": fill},
+                        None,
+                    )
+                return _unknown_reconcile_result(changed, (broker_order,))
+
+            if confirmation != UNKNOWN_NOT_ACCEPTED_CONFIRMATION:
+                raise RouterError(
+                    RouterErrorCode.INVALID_REQUEST,
+                    f"미접수 확정에는 {UNKNOWN_NOT_ACCEPTED_CONFIRMATION} 확인 문구가 필요합니다.",
+                )
+            # A same-day order placed independently hours later must not veto
+            # an explicit HTS non-acceptance confirmation. Only candidates in
+            # the same narrow submit/response window are safety-relevant.
+            candidates = self._unknown_order_candidates(row, broker_orders)
+            if not candidates:
+                candidates = self._unknown_manual_time_candidates(row, broker_orders)
+            if candidates:
+                manual_time_only = all(
+                    isinstance(getattr(item, "ordered_at", None), datetime)
+                    and not any(
+                        (
+                            getattr(item, "ordered_at").hour,
+                            getattr(item, "ordered_at").minute,
+                            getattr(item, "ordered_at").second,
+                            getattr(item, "ordered_at").microsecond,
+                        )
+                    )
+                    for item in candidates
+                )
+                changed = self._store.update_order(
+                    order_id,
+                    status=OrderStatus.UNKNOWN_RECONCILING,
+                    provider_metadata=_unknown_reconcile_metadata(
+                        row,
+                        candidate_count=len(candidates),
+                        match_result=(
+                            "manual_required_no_order_time"
+                            if manual_time_only
+                            else "unique" if len(candidates) == 1 else "ambiguous"
+                        ),
+                    ),
+                    message="일치하는 증권사 주문 후보가 있어 미접수로 확정할 수 없습니다.",
+                )
+                await self._publish_order(changed)
+                raise RouterError(
+                    RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                    "일치하는 증권사 주문 후보가 있어 미접수 확정을 중단했습니다.",
+                    details={"candidate_count": len(candidates)},
+                )
+            metadata = _unknown_reconcile_metadata(
+                row, candidate_count=0, match_result="not_accepted"
+            )
+            metadata["resolution"] = "manual_not_accepted"
+            changed = self._store.update_order(
+                order_id,
+                status=OrderStatus.REJECTED,
+                provider_metadata=metadata,
+                message="사용자가 HTS 주문내역을 확인하여 미접수로 확정했습니다.",
+            )
+            self._store.record(
+                source=str(row["strategy_id"]),
+                event_type="order.manually_resolved",
+                message="사용자가 증권사 미접수를 명시적으로 확인했습니다.",
+                details={
+                    "order_id": order_id,
+                    "resolution": "manual_not_accepted",
+                },
+            )
+            await self._publish_order(changed)
+            return _unknown_reconcile_result(changed, ())
+
+    def _require_unknown_order(self, order_id: str) -> dict[str, Any]:
+        row = self._store.order(order_id)
+        if row is None:
+            raise RouterError(
+                RouterErrorCode.INVALID_REQUEST,
+                "주문을 찾지 못했습니다.",
+            )
+        if row["status"] != OrderStatus.UNKNOWN_RECONCILING.value:
+            raise RouterError(
+                RouterErrorCode.INVALID_REQUEST,
+                "UNKNOWN_RECONCILING 상태의 주문만 수동으로 해결할 수 있습니다.",
+            )
+        return row
+
+    async def _broker_orders_for_row(
+        self, row: dict[str, Any], *, fresh: bool = False
+    ) -> tuple[tuple[object, ...], set[str]]:
+        account_alias = str(row["account_alias"])
+        business_date = _order_business_date(row)
+        snapshots, open_provider_ids = await self._broker_order_snapshots(
+            account_alias, (row,), fresh=fresh
+        )
+        return snapshots[business_date], open_provider_ids
+
+    async def _broker_order_snapshots(
+        self,
+        account_alias: str,
+        rows: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        *,
+        include_today: bool = False,
+        fresh: bool = False,
+    ) -> tuple[dict[date, tuple[object, ...]], set[str]]:
+        today = datetime.now(SEOUL).date()
+        business_dates = {_order_business_date(row) for row in rows}
+        if include_today or not business_dates:
+            business_dates.add(today)
+        snapshots: dict[date, tuple[object, ...]] = {}
+        for business_date in sorted(business_dates):
+            snapshots[business_date] = tuple(
+                await self._gateway.account_orders(
+                    account_alias,
+                    state="all",
+                    business_date=business_date,
+                    fresh=fresh,
+                )
+            )
+        # Reconciliation status comes exclusively from explicit history rows;
+        # absence from an open-order snapshot is never used to infer terminal
+        # state. Avoid a redundant broker call on every tracker cycle.
+        return snapshots, set()
+
+    def _unknown_order_candidates(
+        self,
+        row: dict[str, Any],
+        broker_orders: tuple[object, ...] | list[object],
+        *,
+        enforce_time_window: bool = True,
+    ) -> tuple[object, ...]:
+        candidates: list[object] = []
+        seen: set[str] = set()
+        for broker_order in broker_orders:
+            provider_order_id = str(
+                getattr(broker_order, "provider_order_id", "") or ""
+            ).strip()
+            if not provider_order_id or provider_order_id in seen:
+                continue
+            linked = self._store.order_by_provider_id(
+                str(row["account_alias"]),
+                provider_order_id,
+                business_date=_order_business_date(row).isoformat(),
+            )
+            if linked is not None and str(linked["id"]) != str(row["id"]):
+                continue
+            if not _broker_order_matches_unknown(
+                row,
+                broker_order,
+                enforce_time_window=enforce_time_window,
+            ):
+                continue
+            seen.add(provider_order_id)
+            candidates.append(broker_order)
+        return tuple(candidates)
+
+    def _unknown_manual_time_candidates(
+        self,
+        row: dict[str, Any],
+        broker_orders: tuple[object, ...] | list[object],
+    ) -> tuple[object, ...]:
+        """Broker rows without order time require an explicit broker-id link."""
+
+        candidates: list[object] = []
+        seen: set[str] = set()
+        for broker_order in broker_orders:
+            ordered_at = getattr(broker_order, "ordered_at", None)
+            if not isinstance(ordered_at, datetime) or any(
+                (ordered_at.hour, ordered_at.minute, ordered_at.second, ordered_at.microsecond)
+            ):
+                continue
+            provider_order_id = str(
+                getattr(broker_order, "provider_order_id", "") or ""
+            ).strip()
+            if not provider_order_id or provider_order_id in seen:
+                continue
+            linked = self._store.order_by_provider_id(
+                str(row["account_alias"]),
+                provider_order_id,
+                business_date=_order_business_date(row).isoformat(),
+            )
+            if linked is not None and str(linked["id"]) != str(row["id"]):
+                continue
+            if not _broker_order_matches_unknown(
+                row, broker_order, enforce_time_window=False
+            ):
+                continue
+            seen.add(provider_order_id)
+            candidates.append(broker_order)
+        return tuple(candidates)
+
+    def _uncertain_modification_candidates(
+        self,
+        row: dict[str, Any],
+        broker_orders: tuple[object, ...] | list[object],
+        *,
+        require_parent_relation: bool = True,
+        include_missing_time: bool = False,
+    ) -> tuple[object, ...]:
+        """Return unlinked amendment children in the response-time window."""
+
+        metadata = dict(row.get("provider_metadata") or {})
+        pending = metadata.get("pending_modification")
+        if metadata.get("uncertain_modification") != "amend" or not isinstance(
+            pending, dict
+        ):
+            return ()
+        original_provider_id = str(row.get("provider_order_id") or "")
+        candidates: list[object] = []
+        seen: set[str] = set()
+        for broker_order in broker_orders:
+            provider_order_id = str(
+                getattr(broker_order, "provider_order_id", "") or ""
+            ).strip()
+            if (
+                not provider_order_id
+                or provider_order_id == original_provider_id
+                or provider_order_id in seen
+            ):
+                continue
+            # Never infer an amendment relationship from matching symbol,
+            # quantity and time alone. A manual order can legitimately have
+            # all of those fields. Automatic recovery is allowed only when
+            # the broker history explicitly relates the child to this parent.
+            broker_parent = str(
+                getattr(broker_order, "original_provider_order_id", "") or ""
+            ).strip()
+            if require_parent_relation:
+                if broker_parent != original_provider_id:
+                    continue
+            elif broker_parent and broker_parent != original_provider_id:
+                continue
+            linked = self._store.order_by_provider_id(
+                str(row["account_alias"]),
+                provider_order_id,
+                business_date=_order_business_date(row).isoformat(),
+            )
+            if linked is not None and str(linked["id"]) != str(row["id"]):
+                continue
+            matches = _broker_order_matches_pending_modification(
+                row, broker_order, pending
+            )
+            ordered_at = getattr(broker_order, "ordered_at", None)
+            missing_order_time = isinstance(ordered_at, datetime) and not any(
+                (
+                    ordered_at.hour,
+                    ordered_at.minute,
+                    ordered_at.second,
+                    ordered_at.microsecond,
+                )
+            )
+            if (
+                not matches
+                and include_missing_time
+                and missing_order_time
+            ):
+                matches = _broker_order_matches_pending_modification(
+                    row,
+                    broker_order,
+                    pending,
+                    enforce_time_window=False,
+                )
+            if not matches:
+                continue
+            seen.add(provider_order_id)
+            candidates.append(broker_order)
+        return tuple(candidates)
+
+    def _legacy_uncertain_amendment_candidates(
+        self,
+        row: dict[str, Any],
+        broker_orders: tuple[object, ...] | list[object],
+    ) -> tuple[object, ...]:
+        """Return relation-verified children for pre-pending-metadata rows.
+
+        Releases before pending modification details were persisted retained
+        only ``uncertain_modification=amend``.  Their requested quantity,
+        order type and response window cannot be reconstructed safely, so a
+        related child is evidence for an operator-assisted link only.  Never
+        infer a relation from otherwise identical order fields.
+        """
+
+        metadata = dict(row.get("provider_metadata") or {})
+        if (
+            metadata.get("uncertain_modification") != "amend"
+            or isinstance(metadata.get("pending_modification"), dict)
+        ):
+            return ()
+        original_provider_id = str(row.get("provider_order_id") or "").strip()
+        candidates: list[object] = []
+        seen: set[str] = set()
+        for broker_order in broker_orders:
+            provider_order_id = str(
+                getattr(broker_order, "provider_order_id", "") or ""
+            ).strip()
+            broker_parent = str(
+                getattr(broker_order, "original_provider_order_id", "") or ""
+            ).strip()
+            if (
+                not provider_order_id
+                or provider_order_id == original_provider_id
+                or provider_order_id in seen
+                or broker_parent != original_provider_id
+            ):
+                continue
+            linked = self._store.order_by_provider_id(
+                str(row["account_alias"]),
+                provider_order_id,
+                business_date=_order_business_date(row).isoformat(),
+            )
+            if linked is not None and str(linked["id"]) != str(row["id"]):
+                continue
+            seen.add(provider_order_id)
+            candidates.append(broker_order)
+        return tuple(candidates)
+
+    def _uncertain_modification_snapshot(
+        self,
+        row: dict[str, Any],
+        broker_orders: tuple[object, ...] | list[object],
+        *,
+        by_provider_id: dict[str, object],
+        open_provider_ids: set[str],
+    ) -> tuple[
+        dict[str, Any],
+        object | None,
+        tuple[object, ...],
+        dict[str, object],
+    ]:
+        """Choose a safe snapshot for an uncertain amend/cancel request."""
+
+        metadata = dict(row.get("provider_metadata") or {})
+        kind = str(metadata.get("uncertain_modification") or "")
+        pending = metadata.get("pending_modification")
+        if kind == "amend" and not isinstance(pending, dict):
+            # v0.1.74 did not persist the amendment request.  Related children
+            # therefore cannot be field/time matched automatically, but they
+            # must block both terminal-parent assumptions and NOT_ACCEPTED.
+            legacy_candidates = self._legacy_uncertain_amendment_candidates(
+                row, broker_orders
+            )
+            live_candidates = tuple(
+                candidate
+                for candidate in legacy_candidates
+                if getattr(candidate, "status", None) is not OrderStatus.REJECTED
+            )
+            rejected_candidates = tuple(
+                candidate
+                for candidate in legacy_candidates
+                if getattr(candidate, "status", None) is OrderStatus.REJECTED
+            )
+            original = by_provider_id.get(
+                str(row.get("provider_order_id") or "")
+            )
+            if live_candidates:
+                updates = _unknown_reconcile_metadata(
+                    row,
+                    candidate_count=len(live_candidates),
+                    match_result="manual_required_legacy_modification",
+                )
+                return row, None, live_candidates, updates
+            if rejected_candidates:
+                if original is None:
+                    updates = _unknown_reconcile_metadata(
+                        row,
+                        candidate_count=len(rejected_candidates),
+                        match_result="amendment_rejected_parent_missing",
+                    )
+                    return row, None, rejected_candidates, updates
+                updates = _resolved_modification_metadata(
+                    row, resolution="broker_amendment_rejected"
+                )
+                updates.update(
+                    _unknown_reconcile_metadata(
+                        {**row, "provider_metadata": updates},
+                        candidate_count=len(rejected_candidates),
+                        match_result="broker_amendment_rejected",
+                    )
+                )
+                working = dict(row)
+                working["provider_metadata"] = updates
+                return working, original, rejected_candidates, updates
+            updates = _unknown_reconcile_metadata(
+                row,
+                candidate_count=0,
+                match_result=(
+                    "legacy_modification_pending"
+                    if original is not None
+                    else "none"
+                ),
+            )
+            if original is None:
+                return row, None, (), updates
+            target_status = _reconciled_order_status(
+                original, open_provider_ids=open_provider_ids
+            )
+            if target_status in {
+                OrderStatus.CANCELLED,
+                OrderStatus.FILLED,
+                OrderStatus.REJECTED,
+            }:
+                updates = _resolved_modification_metadata(
+                    row, resolution="broker_terminal"
+                )
+                working = dict(row)
+                working["provider_metadata"] = updates
+                return working, original, (), updates
+            return row, original, (), updates
+
+        candidates = self._uncertain_modification_candidates(row, broker_orders)
+        if (
+            kind == "amend"
+            and len(candidates) == 1
+            and getattr(candidates[0], "status", None)
+            is OrderStatus.REJECTED
+        ):
+            original = by_provider_id.get(str(row.get("provider_order_id") or ""))
+            if original is not None:
+                updates = _resolved_modification_metadata(
+                    row, resolution="broker_amendment_rejected"
+                )
+                updates.update(
+                    _unknown_reconcile_metadata(
+                        {**row, "provider_metadata": updates},
+                        candidate_count=1,
+                        match_result="broker_amendment_rejected",
+                    )
+                )
+                working = dict(row)
+                working["provider_metadata"] = updates
+                return working, original, candidates, updates
+            updates = _unknown_reconcile_metadata(
+                row,
+                candidate_count=1,
+                match_result="amendment_rejected_parent_missing",
+            )
+            return row, None, candidates, updates
+        if kind == "amend" and len(candidates) == 1:
+            working = _row_for_linked_amendment(row, candidates[0])
+            return (
+                working,
+                candidates[0],
+                candidates,
+                dict(working.get("provider_metadata") or {}),
+            )
+        if kind == "amend" and len(candidates) > 1:
+            updates = _unknown_reconcile_metadata(
+                row,
+                candidate_count=len(candidates),
+                match_result="ambiguous_modification",
+            )
+            return row, None, candidates, updates
+
+        if kind == "amend" and not candidates:
+            possible_candidates = self._uncertain_modification_candidates(
+                row,
+                broker_orders,
+                require_parent_relation=False,
+                include_missing_time=True,
+            )
+            if possible_candidates:
+                missing_order_time = any(
+                    isinstance(getattr(item, "ordered_at", None), datetime)
+                    and not any(
+                        (
+                            getattr(item, "ordered_at").hour,
+                            getattr(item, "ordered_at").minute,
+                            getattr(item, "ordered_at").second,
+                            getattr(item, "ordered_at").microsecond,
+                        )
+                    )
+                    for item in possible_candidates
+                )
+                updates = _unknown_reconcile_metadata(
+                    row,
+                    candidate_count=len(possible_candidates),
+                    match_result=(
+                        "manual_required_no_order_time"
+                        if missing_order_time
+                        else "manual_required_missing_parent_relation"
+                    ),
+                )
+                return row, None, possible_candidates, updates
+
+        original = by_provider_id.get(str(row.get("provider_order_id") or ""))
+        updates = _unknown_reconcile_metadata(
+            row,
+            candidate_count=0,
+            match_result="modification_pending" if original is not None else "none",
+        )
+        if original is None:
+            return row, None, candidates, updates
+        target_status = _reconciled_order_status(
+            original, open_provider_ids=open_provider_ids
+        )
+        if kind == "cancel" and target_status in {
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.PARTIALLY_FILLED,
+        }:
+            pending = metadata.get("pending_modification")
+            try:
+                # An amended child reports fills for only its own segment.
+                # Compare the post-cancel total against cumulative fills from
+                # the original chain plus the current child remainder.
+                filled, _ = _broker_cumulative_fill(
+                    row, original, by_provider_id
+                )
+                remaining = Decimal(
+                    str(getattr(original, "remaining_quantity", "0"))
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                filled = remaining = Decimal("0")
+            try:
+                expected_total = Decimal(
+                    str(
+                        pending.get("expected_total_after_cancel")
+                        if isinstance(pending, dict)
+                        else ""
+                    )
+                )
+            except (ArithmeticError, TypeError, ValueError):
+                expected_total = Decimal("-1")
+            if not isinstance(pending, dict):
+                # v0.1.74 retained no requested cancel quantity.  A fresh
+                # parent snapshot whose effective total is smaller than the
+                # pre-cancel ledger total is nevertheless affirmative broker
+                # evidence that a cancel was accepted.  Prefer that evidence
+                # over a stale operator NOT_ACCEPTED confirmation.
+                try:
+                    previous_total = Decimal(
+                        str(_effective_request_payload(row).get("quantity") or "0")
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    previous_total = Decimal("0")
+                observed_total = filled + remaining
+                if (
+                    previous_total > 0
+                    and observed_total >= filled
+                    and observed_total < previous_total
+                ):
+                    updates = _resolved_modification_metadata(
+                        row, resolution="auto_cancel_reconciled"
+                    )
+                    current = _effective_request_payload(row)
+                    updates["effective_request"] = {
+                        "quantity": str(observed_total),
+                        "order_type": str(current.get("order_type")),
+                        "price": current.get("price"),
+                        "route": str(
+                            current.get("route") or OrderRoute.AUTO.value
+                        ),
+                    }
+                    if remaining == 0:
+                        updates["cancel_reconciled_full"] = True
+                    working = dict(row)
+                    working["provider_metadata"] = updates
+                    return working, original, candidates, updates
+            if expected_total >= 0 and filled + remaining == expected_total:
+                updates = _resolved_modification_metadata(
+                    row, resolution="auto_cancel_reconciled"
+                )
+                current = _effective_request_payload(row)
+                updates["effective_request"] = {
+                    "quantity": str(expected_total),
+                    "order_type": str(current.get("order_type")),
+                    "price": current.get("price"),
+                    "route": str(current.get("route") or OrderRoute.AUTO.value),
+                }
+                if remaining == 0:
+                    updates["cancel_reconciled_full"] = True
+                working = dict(row)
+                working["provider_metadata"] = updates
+                return working, original, candidates, updates
+        if kind == "amend" and target_status in {
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+        }:
+            # Successful amendments commonly cancel/replace the original.
+            # Without a relation-verified successor, resolving the parent
+            # would orphan a potentially live child order.
+            updates["match_result"] = "amendment_successor_missing"
+            return row, None, candidates, updates
+        if target_status in {
+            OrderStatus.CANCELLED,
+            OrderStatus.FILLED,
+            OrderStatus.REJECTED,
+        }:
+            updates = _resolved_modification_metadata(
+                row, resolution="broker_terminal"
+            )
+            working = dict(row)
+            working["provider_metadata"] = updates
+            return working, original, candidates, updates
+        return row, original, candidates, updates
+
+    def _apply_broker_snapshot(
+        self,
+        row: dict[str, Any],
+        broker_order: object,
+        *,
+        by_provider_id: dict[str, object],
+        open_provider_ids: set[str],
+        provider_metadata_updates: dict[str, object] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        target_status = _reconciled_order_status(
+            broker_order, open_provider_ids=open_provider_ids
+        )
+        filled_quantity, average_fill_price = _broker_cumulative_fill(
+            row, broker_order, by_provider_id
+        )
+        previous_quantity = Decimal(str(row.get("filled_quantity", "0")))
+        if filled_quantity < previous_quantity:
+            raise ValueError("Broker fill quantity moved backwards.")
+        target_status = _preserve_pending_status(
+            row,
+            target_status,
+            filled_quantity,
+            Decimal(str(getattr(broker_order, "remaining_quantity", "0"))),
+        )
+        fill = self._record_fill_delta(
+            row,
+            previous_quantity=previous_quantity,
+            previous_average=Decimal(str(row.get("average_fill_price") or "0")),
+            cumulative_quantity=filled_quantity,
+            cumulative_average=(
+                Decimal(str(average_fill_price))
+                if average_fill_price is not None
+                else Decimal("0")
+            ),
+        )
+        totals = self._cost_totals(str(row["id"]))
+        provider_metadata = _reconciled_provider_metadata(
+            row, broker_order, filled_quantity
+        )
+        if provider_metadata_updates:
+            provider_metadata.update(provider_metadata_updates)
+        changed = self._store.update_order(
+            str(row["id"]),
+            status=target_status,
+            provider_order_id=str(getattr(broker_order, "provider_order_id")),
+            filled_quantity=filled_quantity,
+            average_fill_price=average_fill_price,
+            commission=totals["commission"],
+            tax=totals["tax"],
+            costs_complete=totals["costs_complete"],
+            provider_metadata=provider_metadata,
+            message=_tracked_order_message(
+                target_status,
+                filled_quantity=filled_quantity,
+                requested_quantity=Decimal(
+                    str(getattr(broker_order, "requested_quantity", "0"))
+                ),
+            ),
+        )
+        return changed, fill
+
     async def _reconcile_account(self, account_alias: str) -> dict[str, object]:
         """Refresh broker state and resolve ledger rows before opening orders."""
 
@@ -161,92 +1318,146 @@ class OrderService:
                 "이 거래 계좌는 잔고와 주문 조정 기능을 지원하지 않습니다.",
             )
         await self._gateway.balance(account_alias)
-        broker_orders = await self._gateway.account_orders(account_alias, state="all")
-        broker_open_orders = await self._gateway.account_orders(
-            account_alias, state="open"
+        # Scope in SQL instead of filtering the globally limited result.  A
+        # busy installation can have more than 1,000 unresolved rows across
+        # accounts; reconciliation for this account must not silently miss
+        # its older orders.
+        unresolved = self._store.unresolved_orders(account_alias=account_alias)
+        snapshots, open_provider_ids = await self._broker_order_snapshots(
+            account_alias, unresolved, include_today=True
         )
-        open_provider_ids = {
-            str(getattr(item, "provider_order_id"))
-            for item in broker_open_orders
-            if getattr(item, "provider_order_id", None)
-        }
-        by_provider_id = {
-            str(getattr(item, "provider_order_id")): item
-            for item in broker_orders
-            if getattr(item, "provider_order_id", None)
-        }
-        unresolved = [
-            row
-            for row in self._store.unresolved_orders()
-            if row["account_alias"] == account_alias
-        ]
         still_unknown: list[str] = []
         for row in unresolved:
+            started_unknown = row["status"] in {
+                OrderStatus.SUBMITTING.value,
+                OrderStatus.UNKNOWN_RECONCILING.value,
+            }
+            business_date = _order_business_date(row)
+            broker_orders = snapshots.get(business_date, ())
+            by_provider_id = _orders_by_provider_id(broker_orders)
             provider_order_id = row.get("provider_order_id")
             if not provider_order_id:
                 if row["status"] == OrderStatus.SUBMITTING.value:
+                    row = self._store.update_order(
+                        row["id"],
+                        status=OrderStatus.UNKNOWN_RECONCILING,
+                        provider_metadata=_unknown_submit_metadata(
+                            row,
+                            origin="restart_submitting",
+                            failure_phase="reconcile",
+                        ),
+                        message="재시작 전에 제출 중이던 주문의 접수 여부를 확인해야 합니다.",
+                    )
+                candidates = self._unknown_order_candidates(row, broker_orders)
+                if len(candidates) != 1:
+                    manual_time_candidates = (
+                        self._unknown_manual_time_candidates(row, broker_orders)
+                        if not candidates
+                        else ()
+                    )
+                    if manual_time_candidates:
+                        candidates = manual_time_candidates
                     self._store.update_order(
                         row["id"],
                         status=OrderStatus.UNKNOWN_RECONCILING,
-                        message="재시작 전에 제출 중이던 주문의 접수 여부를 확인해야 합니다.",
-                    )
-                still_unknown.append(row["id"])
-                continue
-            broker_order = by_provider_id.get(str(provider_order_id))
-            if broker_order is None:
-                still_unknown.append(row["id"])
-                continue
-            target_status = _reconciled_order_status(
-                broker_order,
-                open_provider_ids=open_provider_ids,
-            )
-            filled_quantity, average_fill_price = _broker_cumulative_fill(
-                row, broker_order, by_provider_id
-            )
-            if filled_quantity < Decimal(str(row.get("filled_quantity") or "0")):
-                still_unknown.append(row["id"])
-                continue
-            target_status = _preserve_pending_status(
-                row, target_status, filled_quantity,
-                Decimal(str(getattr(broker_order, "remaining_quantity", "0"))),
-            )
-            if target_status is OrderStatus.UNKNOWN_RECONCILING:
-                still_unknown.append(row["id"])
-            try:
-                self._record_fill_delta(
-                    row,
-                    previous_quantity=Decimal(str(row.get("filled_quantity", "0"))),
-                    previous_average=Decimal(str(row.get("average_fill_price") or "0")),
-                    cumulative_quantity=filled_quantity,
-                    cumulative_average=(
-                        Decimal(str(average_fill_price))
-                        if average_fill_price is not None
-                        else Decimal("0")
-                    ),
-                )
-                totals = self._cost_totals(str(row["id"]))
-                provider_metadata = _reconciled_provider_metadata(
-                    row, broker_order, filled_quantity
-                )
-                self._store.update_order(
-                    row["id"],
-                    status=target_status,
-                    filled_quantity=filled_quantity,
-                    average_fill_price=average_fill_price,
-                    commission=totals["commission"],
-                    tax=totals["tax"],
-                    costs_complete=totals["costs_complete"],
-                    provider_metadata=provider_metadata,
-                    message=_tracked_order_message(
-                        target_status,
-                        filled_quantity=filled_quantity,
-                        requested_quantity=Decimal(
-                            str(getattr(broker_order, "requested_quantity", "0"))
+                        provider_metadata=_unknown_reconcile_metadata(
+                            row,
+                            candidate_count=len(candidates),
+                            match_result=(
+                                "manual_required_no_order_time"
+                                if manual_time_candidates
+                                else "none" if not candidates else "ambiguous"
+                            ),
                         ),
+                        message=(
+                            "증권사 주문시각이 없어 자동 연결할 수 없습니다. HTS 주문번호를 확인해 수동 연결하세요."
+                            if manual_time_candidates
+                            else _unknown_candidate_message(len(candidates))
+                        ),
+                    )
+                    still_unknown.append(str(row["id"]))
+                    continue
+                broker_order = candidates[0]
+                provider_order_id = str(
+                    getattr(broker_order, "provider_order_id", "")
+                )
+                metadata_updates = {
+                    **_unknown_reconcile_metadata(
+                        row, candidate_count=1, match_result="linked"
                     ),
+                    "resolution": "auto_linked",
+                }
+            else:
+                metadata = dict(row.get("provider_metadata") or {})
+                if metadata.get("uncertain_modification"):
+                    row, broker_order, _, metadata_updates = (
+                        self._uncertain_modification_snapshot(
+                            row,
+                            broker_orders,
+                            by_provider_id=by_provider_id,
+                            open_provider_ids=open_provider_ids,
+                        )
+                    )
+                    if broker_order is None:
+                        self._store.update_order(
+                            str(row["id"]),
+                            status=OrderStatus.UNKNOWN_RECONCILING,
+                            provider_metadata=metadata_updates,
+                            message="정정·취소 접수 여부를 증권사 주문내역에서 확정하지 못했습니다.",
+                        )
+                        still_unknown.append(str(row["id"]))
+                        continue
+                else:
+                    broker_order = by_provider_id.get(str(provider_order_id))
+                    metadata_updates = None
+            if broker_order is None:
+                still_unknown.append(str(row["id"]))
+                continue
+            try:
+                changed, fill = self._apply_broker_snapshot(
+                    row,
+                    broker_order,
+                    by_provider_id=by_provider_id,
+                    open_provider_ids=open_provider_ids,
+                    provider_metadata_updates=metadata_updates,
                 )
             except ValueError:
-                still_unknown.append(row["id"])
+                still_unknown.append(str(row["id"]))
+                continue
+            if changed["status"] == OrderStatus.UNKNOWN_RECONCILING.value:
+                still_unknown.append(str(row["id"]))
+                continue
+            if started_unknown:
+                self._store.record(
+                    source=str(row["strategy_id"]),
+                    event_type="order.reconciled",
+                    message="증권사 주문내역에서 미확정 주문 상태를 안전하게 조정했습니다.",
+                    details={
+                        "order_id": str(row["id"]),
+                        "provider_order_id": str(
+                            getattr(broker_order, "provider_order_id", "")
+                        ),
+                        "resolution": str(
+                            dict(changed.get("provider_metadata") or {}).get(
+                                "resolution"
+                            )
+                            or dict(changed.get("provider_metadata") or {}).get(
+                                "modification_resolution"
+                            )
+                            or "startup_reconciled"
+                        ),
+                    },
+                )
+            # Publish the reconciled snapshot (and any newly persisted fill)
+            # before the account gate is opened so the UI/strategy process
+            # cannot observe an armed account with stale order ownership.
+            await self._publish_order(changed)
+            if fill is not None and self._event_publisher is not None:
+                await self._event_publisher(
+                    str(row["strategy_id"]),
+                    {"event_type": "fill", "fill": fill},
+                    None,
+                )
 
         if still_unknown:
             self._reconciled_accounts.discard(account_alias)
@@ -259,7 +1470,7 @@ class OrderService:
         return {
             "account_alias": account_alias,
             "reconciled": True,
-            "broker_order_count": len(broker_orders),
+            "broker_order_count": sum(len(items) for items in snapshots.values()),
             "checked_at": datetime.now(SEOUL).isoformat(),
         }
 
@@ -278,38 +1489,122 @@ class OrderService:
             unresolved = self._store.unresolved_orders(account_alias=account_alias)
             if not unresolved:
                 return []
+            polled_rows = [
+                row
+                for row in unresolved
+                if (
+                    _background_unknown_reconcile_due(row)
+                    if row["status"] == OrderStatus.UNKNOWN_RECONCILING.value
+                    else bool(row.get("provider_order_id"))
+                    or row["status"] == OrderStatus.SUBMITTING.value
+                )
+            ]
+            # UNKNOWN rows use bounded backoff, including uncertain amendments
+            # and cancellations that retain an original provider id. Do not perform
+            # account-history requests, writes or websocket publications while
+            # every such row is still inside its retry delay. Confirmed
+            # ACK/PARTIAL/CANCEL_PENDING rows remain on the normal poll cadence.
+            if not polled_rows:
+                return []
             capabilities = self._gateway.capabilities(account_alias)
             if not capabilities.order_history:
                 raise RouterError(
                     RouterErrorCode.UNSUPPORTED_CAPABILITY,
                     "이 거래 계좌는 주문·체결 조회를 지원하지 않습니다.",
                 )
-            broker_orders = await self._gateway.account_orders(
-                account_alias,
-                state="all",
+            snapshots, open_provider_ids = await self._broker_order_snapshots(
+                account_alias, polled_rows
             )
-            broker_open_orders = await self._gateway.account_orders(
-                account_alias,
-                state="open",
-            )
-            open_provider_ids = {
-                str(getattr(item, "provider_order_id"))
-                for item in broker_open_orders
-                if getattr(item, "provider_order_id", None)
-            }
-            by_provider_id = {
-                str(getattr(item, "provider_order_id")): item
-                for item in broker_orders
-                if getattr(item, "provider_order_id", None)
-            }
             updated: list[dict[str, object]] = []
-            for row in unresolved:
+            for row in polled_rows:
+                broker_orders = snapshots.get(_order_business_date(row), ())
+                by_provider_id = _orders_by_provider_id(broker_orders)
                 provider_order_id = row.get("provider_order_id")
                 if not provider_order_id:
-                    continue
-                broker_order = by_provider_id.get(str(provider_order_id))
+                    if row["status"] == OrderStatus.SUBMITTING.value:
+                        row = self._store.update_order(
+                            str(row["id"]),
+                            status=OrderStatus.UNKNOWN_RECONCILING,
+                            provider_metadata=_unknown_submit_metadata(
+                                row,
+                                origin="restart_submitting",
+                                failure_phase="reconcile",
+                            ),
+                            message="재시작 전에 제출 중이던 주문의 접수 여부를 확인해야 합니다.",
+                        )
+                    candidates = self._unknown_order_candidates(row, broker_orders)
+                    if len(candidates) != 1:
+                        manual_time_candidates = (
+                            self._unknown_manual_time_candidates(row, broker_orders)
+                            if not candidates
+                            else ()
+                        )
+                        if manual_time_candidates:
+                            candidates = manual_time_candidates
+                        changed = self._store.update_order(
+                            str(row["id"]),
+                            status=OrderStatus.UNKNOWN_RECONCILING,
+                            provider_metadata=_unknown_reconcile_metadata(
+                                row,
+                                candidate_count=len(candidates),
+                                match_result=(
+                                    "manual_required_no_order_time"
+                                    if manual_time_candidates
+                                    else "none" if not candidates else "ambiguous"
+                                ),
+                            ),
+                            message=(
+                                "증권사 주문시각이 없어 자동 연결할 수 없습니다. HTS 주문번호를 확인해 수동 연결하세요."
+                                if manual_time_candidates
+                                else _unknown_candidate_message(len(candidates))
+                            ),
+                        )
+                        self._reconciled_accounts.discard(account_alias)
+                        await self._publish_order(changed)
+                        updated.append(changed)
+                        continue
+                    broker_order = candidates[0]
+                    provider_order_id = str(
+                        getattr(broker_order, "provider_order_id", "")
+                    )
+                    metadata_updates = {
+                        **_unknown_reconcile_metadata(
+                            row, candidate_count=1, match_result="linked"
+                        ),
+                        "resolution": "auto_linked",
+                    }
+                else:
+                    metadata = dict(row.get("provider_metadata") or {})
+                    if metadata.get("uncertain_modification"):
+                        row, broker_order, _, metadata_updates = (
+                            self._uncertain_modification_snapshot(
+                                row,
+                                broker_orders,
+                                by_provider_id=by_provider_id,
+                                open_provider_ids=open_provider_ids,
+                            )
+                        )
+                        if broker_order is None:
+                            changed = self._store.update_order(
+                                str(row["id"]),
+                                status=OrderStatus.UNKNOWN_RECONCILING,
+                                provider_metadata=metadata_updates,
+                                message=_uncertain_modification_message(
+                                    metadata_updates
+                                ),
+                            )
+                            self._reconciled_accounts.discard(account_alias)
+                            await self._publish_order(changed)
+                            updated.append(changed)
+                            continue
+                    else:
+                        broker_order = by_provider_id.get(str(provider_order_id))
+                        metadata_updates = None
                 if broker_order is None:
                     continue
+                provider_order_id = str(
+                    getattr(broker_order, "provider_order_id", provider_order_id)
+                )
                 target_status = _reconciled_order_status(
                     broker_order,
                     open_provider_ids=open_provider_ids,
@@ -328,6 +1623,8 @@ class OrderService:
                 provider_metadata = _reconciled_provider_metadata(
                     row, broker_order, filled_quantity
                 )
+                if metadata_updates:
+                    provider_metadata.update(metadata_updates)
                 if (
                     row["status"] == target_status.value
                     and Decimal(str(row.get("filled_quantity", "0")))
@@ -364,6 +1661,7 @@ class OrderService:
                     changed = self._store.update_order(
                         str(row["id"]),
                         status=target_status,
+                        provider_order_id=str(provider_order_id),
                         filled_quantity=filled_quantity,
                         average_fill_price=average_fill_price,
                         commission=totals["commission"],
@@ -434,20 +1732,27 @@ class OrderService:
         provider_order_id = str(notice.get("provider_order_id") or "").strip()
         if not provider_order_id:
             return None
-        signature = hashlib.sha256(
-            json.dumps(notice, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        business_date = datetime.now(SEOUL).date().isoformat()
+        signature = _provider_notice_event_key(notice, business_date)
         if not self._store.claim_provider_event(
             provider=str(notice.get("provider") or "unknown"),
             account_alias=account_alias,
             event_key=signature,
         ):
             return None
-        row = self._store.order_by_provider_id(account_alias, provider_order_id)
+        row = self._store.order_by_provider_id(
+            account_alias,
+            provider_order_id,
+            business_date=business_date,
+        )
         if row is None:
             original = str(notice.get("original_order_id") or "").strip()
             if original:
-                row = self._store.order_by_provider_id(account_alias, original)
+                row = self._store.order_by_provider_id(
+                    account_alias,
+                    original,
+                    business_date=business_date,
+                )
         if row is None:
             return None
         # Receipt/rejection notifications still become on_order events; the
@@ -467,14 +1772,22 @@ class OrderService:
                     or row["status"] == OrderStatus.CANCEL_PENDING.value
                 )
                 try:
+                    restored_metadata = (
+                        _resolved_modification_metadata(
+                            row, resolution="realtime_rejected"
+                        )
+                        if modification_notice
+                        else dict(row.get("provider_metadata") or {})
+                    )
                     row = self._store.update_order(
                         str(row["id"]),
                         status=(
-                            OrderStatus(str(row["status"]))
+                            _modification_previous_status(row)
                             if modification_notice else OrderStatus.REJECTED
                         ),
+                        provider_metadata=restored_metadata,
                         message=(
-                            "정정·취소 요청 거절 통보를 받았습니다. 원주문 상태는 주문내역으로 확인합니다."
+                            "정정·취소 요청 거절 통보를 받아 원주문 상태를 복원했습니다."
                             if modification_notice
                             else "증권사 실시간 통보에서 주문 거절을 확인했습니다."
                         ),
@@ -754,8 +2067,27 @@ class OrderService:
                     if exc.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
                     else OrderStatus.REJECTED
                 )
+                provider_metadata = None
+                if status is OrderStatus.UNKNOWN_RECONCILING:
+                    provider_metadata = _unknown_submit_metadata(
+                        row,
+                        origin=str(
+                            exc.details.get("unknown_origin")
+                            or "unexpected_adapter_error"
+                        ),
+                        failure_phase="submit",
+                        exception_type=(
+                            _safe_metadata_text(exc.details.get("exception_type"))
+                            or type(exc).__name__
+                        ),
+                        winerror=_safe_winerror(exc.details.get("winerror")),
+                        http_status=_safe_http_status(exc.details.get("http_status")),
+                    )
                 row = self._store.update_order(
-                    row["id"], status=status, message=exc.message
+                    row["id"],
+                    status=status,
+                    provider_metadata=provider_metadata,
+                    message=exc.message,
                 )
                 await self._publish_order(
                     row, strategy_name=strategy_name
@@ -765,8 +2097,19 @@ class OrderService:
                 self._store.record(
                     source=strategy_name,
                     event_type="order.unknown" if status is OrderStatus.UNKNOWN_RECONCILING else "order.rejected",
-                    message=exc.message,
-                    details={"order_id": row["id"], "code": exc.code.value},
+                    message=(
+                        "주문 응답을 확정하지 못해 증권사 주문내역 조정이 필요합니다."
+                        if status is OrderStatus.UNKNOWN_RECONCILING
+                        else exc.message
+                    ),
+                    details=(
+                        {
+                            **_unknown_event_details(row),
+                            "code": exc.code.value,
+                        }
+                        if status is OrderStatus.UNKNOWN_RECONCILING
+                        else {"order_id": row["id"], "code": exc.code.value}
+                    ),
                 )
                 if status is OrderStatus.UNKNOWN_RECONCILING:
                     return _order_from_row(row)
@@ -777,9 +2120,22 @@ class OrderService:
                 row = self._store.update_order(
                     row["id"],
                     status=OrderStatus.UNKNOWN_RECONCILING,
+                    provider_metadata=_unknown_submit_metadata(
+                        row,
+                        origin="unexpected_adapter_error",
+                        failure_phase="submit",
+                        exception_type=type(exc).__name__,
+                        winerror=_exception_winerror(exc),
+                    ),
                     message="주문 응답을 확인하지 못해 증권사 주문내역 조정이 필요합니다.",
                 )
                 self._reconciled_accounts.discard(account_alias)
+                self._store.record(
+                    source=strategy_name,
+                    event_type="order.unknown",
+                    message="주문 응답을 확인하지 못해 증권사 주문내역 조정이 필요합니다.",
+                    details=_unknown_event_details(row),
+                )
                 await self._publish_order(row, strategy_name=strategy_name)
                 return _order_from_row(row)
 
@@ -881,6 +2237,7 @@ class OrderService:
                 manifest, row, quantity=amended_quantity,
                 order_type=order_type, price=price, route=normalized_route,
             )
+        modification_requested_at = datetime.now(SEOUL).isoformat()
         try:
             acknowledgement = await self._gateway.amend_order(
                 manifest.trading_account,
@@ -893,21 +2250,75 @@ class OrderService:
         except RouterError as exc:
             if exc.code is not RouterErrorCode.ORDER_STATUS_UNKNOWN:
                 raise
+            unknown_metadata = _unknown_submit_metadata(
+                row,
+                origin=str(
+                    exc.details.get("unknown_origin") or "unexpected_adapter_error"
+                ),
+                failure_phase="modify",
+                exception_type=(
+                    _safe_metadata_text(exc.details.get("exception_type"))
+                    or type(exc).__name__
+                ),
+                winerror=_safe_winerror(exc.details.get("winerror")),
+                http_status=_safe_http_status(exc.details.get("http_status")),
+            )
+            unknown_metadata["uncertain_modification"] = "amend"
+            unknown_metadata["pending_modification"] = {
+                "kind": "amend",
+                "previous_status": str(row["status"]),
+                "requested_at": modification_requested_at,
+                "quantity": str(amended_quantity),
+                "order_type": order_type.value,
+                "price": str(price) if price is not None else None,
+                "route": normalized_route.value,
+            }
             changed = self._store.update_order(
                 order_id,
                 status=OrderStatus.UNKNOWN_RECONCILING,
-                provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "amend"},
+                provider_metadata=unknown_metadata,
                 message=exc.message,
+            )
+            unknown_details = _unknown_event_details(changed)
+            unknown_details["code"] = exc.code.value
+            self._store.record(
+                source=strategy_name,
+                event_type="order.unknown",
+                message="정정 응답을 확인하지 못해 증권사 주문내역 조정이 필요합니다.",
+                details=unknown_details,
             )
             self._reconciled_accounts.discard(manifest.trading_account)
             await self._publish_order(changed, strategy_name=strategy_name)
             return _order_from_row(changed)
         except Exception as exc:
+            unknown_metadata = _unknown_submit_metadata(
+                row,
+                origin="unexpected_adapter_error",
+                failure_phase="modify",
+                exception_type=type(exc).__name__,
+                winerror=_exception_winerror(exc),
+            )
+            unknown_metadata["uncertain_modification"] = "amend"
+            unknown_metadata["pending_modification"] = {
+                "kind": "amend",
+                "previous_status": str(row["status"]),
+                "requested_at": modification_requested_at,
+                "quantity": str(amended_quantity),
+                "order_type": order_type.value,
+                "price": str(price) if price is not None else None,
+                "route": normalized_route.value,
+            }
             changed = self._store.update_order(
                 order_id,
                 status=OrderStatus.UNKNOWN_RECONCILING,
-                provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "amend"},
+                provider_metadata=unknown_metadata,
                 message="정정 응답을 확인하지 못해 주문내역 조정이 필요합니다.",
+            )
+            self._store.record(
+                source=strategy_name,
+                event_type="order.unknown",
+                message="정정 응답을 확인하지 못해 증권사 주문내역 조정이 필요합니다.",
+                details=_unknown_event_details(changed),
             )
             self._reconciled_accounts.discard(manifest.trading_account)
             await self._publish_order(changed, strategy_name=strategy_name)
@@ -1034,6 +2445,11 @@ class OrderService:
                 RouterErrorCode.INVALID_REQUEST,
                 "취소 수량은 현재 미체결 수량 이하여야 합니다.",
             )
+        previous_effective_quantity = Decimal(str(effective_request["quantity"]))
+        cancellation_quantity = quantity if quantity is not None else remaining
+        expected_total_after_cancel = (
+            previous_effective_quantity - cancellation_quantity
+        )
         normalized_route = route or OrderRoute(
             str(effective_request.get("route", "AUTO"))
         )
@@ -1045,6 +2461,7 @@ class OrderService:
             message="취소 요청을 증권사에 제출합니다.",
         )
         await self._publish_order(pending, strategy_name=strategy_name)
+        modification_requested_at = datetime.now(SEOUL).isoformat()
         try:
             acknowledgement = await self._gateway.cancel_order(
                 manifest.trading_account,
@@ -1054,11 +2471,43 @@ class OrderService:
             )
         except RouterError as exc:
             if exc.code is RouterErrorCode.ORDER_STATUS_UNKNOWN:
+                unknown_metadata = _unknown_submit_metadata(
+                    row,
+                    origin=str(
+                        exc.details.get("unknown_origin")
+                        or "unexpected_adapter_error"
+                    ),
+                    failure_phase="modify",
+                    exception_type=(
+                        _safe_metadata_text(exc.details.get("exception_type"))
+                        or type(exc).__name__
+                    ),
+                    winerror=_safe_winerror(exc.details.get("winerror")),
+                    http_status=_safe_http_status(exc.details.get("http_status")),
+                )
+                unknown_metadata["uncertain_modification"] = "cancel"
+                unknown_metadata["pending_modification"] = {
+                    "kind": "cancel",
+                    "previous_status": prior_status.value,
+                    "requested_at": modification_requested_at,
+                    "quantity": str(cancellation_quantity),
+                    "previous_effective_quantity": str(previous_effective_quantity),
+                    "expected_total_after_cancel": str(expected_total_after_cancel),
+                    "route": normalized_route.value,
+                }
                 unknown = self._store.update_order(
                     order_id,
                     status=OrderStatus.UNKNOWN_RECONCILING,
-                    provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "cancel"},
+                    provider_metadata=unknown_metadata,
                     message=exc.message,
+                )
+                unknown_details = _unknown_event_details(unknown)
+                unknown_details["code"] = exc.code.value
+                self._store.record(
+                    source=strategy_name,
+                    event_type="order.unknown",
+                    message="취소 응답을 확인하지 못해 증권사 주문내역 조정이 필요합니다.",
+                    details=unknown_details,
                 )
                 self._reconciled_accounts.discard(manifest.trading_account)
                 await self._publish_order(unknown, strategy_name=strategy_name)
@@ -1070,12 +2519,35 @@ class OrderService:
             )
             await self._publish_order(restored, strategy_name=strategy_name)
             raise
-        except Exception:
+        except Exception as exc:
+            unknown_metadata = _unknown_submit_metadata(
+                row,
+                origin="unexpected_adapter_error",
+                failure_phase="modify",
+                exception_type=type(exc).__name__,
+                winerror=_exception_winerror(exc),
+            )
+            unknown_metadata["uncertain_modification"] = "cancel"
+            unknown_metadata["pending_modification"] = {
+                "kind": "cancel",
+                "previous_status": prior_status.value,
+                "requested_at": modification_requested_at,
+                "quantity": str(cancellation_quantity),
+                "previous_effective_quantity": str(previous_effective_quantity),
+                "expected_total_after_cancel": str(expected_total_after_cancel),
+                "route": normalized_route.value,
+            }
             unknown = self._store.update_order(
                 order_id,
                 status=OrderStatus.UNKNOWN_RECONCILING,
-                provider_metadata={**dict(row.get("provider_metadata") or {}), "uncertain_modification": "cancel"},
+                provider_metadata=unknown_metadata,
                 message="취소 응답을 확인하지 못해 주문내역 조정이 필요합니다.",
+            )
+            self._store.record(
+                source=strategy_name,
+                event_type="order.unknown",
+                message="취소 응답을 확인하지 못해 증권사 주문내역 조정이 필요합니다.",
+                details=_unknown_event_details(unknown),
             )
             self._reconciled_accounts.discard(manifest.trading_account)
             await self._publish_order(unknown, strategy_name=strategy_name)
@@ -1086,7 +2558,7 @@ class OrderService:
         # row. Keep querying that original while retaining the receipt for audit.
         provider_metadata["cancel_provider_order_id"] = acknowledgement.provider_order_id
         provider_metadata["pending_cancel_expected_total"] = str(
-            Decimal(str(effective_request["quantity"])) - (quantity if quantity is not None else remaining)
+            expected_total_after_cancel
         )
         changed = self._store.update_order(
             order_id,
@@ -1450,6 +2922,572 @@ def _effective_request_payload(row: dict[str, object]) -> dict[str, object]:
     return original
 
 
+def _order_business_date(row: dict[str, object]) -> date:
+    created_at = datetime.fromisoformat(str(row["created_at"]))
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=SEOUL)
+    return created_at.astimezone(SEOUL).date()
+
+
+def _orders_by_provider_id(
+    broker_orders: tuple[object, ...] | list[object],
+) -> dict[str, object]:
+    return {
+        str(getattr(item, "provider_order_id")): item
+        for item in broker_orders
+        if getattr(item, "provider_order_id", None)
+    }
+
+
+def _enum_text(value: object) -> str:
+    enum_value = getattr(value, "value", value)
+    return str(enum_value or "").strip().upper()
+
+
+def _provider_notice_event_key(
+    notice: dict[str, object], business_date: str
+) -> str:
+    """Scope broker-notice de-duplication to its Seoul receiving date."""
+
+    payload = {"business_date": business_date, "notice": notice}
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _broker_order_matches_unknown(
+    row: dict[str, object],
+    broker_order: object,
+    *,
+    enforce_time_window: bool,
+) -> bool:
+    """Match only immutable request fields; uniqueness is checked separately."""
+
+    request = _effective_request_payload(row)
+    required = ("code", "side", "quantity", "order_type")
+    if any(request.get(key) in {None, ""} for key in required):
+        return False
+    instrument = getattr(broker_order, "instrument", None)
+    if str(getattr(instrument, "code", "")) != str(request["code"]):
+        return False
+    if _enum_text(getattr(broker_order, "side", "")) != _enum_text(request["side"]):
+        return False
+    try:
+        requested_quantity = Decimal(str(request["quantity"]))
+        broker_quantity = Decimal(str(getattr(broker_order, "requested_quantity")))
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    if requested_quantity <= 0 or requested_quantity != broker_quantity:
+        return False
+    order_type = _enum_text(request["order_type"])
+    if order_type != _enum_text(getattr(broker_order, "order_type", "")):
+        return False
+    if order_type == OrderType.LIMIT.value:
+        if request.get("price") in {None, ""}:
+            return False
+        try:
+            if Decimal(str(request["price"])) != Decimal(
+                str(getattr(broker_order, "price"))
+            ):
+                return False
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+    requested_route = _enum_text(request.get("route") or OrderRoute.AUTO.value)
+    broker_route = _enum_text(getattr(broker_order, "route", OrderRoute.AUTO))
+    if requested_route == OrderRoute.SOR.value:
+        if broker_route not in {
+            OrderRoute.SOR.value,
+            OrderRoute.KRX.value,
+            OrderRoute.NXT.value,
+        }:
+            return False
+    elif requested_route != OrderRoute.AUTO.value and requested_route != broker_route:
+        return False
+
+    try:
+        submitted_at = datetime.fromisoformat(str(row["created_at"]))
+        ordered_at = getattr(broker_order, "ordered_at")
+        if not isinstance(ordered_at, datetime):
+            return False
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=SEOUL)
+        if ordered_at.tzinfo is None:
+            ordered_at = ordered_at.replace(tzinfo=SEOUL)
+        submitted_at = submitted_at.astimezone(SEOUL)
+        ordered_at = ordered_at.astimezone(SEOUL)
+    except (TypeError, ValueError):
+        return False
+    if submitted_at.date() != ordered_at.date():
+        return False
+    if enforce_time_window:
+        unknown_at = submitted_at
+        metadata = row.get("provider_metadata")
+        unknown_value = (
+            metadata.get("first_unknown_at")
+            if isinstance(metadata, dict) and metadata.get("first_unknown_at")
+            else None
+        )
+        if unknown_value:
+            try:
+                parsed_unknown_at = datetime.fromisoformat(
+                    str(unknown_value)
+                )
+                if parsed_unknown_at.tzinfo is None:
+                    parsed_unknown_at = parsed_unknown_at.replace(tzinfo=SEOUL)
+                parsed_unknown_at = parsed_unknown_at.astimezone(SEOUL)
+                if parsed_unknown_at.date() == submitted_at.date():
+                    # A legacy row can be updated long after submission; do
+                    # not turn that later write into an all-day match window.
+                    unknown_at = min(
+                        max(submitted_at, parsed_unknown_at),
+                        submitted_at + timedelta(minutes=2),
+                    )
+            except (TypeError, ValueError):
+                pass
+        if ordered_at < submitted_at - UNKNOWN_ORDER_EARLY_TOLERANCE:
+            return False
+        if ordered_at > unknown_at + UNKNOWN_ORDER_LATE_TOLERANCE:
+            return False
+    return True
+
+
+def _broker_order_matches_pending_modification(
+    row: dict[str, object],
+    broker_order: object,
+    pending: dict[str, object],
+    *,
+    enforce_time_window: bool = True,
+) -> bool:
+    requested_at = pending.get("requested_at")
+    if not requested_at:
+        return False
+    request = _effective_request_payload(row)
+    request.update(
+        {
+            "quantity": pending.get("quantity"),
+            "order_type": pending.get("order_type"),
+            "price": pending.get("price"),
+            "route": pending.get("route") or request.get("route"),
+        }
+    )
+    synthetic = dict(row)
+    synthetic["request"] = request
+    synthetic["created_at"] = str(requested_at)
+    synthetic["provider_metadata"] = {
+        "first_unknown_at": dict(row.get("provider_metadata") or {}).get(
+            "first_unknown_at"
+        )
+        or requested_at
+    }
+    if _broker_order_matches_unknown(
+        synthetic, broker_order, enforce_time_window=enforce_time_window
+    ):
+        return True
+    # Some histories report an amendment child as a cumulative order: prior
+    # fills plus the replacement remainder.  Accept that alternate quantity
+    # only when the broker explicitly relates the child to this parent.
+    broker_parent = str(
+        getattr(broker_order, "original_provider_order_id", "") or ""
+    ).strip()
+    if broker_parent != str(row.get("provider_order_id") or "").strip():
+        return False
+    try:
+        previous_filled = Decimal(str(row.get("filled_quantity") or "0"))
+        pending_quantity = Decimal(str(pending.get("quantity") or "0"))
+        cumulative_quantity = previous_filled + pending_quantity
+        broker_quantity = Decimal(
+            str(getattr(broker_order, "requested_quantity", "0"))
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    if previous_filled <= 0 or broker_quantity != cumulative_quantity:
+        return False
+    cumulative_request = dict(request)
+    cumulative_request["quantity"] = str(cumulative_quantity)
+    cumulative_synthetic = dict(synthetic)
+    cumulative_synthetic["request"] = cumulative_request
+    return _broker_order_matches_unknown(
+        cumulative_synthetic,
+        broker_order,
+        enforce_time_window=enforce_time_window,
+    )
+
+
+def _resolved_modification_metadata(
+    row: dict[str, object], *, resolution: str
+) -> dict[str, object]:
+    metadata = dict(row.get("provider_metadata") or {})
+    pending = metadata.get("pending_modification")
+    if (
+        resolution in {"manual_modification_not_accepted", "realtime_rejected"}
+        and isinstance(pending, dict)
+        and pending.get("kind") == "cancel"
+        and pending.get("previous_effective_quantity") not in {None, ""}
+    ):
+        effective = dict(metadata.get("effective_request") or {})
+        effective["quantity"] = str(pending["previous_effective_quantity"])
+        metadata["effective_request"] = effective
+    metadata.pop("uncertain_modification", None)
+    metadata.pop("pending_modification", None)
+    metadata["modification_resolution"] = resolution
+    metadata["match_result"] = resolution
+    metadata["last_reconcile_at"] = datetime.now(SEOUL).isoformat()
+    return metadata
+
+
+def _modification_previous_status(row: dict[str, object]) -> OrderStatus:
+    metadata = dict(row.get("provider_metadata") or {})
+    pending = metadata.get("pending_modification")
+    previous = pending.get("previous_status") if isinstance(pending, dict) else None
+    try:
+        status = OrderStatus(str(previous))
+    except (TypeError, ValueError):
+        status = (
+            OrderStatus.PARTIALLY_FILLED
+            if Decimal(str(row.get("filled_quantity") or "0")) > 0
+            else OrderStatus.ACKNOWLEDGED
+        )
+    if status not in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
+        return (
+            OrderStatus.PARTIALLY_FILLED
+            if Decimal(str(row.get("filled_quantity") or "0")) > 0
+            else OrderStatus.ACKNOWLEDGED
+        )
+    return status
+
+
+def _row_for_linked_amendment(
+    row: dict[str, object], broker_order: object
+) -> dict[str, object]:
+    metadata = dict(row.get("provider_metadata") or {})
+    pending = metadata.get("pending_modification")
+    if not isinstance(pending, dict):
+        return dict(row)
+    child_provider_id = str(getattr(broker_order, "provider_order_id", ""))
+    previous_filled = Decimal(str(row.get("filled_quantity") or "0"))
+    previous_average = Decimal(str(row.get("average_fill_price") or "0"))
+    offsets = dict(metadata.get("amendment_fill_offsets") or {})
+    offsets[child_provider_id] = {
+        "quantity": str(previous_filled),
+        "amount": str(previous_filled * previous_average),
+        "requested_quantity": str(pending.get("quantity") or "0"),
+        "previous_provider_order_id": str(row.get("provider_order_id") or ""),
+    }
+    metadata["amendment_fill_offsets"] = offsets
+    metadata["effective_request"] = {
+        "quantity": str(
+            previous_filled + Decimal(str(pending.get("quantity") or "0"))
+        ),
+        "order_type": str(pending.get("order_type") or OrderType.MARKET.value),
+        "price": pending.get("price"),
+        "route": str(pending.get("route") or OrderRoute.AUTO.value),
+    }
+    metadata.pop("uncertain_modification", None)
+    metadata.pop("pending_modification", None)
+    metadata.update(
+        _unknown_reconcile_metadata(
+            {**row, "provider_metadata": metadata},
+            candidate_count=1,
+            match_result="linked_modification",
+        )
+    )
+    metadata["resolution"] = "auto_amendment_linked"
+    metadata["modification_resolution"] = "auto_amendment_linked"
+    working = dict(row)
+    working["provider_metadata"] = metadata
+    return working
+
+
+def _row_for_linked_legacy_amendment(
+    row: dict[str, object], broker_order: object
+) -> dict[str, object]:
+    """Build fill offsets from a relation-verified legacy amendment child."""
+
+    metadata = dict(row.get("provider_metadata") or {})
+    child_provider_id = str(getattr(broker_order, "provider_order_id", ""))
+    child_quantity = Decimal(
+        str(getattr(broker_order, "requested_quantity", "0"))
+    )
+    previous_filled = Decimal(str(row.get("filled_quantity") or "0"))
+    previous_average = Decimal(str(row.get("average_fill_price") or "0"))
+    offsets = dict(metadata.get("amendment_fill_offsets") or {})
+    offsets[child_provider_id] = {
+        "quantity": str(previous_filled),
+        "amount": str(previous_filled * previous_average),
+        "requested_quantity": str(child_quantity),
+        "previous_provider_order_id": str(row.get("provider_order_id") or ""),
+    }
+    metadata["amendment_fill_offsets"] = offsets
+    broker_order_type = getattr(broker_order, "order_type", OrderType.MARKET)
+    broker_route = getattr(broker_order, "route", OrderRoute.AUTO)
+    broker_price = getattr(broker_order, "price", None)
+    metadata["effective_request"] = {
+        "quantity": str(previous_filled + child_quantity),
+        "order_type": _enum_text(broker_order_type),
+        "price": (
+            str(broker_price)
+            if broker_price is not None and Decimal(str(broker_price)) > 0
+            else None
+        ),
+        "route": _enum_text(broker_route) or OrderRoute.AUTO.value,
+    }
+    metadata.pop("uncertain_modification", None)
+    metadata.pop("pending_modification", None)
+    metadata.update(
+        _unknown_reconcile_metadata(
+            {**row, "provider_metadata": metadata},
+            candidate_count=1,
+            match_result="manual_linked_modification",
+        )
+    )
+    metadata["resolution"] = "manual_amendment_linked"
+    metadata["modification_resolution"] = "manual_amendment_linked"
+    working = dict(row)
+    working["provider_metadata"] = metadata
+    return working
+
+
+def _legacy_amendment_fill_semantics_are_safe(
+    row: dict[str, object], original_broker_order: object | None
+) -> bool:
+    """Reject legacy links whose cumulative/segment fill meaning is unknown.
+
+    With no persisted pending request, a child showing five fills after the
+    parent had three could mean either five cumulative fills or five new
+    fills.  Even a child showing zero fills can encode either a new segment
+    quantity or a new cumulative target.  Linking it would silently under- or
+    over-count inventory, so only a parent with no prior fills is unambiguous.
+    Both the ledger and the fresh broker parent snapshot must confirm zero;
+    the broker may have fills that arrived after the last local update.
+    """
+
+    try:
+        ledger_filled = Decimal(str(row.get("filled_quantity") or "0"))
+        if original_broker_order is None:
+            return False
+        broker_filled = Decimal(
+            str(getattr(original_broker_order, "filled_quantity", "0"))
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    return ledger_filled <= 0 and broker_filled <= 0
+
+
+def _safe_metadata_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text or len(text) > 80:
+        return None
+    if not all(character.isalnum() or character in {"_", ".", "-"} for character in text):
+        return None
+    return text
+
+
+def _safe_winerror(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if -1_000_000 <= parsed <= 1_000_000 else None
+
+
+def _safe_http_status(value: object) -> int | None:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if 100 <= parsed <= 599 else None
+
+
+def _safe_nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _exception_winerror(exc: BaseException) -> int | None:
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        winerror = _safe_winerror(getattr(current, "winerror", None))
+        if winerror is not None:
+            return winerror
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _unknown_submit_metadata(
+    row: dict[str, object],
+    *,
+    origin: str,
+    failure_phase: str,
+    exception_type: str | None = None,
+    winerror: int | None = None,
+    http_status: int | None = None,
+) -> dict[str, object]:
+    metadata = dict(row.get("provider_metadata") or {})
+    now = datetime.now(SEOUL).isoformat()
+    safe_origin = _safe_metadata_text(origin) or "unexpected_adapter_error"
+    safe_phase = _safe_metadata_text(failure_phase) or "submit"
+    first_unknown_at = metadata.get("first_unknown_at") or now
+    if safe_origin == "restart_submitting":
+        # A restart can occur hours after the process died. The response-time
+        # window for a formerly SUBMITTING row starts and ends at submission,
+        # not at the later restart time.
+        first_unknown_at = str(row.get("created_at") or now)
+    metadata.update(
+        {
+            "unknown_origin": safe_origin,
+            "failure_phase": safe_phase,
+            "first_unknown_at": first_unknown_at,
+            "reconcile_attempt_count": _safe_nonnegative_int(
+                metadata.get("reconcile_attempt_count")
+            ),
+            "last_reconcile_at": metadata.get("last_reconcile_at"),
+            "candidate_count": _safe_nonnegative_int(
+                metadata.get("candidate_count")
+            ),
+            "match_result": metadata.get("match_result") or "not_checked",
+        }
+    )
+    safe_exception_type = _safe_metadata_text(exception_type)
+    if safe_exception_type is not None:
+        metadata["exception_type"] = safe_exception_type
+    if winerror is not None:
+        metadata["winerror"] = winerror
+    if http_status is not None:
+        metadata["http_status"] = http_status
+    return metadata
+
+
+def _unknown_reconcile_metadata(
+    row: dict[str, object],
+    *,
+    candidate_count: int,
+    match_result: str,
+) -> dict[str, object]:
+    metadata = dict(row.get("provider_metadata") or {})
+    metadata.setdefault("unknown_origin", "legacy_unknown")
+    metadata.setdefault("failure_phase", "reconcile")
+    # A legacy row may have been updated hours after submission.  Using that
+    # mutable timestamp would widen a later automatic-match window and could
+    # attach an unrelated manual order.  Missing onset data stays pinned to
+    # the immutable submission time.
+    metadata.setdefault("first_unknown_at", str(row["created_at"]))
+    metadata["reconcile_attempt_count"] = _safe_nonnegative_int(
+        metadata.get("reconcile_attempt_count")
+    ) + 1
+    metadata["last_reconcile_at"] = datetime.now(SEOUL).isoformat()
+    metadata["candidate_count"] = max(0, int(candidate_count))
+    metadata["match_result"] = match_result
+    return metadata
+
+
+def _background_unknown_reconcile_due(row: dict[str, object]) -> bool:
+    metadata = row.get("provider_metadata")
+    if not isinstance(metadata, dict):
+        return True
+    last_value = metadata.get("last_reconcile_at")
+    if not last_value:
+        return True
+    try:
+        last_reconcile_at = datetime.fromisoformat(str(last_value))
+        if last_reconcile_at.tzinfo is None:
+            last_reconcile_at = last_reconcile_at.replace(tzinfo=SEOUL)
+        last_reconcile_at = last_reconcile_at.astimezone(SEOUL)
+    except (TypeError, ValueError):
+        return True
+    attempts = _safe_nonnegative_int(metadata.get("reconcile_attempt_count"))
+    delay_seconds = min(60, 5 * (2 ** min(max(0, attempts - 1), 4)))
+    return datetime.now(SEOUL) >= last_reconcile_at + timedelta(
+        seconds=delay_seconds
+    )
+
+
+def _unknown_event_details(row: dict[str, object]) -> dict[str, object]:
+    metadata = dict(row.get("provider_metadata") or {})
+    details: dict[str, object] = {
+        "order_id": str(row["id"]),
+        "unknown_origin": str(
+            metadata.get("unknown_origin") or "unexpected_adapter_error"
+        ),
+        "failure_phase": str(metadata.get("failure_phase") or "submit"),
+        "provider_id_present": bool(row.get("provider_order_id")),
+    }
+    exception_type = _safe_metadata_text(metadata.get("exception_type"))
+    if exception_type is not None:
+        details["exception_type"] = exception_type
+    winerror = _safe_winerror(metadata.get("winerror"))
+    if winerror is not None:
+        details["winerror"] = winerror
+    http_status = _safe_http_status(metadata.get("http_status"))
+    if http_status is not None:
+        details["http_status"] = http_status
+    return details
+
+
+def _unknown_candidate_message(candidate_count: int) -> str:
+    if candidate_count <= 0:
+        return "증권사 주문내역에서 일치하는 주문을 찾지 못해 확인이 필요합니다."
+    return f"증권사 주문내역에 일치 후보가 {candidate_count}건 있어 자동 연결하지 않았습니다."
+
+
+def _uncertain_modification_message(metadata: dict[str, object]) -> str:
+    match_result = str(metadata.get("match_result") or "")
+    if match_result == "manual_required_no_order_time":
+        return "증권사 정정 주문시각이 없어 자동 연결할 수 없습니다. HTS의 새 주문번호를 확인하세요."
+    if match_result == "manual_required_missing_parent_relation":
+        return "증권사 주문내역에 원주문 연결정보가 없어 자동 연결하지 않았습니다. HTS의 새 주문번호를 확인하세요."
+    if match_result == "manual_required_legacy_modification":
+        return "구버전 미확정 정정은 요청값을 복원할 수 없어 자동 연결하지 않았습니다. HTS의 새 주문번호를 확인하세요."
+    if match_result == "amendment_rejected_parent_missing":
+        return "거절된 정정 주문은 확인했지만 원주문 상태를 찾지 못해 확인이 필요합니다."
+    return "정정·취소 접수 여부를 증권사 주문내역에서 확정하지 못했습니다."
+
+
+def _broker_order_summary(broker_order: object) -> dict[str, object]:
+    price = getattr(broker_order, "price", None)
+    return {
+        "provider_order_id": str(getattr(broker_order, "provider_order_id", "")),
+        "original_provider_order_id": (
+            str(getattr(broker_order, "original_provider_order_id", "") or "")
+            or None
+        ),
+        "code": str(getattr(getattr(broker_order, "instrument", None), "code", "")),
+        "side": _enum_text(getattr(broker_order, "side", "")),
+        "order_type": _enum_text(getattr(broker_order, "order_type", "")),
+        "requested_quantity": str(getattr(broker_order, "requested_quantity", "0")),
+        "filled_quantity": str(getattr(broker_order, "filled_quantity", "0")),
+        "price": str(price) if price is not None else None,
+        "route": _enum_text(getattr(broker_order, "route", "")),
+        "ordered_at": getattr(broker_order, "ordered_at").isoformat(),
+        "status": _enum_text(getattr(broker_order, "status", "")),
+    }
+
+
+def _unknown_reconcile_result(
+    row: dict[str, Any], candidates: tuple[object, ...] | list[object]
+) -> dict[str, object]:
+    metadata = dict(row.get("provider_metadata") or {})
+    return {
+        "order": row,
+        "resolved": row["status"] != OrderStatus.UNKNOWN_RECONCILING.value,
+        "match_result": str(metadata.get("match_result") or "not_checked"),
+        "candidate_count": _safe_nonnegative_int(
+            metadata.get("candidate_count")
+            if metadata.get("candidate_count") is not None
+            else len(candidates)
+        ),
+        "candidates": [_broker_order_summary(item) for item in candidates],
+    }
+
+
 def _broker_cumulative_fill(
     row: dict[str, object], broker_order: object, by_provider_id: dict[str, object],
     visited: frozenset[str] = frozenset(),
@@ -1492,6 +3530,8 @@ def _preserve_pending_status(
 ) -> OrderStatus:
     if status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
         metadata = dict(row.get("provider_metadata") or {})
+        if metadata.get("cancel_reconciled_full") and remaining_quantity == 0:
+            return OrderStatus.CANCELLED
         if row["status"] == OrderStatus.UNKNOWN_RECONCILING.value and metadata.get("uncertain_modification"):
             return OrderStatus.UNKNOWN_RECONCILING
         if row["status"] == OrderStatus.CANCEL_PENDING.value:
@@ -1507,6 +3547,11 @@ def _reconciled_provider_metadata(
     row: dict[str, object], broker_order: object, filled_quantity: Decimal
 ) -> dict[str, object]:
     metadata = dict(row.get("provider_metadata") or {})
+    # Never let an intermediate broker snapshot overwrite the pre-modification
+    # baseline while amend/cancel acceptance is still uncertain. The verified
+    # resolution path supplies the effective request explicitly.
+    if metadata.get("uncertain_modification"):
+        return metadata
     current = _effective_request_payload(row)
     remaining = Decimal(str(getattr(broker_order, "remaining_quantity", "0")))
     effective_total = filled_quantity + remaining

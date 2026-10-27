@@ -12,11 +12,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from trade_router import (
-    AccountOrder, AsyncTradeRouter, Order, OrderRequest, OrderRoute, OrderSide,
+    AccountOrder, AsyncTradeRouter, InstrumentId, Order, OrderRequest, OrderRoute, OrderSide,
     OrderStatus, OrderType, RouterError, RouterErrorCode, StrategyConfig,
 )
 from trade_router.client import SyncOrderClient
 from trade_router_studio.app import create_app
+from trade_router_studio.connections import (
+    _normalize_kis_account_orders,
+    _normalize_namuh_account_orders,
+)
 from trade_router_studio.orders import OrderService
 from trade_router_studio.runtime_store import RuntimeStore
 from test_connections import workspace
@@ -102,6 +106,14 @@ def test_uncertain_modification_does_not_reopen_on_stale_original_snapshot(
                 kwargs.update(order_type=OrderType.BEST_LIMIT, price=None)
             result = await getattr(service, operation)(**kwargs)
             assert result.status is OrderStatus.UNKNOWN_RECONCILING
+            pending = store.order(submitted.id)["provider_metadata"]["pending_modification"]
+            assert pending["kind"] == operation
+            assert pending["previous_status"] == "PARTIALLY_FILLED"
+            assert pending["requested_at"]
+            unknown_event = store.events(event_types=("order.unknown",), limit=1)[0]
+            assert unknown_event["details"]["failure_phase"] == "modify"
+            assert unknown_event["details"]["provider_id_present"] is True
+            assert "ambiguous mocked response" not in str(unknown_event)
             assert await service.open_orders(manifest=manifest()) == []
             assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
             with pytest.raises(RouterError):
@@ -113,10 +125,1544 @@ def test_uncertain_modification_does_not_reopen_on_stale_original_snapshot(
             gateway.orders = (replace(
                 broker_order("broker-1", filled="10", remaining="0"), status=OrderStatus.FILLED,
             ),)
-            await service.refresh_unresolved_orders("broker-account")
+            await service.reconcile_unknown_order(submitted.id)
             assert store.order(submitted.id)["status"] == "FILLED"
         finally:
             store.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ("amend", "cancel"))
+def test_unexpected_modification_exception_records_safe_unknown_event(
+    tmp_path: Path, operation: str,
+) -> None:
+    class FaultGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RuntimeError("secret broker response")
+
+        async def cancel_order(self, *args, **kwargs):
+            raise RuntimeError("secret broker response")
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"modify-secret-{operation}.sqlite3")
+        gateway = FaultGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy(f"modify-secret-{operation}"), quantity=Decimal("10")),
+            )
+            kwargs = dict(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                route=None,
+            )
+            if operation == "amend":
+                kwargs.update(order_type=OrderType.BEST_LIMIT, price=None)
+            result = await getattr(service, operation)(**kwargs)
+            assert result.status is OrderStatus.UNKNOWN_RECONCILING
+            event = store.events(event_types=("order.unknown",), limit=1)[0]
+            assert event["details"]["failure_phase"] == "modify"
+            assert event["details"]["exception_type"] == "RuntimeError"
+            assert event["details"]["provider_id_present"] is True
+            assert "secret" not in str(event)
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_amendment_auto_links_unique_broker_child(tmp_path: Path) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "uncertain-amend-child.sqlite3")
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("uncertain-child"), quantity=Decimal("10")),
+            )
+            gateway.orders = (broker_order("broker-1"),)
+            uncertain = await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            assert uncertain.status is OrderStatus.UNKNOWN_RECONCILING
+            requested_at = datetime.fromisoformat(
+                store.order(submitted.id)["provider_metadata"]["pending_modification"]["requested_at"]
+            )
+            gateway.orders = (
+                broker_order("broker-1"),
+                replace(
+                    broker_order("independent-manual"),
+                    ordered_at=requested_at,
+                ),
+                replace(
+                    broker_order(
+                        "broker-child",
+                        original_provider_id="broker-1",
+                    ),
+                    ordered_at=requested_at,
+                ),
+            )
+            assert [
+                item.provider_order_id
+                for item in service._uncertain_modification_candidates(
+                    store.order(submitted.id), gateway.orders
+                )
+            ] == ["broker-child"]
+
+            await service.refresh_unresolved_orders("broker-account")
+
+            stored = store.order(submitted.id)
+            assert stored["status"] == "ACKNOWLEDGED"
+            assert stored["provider_order_id"] == "broker-child"
+            assert "uncertain_modification" not in stored["provider_metadata"]
+            assert stored["provider_metadata"]["modification_resolution"] == "auto_amendment_linked"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_amendment_without_parent_relation_requires_manual_id_link(
+    tmp_path: Path,
+) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "uncertain-amend-manual-link.sqlite3")
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("uncertain-manual-child"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            gateway.orders = (broker_order("broker-1"),)
+            await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            requested_at = datetime.fromisoformat(
+                store.order(submitted.id)["provider_metadata"]
+                ["pending_modification"]["requested_at"]
+            )
+            relationless = replace(
+                broker_order("manual-child"), ordered_at=requested_at
+            )
+            gateway.orders = (broker_order("broker-1"), relationless)
+
+            result = await service.reconcile_unknown_order(submitted.id)
+            assert result["resolved"] is False
+            assert result["match_result"] == (
+                "manual_required_missing_parent_relation"
+            )
+            assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
+
+            gateway.orders = (
+                broker_order("broker-1"),
+                replace(
+                    broker_order(
+                        "manual-child", original_provider_id="another-parent"
+                    ),
+                    ordered_at=requested_at,
+                ),
+            )
+            with pytest.raises(RouterError) as wrong_parent:
+                await service.resolve_unknown_order(
+                    submitted.id,
+                    action="LINK",
+                    provider_order_id="manual-child",
+                    confirmation="HTS_LINK_CONFIRMED",
+                )
+            assert wrong_parent.value.code is RouterErrorCode.INVALID_REQUEST
+
+            gateway.orders = (broker_order("broker-1"), relationless)
+            linked = await service.resolve_unknown_order(
+                submitted.id,
+                action="LINK",
+                provider_order_id="manual-child",
+                confirmation="HTS_LINK_CONFIRMED",
+            )
+            assert linked["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["provider_order_id"] == "manual-child"
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "manual_amendment_linked"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_amendment_missing_broker_time_vetoes_not_accepted(
+    tmp_path: Path,
+) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "uncertain-amend-no-time.sqlite3")
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("uncertain-no-time-child"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            gateway.orders = (broker_order("broker-1"),)
+            await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            requested_at = datetime.fromisoformat(
+                store.order(submitted.id)["provider_metadata"]
+                ["pending_modification"]["requested_at"]
+            )
+            missing_time_child = replace(
+                broker_order(
+                    "no-time-child", original_provider_id="broker-1"
+                ),
+                ordered_at=requested_at.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ),
+            )
+            gateway.orders = (broker_order("broker-1"), missing_time_child)
+
+            result = await service.reconcile_unknown_order(submitted.id)
+            assert result["resolved"] is False
+            assert result["match_result"] == "manual_required_no_order_time"
+
+            with pytest.raises(RouterError) as vetoed:
+                await service.resolve_unknown_order(
+                    submitted.id,
+                    action="NOT_ACCEPTED",
+                    confirmation="HTS_NOT_ACCEPTED",
+                )
+            assert vetoed.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+
+            linked = await service.resolve_unknown_order(
+                submitted.id,
+                action="LINK",
+                provider_order_id="no-time-child",
+                confirmation="HTS_LINK_CONFIRMED",
+            )
+            assert linked["resolved"] is True
+            assert store.order(submitted.id)["provider_order_id"] == (
+                "no-time-child"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_amendment_rejected_child_restores_original_order(
+    tmp_path: Path,
+) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "uncertain-amend-rejected.sqlite3")
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("uncertain-rejected-child"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            gateway.orders = (broker_order("broker-1"),)
+            await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            requested_at = datetime.fromisoformat(
+                store.order(submitted.id)["provider_metadata"]
+                ["pending_modification"]["requested_at"]
+            )
+            rejected_child = replace(
+                broker_order(
+                    "rejected-child", original_provider_id="broker-1"
+                ),
+                status=OrderStatus.REJECTED,
+                remaining_quantity=Decimal("0"),
+                ordered_at=requested_at,
+            )
+            gateway.orders = (broker_order("broker-1"), rejected_child)
+
+            await service.refresh_unresolved_orders("broker-account")
+
+            stored = store.order(submitted.id)
+            assert stored["status"] == "ACKNOWLEDGED"
+            assert stored["provider_order_id"] == "broker-1"
+            assert "uncertain_modification" not in stored["provider_metadata"]
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "broker_amendment_rejected"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_amendment_rejected_child_without_parent_stays_unknown(
+    tmp_path: Path,
+) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "rejected-child-parent-missing.sqlite3")
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("rejected-child-parent-missing"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            requested_at = datetime.fromisoformat(
+                store.order(submitted.id)["provider_metadata"]
+                ["pending_modification"]["requested_at"]
+            )
+            gateway.orders = (
+                replace(
+                    broker_order(
+                        "rejected-child", original_provider_id="broker-1"
+                    ),
+                    status=OrderStatus.REJECTED,
+                    remaining_quantity=Decimal("0"),
+                    ordered_at=requested_at,
+                ),
+            )
+
+            result = await service.reconcile_unknown_order(submitted.id)
+
+            assert result["resolved"] is False
+            assert result["match_result"] == "amendment_rejected_parent_missing"
+            stored = store.order(submitted.id)
+            assert stored["status"] == "UNKNOWN_RECONCILING"
+            assert stored["provider_order_id"] == "broker-1"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("manual_link", (False, True))
+def test_response_lost_amendment_accepts_relation_verified_cumulative_quantity(
+    tmp_path: Path, manual_link: bool,
+) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(
+            tmp_path / f"cumulative-amend-{int(manual_link)}.sqlite3"
+        )
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("cumulative-amend"),
+                    quantity=Decimal("10"),
+                    order_type=OrderType.BEST_LIMIT,
+                ),
+            )
+            gateway.orders = (broker_order("broker-1", filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            pending = store.order(submitted.id)["provider_metadata"]
+            pending = pending["pending_modification"]
+            assert pending["quantity"] == "7"
+            child = replace(
+                broker_order(
+                    "cumulative-child",
+                    quantity="10",
+                    filled="3",
+                    remaining="7",
+                    original_provider_id="broker-1",
+                ),
+                ordered_at=datetime.fromisoformat(pending["requested_at"]),
+            )
+            gateway.orders = (broker_order("broker-1", filled="3"), child)
+
+            if manual_link:
+                result = await service.resolve_unknown_order(
+                    submitted.id,
+                    action="LINK",
+                    provider_order_id="cumulative-child",
+                    confirmation="HTS_LINK_CONFIRMED",
+                )
+            else:
+                result = await service.reconcile_unknown_order(submitted.id)
+
+            assert result["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["provider_order_id"] == "cumulative-child"
+            assert stored["filled_quantity"] == "3"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                "10"
+            )
+            assert sum(
+                Decimal(fill["quantity"])
+                for fill in store.fills(order_id=submitted.id)
+            ) == 3
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ("amend", "cancel"))
+def test_legacy_uncertain_modification_can_restore_live_parent(
+    tmp_path: Path, operation: str,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"legacy-{operation}-restore.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy(f"legacy-{operation}-restore"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            # Exact persisted shape produced by v0.1.74: the operation marker
+            # exists but pending_modification was not recorded.
+            store.update_order(
+                submitted.id,
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"uncertain_modification": operation},
+            )
+            gateway.orders = (broker_order("broker-1"),)
+
+            result = await service.resolve_unknown_order(
+                submitted.id,
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+
+            assert result["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["status"] == "ACKNOWLEDGED"
+            assert "uncertain_modification" not in stored["provider_metadata"]
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "manual_modification_not_accepted"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_uncertain_cancel_prefers_fresh_reduced_parent_total(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "legacy-cancel-reduced.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("legacy-cancel-reduced"),
+                    quantity=Decimal("10"),
+                    order_type=OrderType.BEST_LIMIT,
+                ),
+            )
+            store.update_order(
+                submitted.id,
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                filled_quantity=Decimal("3"),
+                average_fill_price=Decimal("90000"),
+                provider_metadata={"uncertain_modification": "cancel"},
+            )
+            gateway.orders = (
+                broker_order("broker-1", filled="3", remaining="5"),
+            )
+
+            resolved = await service.resolve_unknown_order(
+                submitted.id,
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+
+            assert resolved["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["status"] == "PARTIALLY_FILLED"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                "8"
+            )
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "auto_cancel_reconciled"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_uncertain_amendment_terminal_parent_reconciles(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "legacy-terminal-parent.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("legacy-terminal-parent"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            store.update_order(
+                submitted.id,
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"uncertain_modification": "amend"},
+            )
+            gateway.orders = (
+                replace(
+                    broker_order("broker-1", filled="10", remaining="0"),
+                    status=OrderStatus.FILLED,
+                ),
+            )
+
+            result = await service.reconcile_unknown_order(submitted.id)
+
+            assert result["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["status"] == "FILLED"
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "broker_terminal"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_uncertain_amendment_requires_relation_verified_manual_link(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "legacy-amend-manual.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("legacy-amend-manual"), quantity=Decimal("10")
+                ),
+            )
+            store.update_order(
+                submitted.id,
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"uncertain_modification": "amend"},
+            )
+            parent = broker_order("broker-1")
+            child = broker_order(
+                "legacy-child", quantity="6", original_provider_id="broker-1"
+            )
+            gateway.orders = (parent, child)
+
+            pending = await service.reconcile_unknown_order(submitted.id)
+            assert pending["resolved"] is False
+            assert pending["match_result"] == (
+                "manual_required_legacy_modification"
+            )
+            with pytest.raises(RouterError):
+                await service.resolve_unknown_order(
+                    submitted.id,
+                    action="NOT_ACCEPTED",
+                    confirmation="HTS_NOT_ACCEPTED",
+                )
+
+            for invalid_child in (
+                replace(child, original_provider_order_id=None),
+                replace(child, original_provider_order_id="other-parent"),
+                replace(
+                    child,
+                    status=OrderStatus.REJECTED,
+                    remaining_quantity=Decimal("0"),
+                ),
+            ):
+                gateway.orders = (parent, invalid_child)
+                with pytest.raises(RouterError) as invalid:
+                    await service.resolve_unknown_order(
+                        submitted.id,
+                        action="LINK",
+                        provider_order_id="legacy-child",
+                        confirmation="HTS_LINK_CONFIRMED",
+                    )
+                assert invalid.value.code is RouterErrorCode.INVALID_REQUEST
+
+            gateway.orders = (parent, child)
+            linked = await service.resolve_unknown_order(
+                submitted.id,
+                action="LINK",
+                provider_order_id="legacy-child",
+                confirmation="HTS_LINK_CONFIRMED",
+            )
+            assert linked["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["provider_order_id"] == "legacy-child"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                "6"
+            )
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "manual_amendment_linked"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("child_quantity", "child_filled", "child_remaining"),
+    (("10", "5", "5"), ("5", "0", "5")),
+)
+def test_legacy_cumulative_amendment_snapshot_is_not_double_counted(
+    tmp_path: Path,
+    child_quantity: str,
+    child_filled: str,
+    child_remaining: str,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "legacy-cumulative-amend.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("legacy-cumulative-amend"),
+                    quantity=Decimal("10"),
+                ),
+            )
+            store.update_order(
+                submitted.id,
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                filled_quantity=Decimal("3"),
+                average_fill_price=Decimal("90000"),
+                provider_metadata={"uncertain_modification": "amend"},
+            )
+            parent = broker_order("broker-1", filled="3")
+            # With no pending request, both a cumulative fill snapshot and a
+            # zero-fill replacement can encode either cumulative or segment
+            # quantities. Do not guess after the parent already filled.
+            cumulative_or_segment = broker_order(
+                "legacy-cumulative-child",
+                quantity=child_quantity,
+                filled=child_filled,
+                remaining=child_remaining,
+                original_provider_id="broker-1",
+            )
+            gateway.orders = (parent, cumulative_or_segment)
+
+            with pytest.raises(RouterError) as ambiguous:
+                await service.resolve_unknown_order(
+                    submitted.id,
+                    action="LINK",
+                    provider_order_id="legacy-cumulative-child",
+                    confirmation="HTS_LINK_CONFIRMED",
+                )
+
+            assert ambiguous.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+            stored = store.order(submitted.id)
+            assert stored["status"] == "UNKNOWN_RECONCILING"
+            assert stored["provider_order_id"] == "broker-1"
+            assert stored["filled_quantity"] == "3"
+            assert sum(
+                Decimal(fill["quantity"])
+                for fill in store.fills(order_id=submitted.id)
+            ) == 0
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("child_quantity", "child_filled", "child_remaining"),
+    (("10", "3", "7"), ("5", "0", "5")),
+)
+def test_legacy_amendment_link_checks_fresh_parent_fills(
+    tmp_path: Path,
+    child_quantity: str,
+    child_filled: str,
+    child_remaining: str,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"legacy-fresh-parent-{child_quantity}.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("legacy-fresh-parent"), quantity=Decimal("10")
+                ),
+            )
+            # The legacy ledger has not received the parent's three fills yet.
+            store.update_order(
+                submitted.id,
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"uncertain_modification": "amend"},
+            )
+            parent = broker_order("broker-1", filled="3")
+            child = broker_order(
+                "legacy-fresh-child",
+                quantity=child_quantity,
+                filled=child_filled,
+                remaining=child_remaining,
+                original_provider_id="broker-1",
+            )
+            gateway.orders = (parent, child)
+
+            with pytest.raises(RouterError) as ambiguous:
+                await service.resolve_unknown_order(
+                    submitted.id,
+                    action="LINK",
+                    provider_order_id="legacy-fresh-child",
+                    confirmation="HTS_LINK_CONFIRMED",
+                )
+
+            assert ambiguous.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+            stored = store.order(submitted.id)
+            assert stored["status"] == "UNKNOWN_RECONCILING"
+            assert stored["provider_order_id"] == "broker-1"
+            assert stored["filled_quantity"] == "0"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_amendment_does_not_close_on_cancelled_parent_without_successor(
+    tmp_path: Path,
+) -> None:
+    class UncertainAmendGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "orphan-amend-child.sqlite3")
+        gateway = UncertainAmendGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("orphan-child"), quantity=Decimal("10")),
+            )
+            await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            pending = store.order(submitted.id)["provider_metadata"]["pending_modification"]
+            requested_at = datetime.fromisoformat(pending["requested_at"])
+            gateway.orders = (
+                replace(
+                    broker_order("broker-1"),
+                    status=OrderStatus.CANCELLED,
+                    remaining_quantity=Decimal("0"),
+                ),
+                # It looks like the desired child but has no credible temporal
+                # relation to the request and therefore cannot be auto-linked.
+                replace(
+                    broker_order("late-child"),
+                    ordered_at=requested_at.replace(hour=0, minute=0, second=0),
+                ),
+            )
+
+            await service.refresh_unresolved_orders("broker-account")
+
+            stored = store.order(submitted.id)
+            assert stored["status"] == "UNKNOWN_RECONCILING"
+            assert stored["provider_order_id"] == "broker-1"
+            assert stored["provider_metadata"]["match_result"] == "amendment_successor_missing"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ("amend", "cancel"))
+def test_uncertain_modification_can_be_manually_restored_after_hts_check(
+    tmp_path: Path, operation: str,
+) -> None:
+    class UncertainGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+        async def cancel_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "ambiguous mocked response"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"uncertain-manual-{operation}.sqlite3")
+        gateway = UncertainGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy(f"manual-{operation}"), quantity=Decimal("10")),
+            )
+            gateway.orders = (broker_order("broker-1"),)
+            kwargs = dict(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                route=None,
+            )
+            if operation == "amend":
+                kwargs.update(order_type=OrderType.BEST_LIMIT, price=None)
+            await getattr(service, operation)(**kwargs)
+            with pytest.raises(RouterError) as missing_confirmation:
+                await service.resolve_unknown_order(
+                    submitted.id, action="NOT_ACCEPTED"
+                )
+            assert missing_confirmation.value.code is RouterErrorCode.INVALID_REQUEST
+
+            result = await service.resolve_unknown_order(
+                submitted.id,
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+
+            assert result["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["status"] == "ACKNOWLEDGED"
+            assert "uncertain_modification" not in stored["provider_metadata"]
+            assert stored["provider_metadata"]["modification_resolution"] == "manual_modification_not_accepted"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ("amend", "cancel"))
+def test_manual_modification_not_accepted_rejects_terminal_parent_snapshot(
+    tmp_path: Path, operation: str,
+) -> None:
+    class UncertainGateway(SimulationGateway):
+        async def amend_order(self, *args, **kwargs):
+            raise RouterError(RouterErrorCode.ORDER_STATUS_UNKNOWN, "uncertain")
+
+        async def cancel_order(self, *args, **kwargs):
+            raise RouterError(RouterErrorCode.ORDER_STATUS_UNKNOWN, "uncertain")
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"terminal-manual-{operation}.sqlite3")
+        gateway = UncertainGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy(f"terminal-{operation}"), quantity=Decimal("10")),
+            )
+            kwargs = dict(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=None,
+                route=None,
+            )
+            if operation == "amend":
+                kwargs.update(order_type=OrderType.BEST_LIMIT, price=None)
+            await getattr(service, operation)(**kwargs)
+            gateway.orders = (
+                replace(
+                    broker_order("broker-1"),
+                    status=OrderStatus.CANCELLED,
+                    remaining_quantity=Decimal("0"),
+                ),
+            )
+
+            if operation == "cancel":
+                resolved = await service.resolve_unknown_order(
+                    submitted.id,
+                    action="NOT_ACCEPTED",
+                    confirmation="HTS_NOT_ACCEPTED",
+                )
+                assert resolved["resolved"] is True
+                stored = store.order(submitted.id)
+                assert stored["status"] == "CANCELLED"
+                assert stored["provider_metadata"]["modification_resolution"] == (
+                    "broker_terminal"
+                )
+            else:
+                with pytest.raises(RouterError) as contradiction:
+                    await service.resolve_unknown_order(
+                        submitted.id,
+                        action="NOT_ACCEPTED",
+                        confirmation="HTS_NOT_ACCEPTED",
+                    )
+                assert contradiction.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+                assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("cancel_quantity", "remaining_after", "expected_status", "expected_total"),
+    (
+        (None, "0", "CANCELLED", "3"),
+        (Decimal("2"), "5", "PARTIALLY_FILLED", "8"),
+    ),
+)
+def test_response_lost_cancel_reconciles_reduced_remaining_quantity(
+    tmp_path: Path,
+    cancel_quantity: Decimal | None,
+    remaining_after: str,
+    expected_status: str,
+    expected_total: str,
+) -> None:
+    class LostCancelGateway(SimulationGateway):
+        async def cancel_order(self, *args, **kwargs):
+            raise RouterError(RouterErrorCode.ORDER_STATUS_UNKNOWN, "response lost")
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"lost-cancel-{expected_total}.sqlite3")
+        gateway = LostCancelGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy(f"lost-cancel-{expected_total}"), quantity=Decimal("10")),
+            )
+            gateway.orders = (broker_order("broker-1", filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            result = await service.cancel(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=cancel_quantity,
+                route=None,
+            )
+            assert result.status is OrderStatus.UNKNOWN_RECONCILING
+            pending = store.order(submitted.id)["provider_metadata"]["pending_modification"]
+            assert pending["previous_effective_quantity"] == "10"
+            assert pending["expected_total_after_cancel"] == expected_total
+            gateway.orders = (
+                broker_order(
+                    "broker-1", filled="3", remaining=remaining_after
+                ),
+            )
+
+            await service.refresh_unresolved_orders("broker-account")
+
+            stored = store.order(submitted.id)
+            assert stored["status"] == expected_status
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == expected_total
+            assert "uncertain_modification" not in stored["provider_metadata"]
+            assert stored["provider_metadata"]["modification_resolution"] == "auto_cancel_reconciled"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_manual_not_accepted_cannot_restore_an_already_applied_partial_cancel(
+    tmp_path: Path,
+) -> None:
+    class LostCancelGateway(SimulationGateway):
+        async def cancel_order(self, *args, **kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN, "response lost"
+            )
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "partial-cancel-not-accepted.sqlite3")
+        gateway = LostCancelGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("partial-cancel-not-accepted"),
+                    quantity=Decimal("10"),
+                    order_type=OrderType.BEST_LIMIT,
+                ),
+            )
+            gateway.orders = (broker_order("broker-1", filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            await service.cancel(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=Decimal("2"),
+                route=None,
+            )
+            gateway.orders = (
+                broker_order("broker-1", filled="3", remaining="5"),
+            )
+
+            resolved = await service.resolve_unknown_order(
+                submitted.id,
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+
+            assert resolved["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["status"] == "PARTIALLY_FILLED"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                "8"
+            )
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "auto_cancel_reconciled"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_uncertain_cancel_poll_preserves_baseline_for_manual_not_accepted(
+    tmp_path: Path,
+) -> None:
+    class LostCancelGateway(SimulationGateway):
+        async def cancel_order(self, *args, **kwargs):
+            raise RouterError(RouterErrorCode.ORDER_STATUS_UNKNOWN, "response lost")
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "lost-cancel-baseline.sqlite3")
+        gateway = LostCancelGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(market_buy("lost-cancel-baseline"), quantity=Decimal("10")),
+            )
+            gateway.orders = (broker_order("broker-1", filled="3"),)
+            await service.refresh_unresolved_orders("broker-account")
+            await service.cancel(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=Decimal("2"),
+                route=None,
+            )
+            # An intermediate total of 9 is neither the previous 10 nor the
+            # expected post-cancel 8. It must not overwrite the baseline.
+            gateway.orders = (broker_order("broker-1", filled="3", remaining="6"),)
+            await service.refresh_unresolved_orders("broker-account")
+            pending = store.order(submitted.id)
+            assert pending["status"] == "UNKNOWN_RECONCILING"
+            assert pending["request"]["quantity"] == "10"
+            assert "effective_request" not in pending["provider_metadata"]
+
+            gateway.orders = (broker_order("broker-1", filled="3", remaining="7"),)
+            resolved = await service.resolve_unknown_order(
+                submitted.id,
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+            assert resolved["resolved"] is True
+            stored = store.order(submitted.id)
+            assert stored["status"] == "PARTIALLY_FILLED"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == "10"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("cancel_quantity", "child_remaining", "expected_status", "expected_total"),
+    (
+        (None, "0", "CANCELLED", "3"),
+        (Decimal("2"), "5", "PARTIALLY_FILLED", "8"),
+    ),
+)
+def test_response_lost_cancel_after_amendment_uses_cumulative_fill_offsets(
+    tmp_path: Path,
+    cancel_quantity: Decimal | None,
+    child_remaining: str,
+    expected_status: str,
+    expected_total: str,
+) -> None:
+    class LostCancelGateway(SimulationGateway):
+        async def cancel_order(self, *args, **kwargs):
+            raise RouterError(RouterErrorCode.ORDER_STATUS_UNKNOWN, "response lost")
+
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"amended-lost-cancel-{expected_total}.sqlite3")
+        gateway = LostCancelGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy(f"amended-lost-cancel-{expected_total}"),
+                    quantity=Decimal("10"),
+                    order_type=OrderType.BEST_LIMIT,
+                ),
+            )
+            original = broker_order("broker-1", filled="2")
+            gateway.orders = (original,)
+            await service.refresh_unresolved_orders("broker-account")
+            amended = await service.amend(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                order_id=submitted.id,
+                quantity=Decimal("8"),
+                order_type=OrderType.BEST_LIMIT,
+                price=None,
+                route=None,
+            )
+            assert amended.provider_order_id == "broker-1-amended"
+            child = broker_order(
+                "broker-1-amended", quantity="8", filled="1", remaining="7"
+            )
+            gateway.orders = (original, child)
+            await service.refresh_unresolved_orders("broker-account")
+            assert store.order(submitted.id)["filled_quantity"] == "3"
+
+            unknown = await service.cancel(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=cancel_quantity,
+                route=None,
+            )
+            assert unknown.status is OrderStatus.UNKNOWN_RECONCILING
+            gateway.orders = (
+                original,
+                broker_order(
+                    "broker-1-amended",
+                    quantity="8",
+                    filled="1",
+                    remaining=child_remaining,
+                ),
+            )
+
+            await service.refresh_unresolved_orders("broker-account")
+
+            stored = store.order(submitted.id)
+            assert stored["status"] == expected_status
+            assert stored["filled_quantity"] == "3"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                expected_total
+            )
+            assert stored["provider_metadata"]["modification_resolution"] == (
+                "auto_cancel_reconciled"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("response_lost", (False, True))
+@pytest.mark.parametrize(
+    ("cancel_quantity", "expected_status", "expected_total"),
+    (
+        (None, "CANCELLED", "3"),
+        (Decimal("2"), "PARTIALLY_FILLED", "8"),
+    ),
+)
+def test_namuh_cancel_child_snapshot_reconciles_service_order(
+    tmp_path: Path,
+    response_lost: bool,
+    cancel_quantity: Decimal | None,
+    expected_status: str,
+    expected_total: str,
+) -> None:
+    class NamuhCancelGateway(SimulationGateway):
+        async def submit_order(self, *args, **kwargs):
+            return replace(
+                await super().submit_order(*args, **kwargs),
+                provider_order_id="30",
+            )
+
+        async def cancel_order(self, *args, **kwargs):
+            acknowledgement = replace(
+                await super().cancel_order(*args, **kwargs),
+                provider_order_id="31",
+            )
+            if response_lost:
+                raise RouterError(
+                    RouterErrorCode.ORDER_STATUS_UNKNOWN, "response lost"
+                )
+            return acknowledgement
+
+    def snapshots(cancelled: Decimal = Decimal("0")) -> tuple[AccountOrder, ...]:
+        day = datetime.now(SEOUL).date()
+        rows = [
+            {
+                "itg_orr_no": "30",
+                "orr_dt": day.strftime("%Y%m%d"),
+                "orr_tm": "101500",
+                "iem_cd": "005930",
+                "sby_dit_cd_nm": "매수",
+                "nmn_pr_tp_cd_nm": "보통가",
+                "orr_qty": "10",
+                "orr_pr": "73000",
+                "tot_cns_qty": "3",
+                "cns_avg_uit_pr": "72900",
+                "ny_cns_qty": "7",
+                "can_qty": "0",
+                "orr_rjt_rsn_cd_nm": "",
+                "rmt_mkt_cd": "KRX",
+            }
+        ]
+        if cancelled > 0:
+            rows.append(
+                {
+                    "itg_orr_no": "31",
+                    "org_mkt_orr_no": "30",
+                    "orr_dt": day.strftime("%Y%m%d"),
+                    "orr_tm": "101600",
+                    "iem_cd": "005930",
+                    "sby_dit_cd_nm": "매수",
+                    "nmn_pr_tp_cd_nm": "취소",
+                    "orr_qty": str(cancelled),
+                    "orr_pr": "0",
+                    "tot_cns_qty": "0",
+                    "ny_cns_qty": "0",
+                    "can_qty": str(cancelled),
+                    "orr_rjt_rsn_cd_nm": "",
+                    "rmt_mkt_cd": "KRX",
+                }
+            )
+        return _normalize_namuh_account_orders(rows, "broker-account", day)
+
+    async def run() -> None:
+        store = RuntimeStore(
+            tmp_path
+            / f"namuh-cancel-{int(response_lost)}-{expected_total}.sqlite3"
+        )
+        gateway = NamuhCancelGateway(provider="namuh")
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="1000000"),
+                request=replace(
+                    market_buy("namuh-cancel-service"),
+                    quantity=Decimal("10"),
+                    order_type=OrderType.BEST_LIMIT,
+                ),
+            )
+            gateway.orders = snapshots()
+            await service.refresh_unresolved_orders("broker-account")
+            result = await service.cancel(
+                strategy_name="strategy.py",
+                manifest=manifest(),
+                order_id=submitted.id,
+                quantity=cancel_quantity,
+                route=None,
+            )
+            assert result.status is (
+                OrderStatus.UNKNOWN_RECONCILING
+                if response_lost
+                else OrderStatus.CANCEL_PENDING
+            )
+            confirmed_cancel = Decimal("7") if cancel_quantity is None else cancel_quantity
+            gateway.orders = snapshots(confirmed_cancel)
+
+            await service.refresh_unresolved_orders("broker-account")
+
+            stored = store.order(submitted.id)
+            assert stored["status"] == expected_status
+            assert stored["filled_quantity"] == "3"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                expected_total
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provider", ("kis", "namuh"))
+def test_cancel_child_fold_preserves_submit_time_for_unknown_auto_link(
+    tmp_path: Path, provider: str,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / f"{provider}-cancel-fold-window.sqlite3")
+        gateway = SimulationGateway(provider=provider)
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(
+                day, datetime.min.time(), tzinfo=SEOUL
+            ).replace(hour=9)
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id=f"{provider}-cancel-fold-window",
+                request={
+                    "code": "005930",
+                    "side": "BUY",
+                    "order_type": "LIMIT",
+                    "quantity": "10",
+                    "price": "73000",
+                    "route": "KRX",
+                    "reserved_amount": "730000",
+                },
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), submitted_at.isoformat(), row["id"]),
+                )
+            store.update_order(
+                str(row["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+            )
+            if provider == "kis":
+                raw_rows = [
+                    {
+                        "odno": "original",
+                        "pdno": "005930",
+                        "sll_buy_dvsn_cd": "02",
+                        "ord_dvsn_name": "지정가",
+                        "ord_qty": "10",
+                        "tot_ccld_qty": "1",
+                        "rmn_qty": "9",
+                        "ord_unpr": "73000",
+                        "avg_prvs": "72900",
+                        "ord_dt": day.strftime("%Y%m%d"),
+                        "ord_tmd": "090000",
+                        "excg_id_dvsn_cd": "KRX",
+                    },
+                    {
+                        "odno": "cancel-child",
+                        "orgn_odno": "original",
+                        "pdno": "005930",
+                        "sll_buy_dvsn_cd": "02",
+                        "rvse_cncl_dvsn_cd": "02",
+                        "cncl_yn": "Y",
+                        "ord_dvsn_name": "취소",
+                        "ord_qty": "2",
+                        "cncl_qty": "2",
+                        "tot_ccld_qty": "0",
+                        "rmn_qty": "0",
+                        "ord_dt": day.strftime("%Y%m%d"),
+                        "ord_tmd": "090500",
+                        "excg_id_dvsn_cd": "KRX",
+                    },
+                ]
+                gateway.orders = _normalize_kis_account_orders(
+                    raw_rows, "broker-account", day
+                )
+            else:
+                raw_rows = [
+                    {
+                        "itg_orr_no": "30",
+                        "orr_dt": day.strftime("%Y%m%d"),
+                        "orr_tm": "090000",
+                        "iem_cd": "005930",
+                        "sby_dit_cd_nm": "매수",
+                        "nmn_pr_tp_cd_nm": "보통가",
+                        "orr_qty": "10",
+                        "orr_pr": "73000",
+                        "tot_cns_qty": "1",
+                        "cns_avg_uit_pr": "72900",
+                        "ny_cns_qty": "9",
+                        "can_qty": "0",
+                        "orr_rjt_rsn_cd_nm": "",
+                        "rmt_mkt_cd": "KRX",
+                    },
+                    {
+                        "itg_orr_no": "31",
+                        "org_mkt_orr_no": "30",
+                        "orr_dt": day.strftime("%Y%m%d"),
+                        "orr_tm": "090500",
+                        "iem_cd": "005930",
+                        "sby_dit_cd_nm": "매수",
+                        "nmn_pr_tp_cd_nm": "취소",
+                        "orr_qty": "2",
+                        "orr_pr": "0",
+                        "tot_cns_qty": "0",
+                        "ny_cns_qty": "0",
+                        "can_qty": "2",
+                        "orr_rjt_rsn_cd_nm": "",
+                        "rmt_mkt_cd": "KRX",
+                    },
+                ]
+                gateway.orders = _normalize_namuh_account_orders(
+                    raw_rows, "broker-account", day
+                )
+
+            result = await service.reconcile_unknown_order(str(row["id"]))
+
+            assert result["resolved"] is True
+            stored = store.order(str(row["id"]))
+            assert stored["provider_order_id"] == (
+                "original" if provider == "kis" else "30"
+            )
+            assert stored["status"] == "PARTIALLY_FILLED"
+            assert stored["filled_quantity"] == "1"
+            assert stored["provider_metadata"]["effective_request"]["quantity"] == (
+                "8"
+            )
+        finally:
+            store.close()
+
     asyncio.run(run())
 
 
@@ -187,7 +1733,8 @@ def test_amended_rest_and_realtime_fills_do_not_double_count(
 
 
 def broker_order(provider_id: str, *, filled: str = "0", quantity: str = "10",
-                 remaining: str | None = None, average: str = "90000") -> AccountOrder:
+                 remaining: str | None = None, average: str = "90000",
+                 original_provider_id: str | None = None) -> AccountOrder:
     quantity_value = Decimal(quantity)
     filled_value = Decimal(filled)
     return AccountOrder(
@@ -200,6 +1747,7 @@ def broker_order(provider_id: str, *, filled: str = "0", quantity: str = "10",
         ordered_at=datetime.now(SEOUL), provider="simulation",
         average_fill_price=Decimal(average) if filled_value else None,
         route=OrderRoute.KRX,
+        original_provider_order_id=original_provider_id,
     )
 
 
@@ -237,7 +1785,12 @@ def test_open_orders_api_reconciles_and_only_exposes_owned_actionable_orders(tmp
             broker_order("owned-broker", filled="3"),
             broker_order("other-broker"),
             broker_order("cancel-broker"),
-            broker_order("manual-broker"),
+            # An unrelated external order must not look identical to the
+            # provider-id-less router order now that unique matching is active.
+            replace(
+                broker_order("manual-broker"),
+                instrument=InstrumentId("000660"),
+            ),
         )
         assert client.get("/api/v1/orders/open").status_code == 401
         result = client.get("/api/v1/orders/open", headers={"Authorization": f"Bearer {token}"})
@@ -434,7 +1987,7 @@ def test_original_rest_and_realtime_streams_never_double_count(
 
 
 @pytest.mark.parametrize("operation", ("amend", "cancel"))
-def test_rejected_modification_notice_does_not_reject_uncertain_original(
+def test_rejected_modification_notice_restores_uncertain_original(
     tmp_path: Path, operation: str,
 ) -> None:
     async def run() -> None:
@@ -457,10 +2010,13 @@ def test_rejected_modification_notice_does_not_reject_uncertain_original(
                 "original_order_id": "broker-1", "execution_code": "1",
                 "rejected": "1", "time": "160100",
             })
-            assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
+            restored = store.order(submitted.id)
+            assert restored["status"] == "ACKNOWLEDGED"
+            assert "uncertain_modification" not in restored["provider_metadata"]
+            assert restored["provider_metadata"]["modification_resolution"] == "realtime_rejected"
             gateway.orders = (broker_order("broker-1"),)
-            assert await service.open_orders(manifest=manifest()) == []
-            assert store.order(submitted.id)["status"] == "UNKNOWN_RECONCILING"
+            assert [order.id for order in await service.open_orders(manifest=manifest())] == [submitted.id]
+            assert store.order(submitted.id)["status"] == "ACKNOWLEDGED"
             gateway.orders = (replace(
                 broker_order("broker-1", filled="10", remaining="0"), status=OrderStatus.FILLED,
             ),)

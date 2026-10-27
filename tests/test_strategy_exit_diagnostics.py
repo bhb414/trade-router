@@ -28,6 +28,11 @@ def test_exit_projection_has_a_fixed_allowlist_not_arbitrary_exception_or_detail
     assert safe_exit_details({"exit_code": -15, "stop_requested": True})["exit_reason"] == "USER_STOPPED"
 
 
+def test_missing_provider_order_id_is_an_allowlisted_safe_exception_type():
+    projected = safe_exit_details({"exception_type": "MissingProviderOrderId"})
+    assert projected["exception_type"] == "MissingProviderOrderId"
+
+
 def test_reader_collects_failure_before_exit_callback_and_tolerates_callback_failure(tmp_path):
     async def run():
         paths = workspace(tmp_path / "workspace")

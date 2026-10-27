@@ -5,6 +5,7 @@ import asyncio
 from trade_router import RouterError
 
 from .orders import OrderService
+from .process_diagnostics import EXCEPTION_TYPES
 from .runtime_store import RuntimeStore
 
 
@@ -22,7 +23,9 @@ class OrderReconciler:
         self._service = service
         self._interval_seconds = interval_seconds
         self._task: asyncio.Task[None] | None = None
-        self._last_errors: dict[str, str] = {}
+        self._last_errors: dict[
+            str, tuple[str | None, str | None, int | None]
+        ] = {}
 
     async def start(self) -> None:
         if self._task is None:
@@ -39,21 +42,34 @@ class OrderReconciler:
             await asyncio.gather(task, return_exceptions=True)
 
     async def refresh_once(self) -> None:
-        accounts = sorted(
-            {
-                str(row["account_alias"])
-                for row in self._store.unresolved_orders()
-            }
-        )
+        accounts = self._store.unresolved_order_account_aliases()
         for account_alias in accounts:
             try:
                 await self._service.refresh_unresolved_orders(account_alias)
             except RouterError as exc:
-                self._record_error_once(account_alias, exc.message)
-            except Exception:
+                details = exc.details if isinstance(exc.details, dict) else {}
+                wrapped_type = details.get("exception_type")
+                self._record_error_once(
+                    account_alias,
+                    "주문 상태 자동 확인 중 증권사 조회 오류가 발생했습니다.",
+                    error_code=exc.code.value,
+                    exception_type=(
+                        wrapped_type
+                        if isinstance(wrapped_type, str)
+                        and wrapped_type in EXCEPTION_TYPES
+                        else "RouterError"
+                    ),
+                    winerror=_safe_winerror(details.get("winerror")),
+                )
+            except Exception as exc:
+                exception_type = type(exc).__name__
                 self._record_error_once(
                     account_alias,
                     "주문 상태 자동 확인 중 예상하지 못한 오류가 발생했습니다.",
+                    exception_type=(
+                        exception_type if exception_type in EXCEPTION_TYPES else None
+                    ),
+                    winerror=_safe_winerror(getattr(exc, "winerror", None)),
                 )
             else:
                 self._last_errors.pop(account_alias, None)
@@ -63,12 +79,36 @@ class OrderReconciler:
             await self.refresh_once()
             await asyncio.sleep(self._interval_seconds)
 
-    def _record_error_once(self, account_alias: str, message: str) -> None:
-        if self._last_errors.get(account_alias) == message:
+    def _record_error_once(
+        self,
+        account_alias: str,
+        message: str,
+        *,
+        error_code: str | None = None,
+        exception_type: str | None = None,
+        winerror: int | None = None,
+    ) -> None:
+        signature = (error_code, exception_type, winerror)
+        if self._last_errors.get(account_alias) == signature:
             return
-        self._last_errors[account_alias] = message
+        self._last_errors[account_alias] = signature
+        details: dict[str, object] = {
+            "source_kind": "account",
+            "failure_phase": "reconcile",
+        }
+        if error_code is not None:
+            details["error_code"] = error_code
+        if exception_type is not None:
+            details["exception_type"] = exception_type
+        if winerror is not None:
+            details["winerror"] = winerror
         self._store.record(
             source=account_alias,
             event_type="order.reconcile_error",
             message=message,
+            details=details,
         )
+
+
+def _safe_winerror(value: object) -> int | None:
+    return value if type(value) is int and 0 <= value <= 65535 else None

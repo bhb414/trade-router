@@ -56,6 +56,8 @@ const state = {
   strategyBalanceTab: "balance",
   accountBalanceTab: "balance",
   activeAccount: null,
+  resolvingOrder: null,
+  orderResolutionCandidates: [],
   updateResult: null,
   updateCheckPromise: null,
 };
@@ -113,6 +115,19 @@ const elements = {
   serviceDetailBody: document.querySelector("#service-detail-body"),
   accountBalanceModal: document.querySelector("#account-balance-modal"),
   accountBalanceBody: document.querySelector("#account-balance-body"),
+  orderResolutionModal: document.querySelector("#order-resolution-modal"),
+  orderResolutionSummary: document.querySelector("#order-resolution-summary"),
+  orderResolutionLinkSection: document.querySelector("#order-resolution-link-section"),
+  orderResolutionLinkTitle: document.querySelector("#order-resolution-link-title"),
+  orderResolutionLinkDescription: document.querySelector("#order-resolution-link-description"),
+  orderResolutionProviderLabel: document.querySelector("#order-resolution-provider-label"),
+  orderResolutionProviderId: document.querySelector("#order-resolution-provider-id"),
+  orderResolutionLink: document.querySelector("#order-resolution-link"),
+  orderResolutionRejectTitle: document.querySelector("#order-resolution-reject-title"),
+  orderResolutionRejectDescription: document.querySelector("#order-resolution-reject-description"),
+  orderResolutionConfirmText: document.querySelector("#order-resolution-confirm-text"),
+  orderResolutionNotAcceptedConfirm: document.querySelector("#order-resolution-not-accepted-confirm"),
+  orderResolutionNotAccepted: document.querySelector("#order-resolution-not-accepted"),
   connectionProvider: document.querySelector("#connection-provider"),
   connectionTarget: document.querySelector("#connection-target"),
   accountConnection: document.querySelector("#account-connection"),
@@ -7270,7 +7285,8 @@ async function openStrategy(name) {
     }
     if (openToken !== state.strategyOpenToken) return;
     await refreshStrategyPermission();
-    await Promise.all([refreshStrategySummary(), refreshLogs(), refreshOrders()]);
+    await refreshStrategySummary();
+    await Promise.all([refreshLogs(), refreshOrders()]);
   } finally {
     if (openToken === state.strategyOpenToken) state.openingStrategy = null;
   }
@@ -7446,6 +7462,258 @@ function orderStatusPresentation(status) {
   return values[status] || [status, ""];
 }
 
+function unknownOrderOriginLabel(value) {
+  const labels = {
+    transport_error: "증권사 응답을 받지 못함",
+    TRANSPORT_ERROR: "증권사 응답을 받지 못함",
+    http_status_unknown: "증권사 서버 오류로 접수 결과를 확정하지 못함",
+    HTTP_STATUS_UNKNOWN: "증권사 서버 오류로 접수 결과를 확정하지 못함",
+    router_error: "증권사가 접수 여부를 확정하지 못함",
+    ROUTER_ERROR: "증권사가 접수 여부를 확정하지 못함",
+    success_without_order_id: "성공 응답에 주문번호가 없음",
+    SUCCESS_WITHOUT_ORDER_ID: "성공 응답에 주문번호가 없음",
+    submit_exception: "주문 제출 중 통신 오류",
+    SUBMIT_EXCEPTION: "주문 제출 중 통신 오류",
+    restart_submitting: "프로그램 재시작 전 제출 상태",
+    RESTART_SUBMITTING: "프로그램 재시작 전 제출 상태",
+    unexpected_adapter_error: "주문 어댑터의 예상하지 못한 오류",
+    UNEXPECTED_ADAPTER_ERROR: "주문 어댑터의 예상하지 못한 오류",
+    amend_exception: "주문 정정 응답을 확인하지 못함",
+    AMEND_EXCEPTION: "주문 정정 응답을 확인하지 못함",
+    cancel_exception: "주문 취소 응답을 확인하지 못함",
+    CANCEL_EXCEPTION: "주문 취소 응답을 확인하지 못함",
+  };
+  return labels[value] || "주문 접수 결과를 확정하지 못함";
+}
+
+function unknownOrderDetail(row) {
+  const metadata = row.provider_metadata || {};
+  const origin = unknownOrderOriginLabel(metadata.unknown_origin);
+  const phaseLabels = {
+    submit: "주문 제출",
+    modify: "정정·취소",
+    reconcile: "상태 대조",
+  };
+  const technicalParts = [];
+  if (phaseLabels[metadata.failure_phase]) {
+    technicalParts.push(`단계 ${phaseLabels[metadata.failure_phase]}`);
+  }
+  if (typeof metadata.exception_type === "string" && metadata.exception_type) {
+    technicalParts.push(`오류 ${metadata.exception_type}`);
+  }
+  const winerror = Number(metadata.winerror);
+  if (Number.isInteger(winerror) && winerror >= 0) {
+    technicalParts.push(`WinError ${winerror}`);
+  }
+  const httpStatus = Number(metadata.http_status);
+  if (Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599) {
+    technicalParts.push(`HTTP ${httpStatus}`);
+  }
+  const attempts = Number(metadata.reconcile_attempt_count);
+  if (Number.isInteger(attempts) && attempts > 0) {
+    technicalParts.push(`자동 대조 ${attempts}회`);
+  }
+  const candidateCount = Number.isFinite(Number(metadata.candidate_count))
+    ? `${Number(metadata.candidate_count)}건`
+    : "확인 전";
+  const lastChecked = metadata.last_reconcile_at
+    ? new Date(metadata.last_reconcile_at).toLocaleString("ko-KR", { hour12: false })
+    : "아직 대조되지 않음";
+  return {
+    origin,
+    technical: technicalParts.join(" · "),
+    candidateCount,
+    lastChecked,
+  };
+}
+
+function orderResolutionCandidateLine(candidate) {
+  const orderedAt = candidate?.ordered_at
+    ? new Date(candidate.ordered_at).toLocaleString("ko-KR", { hour12: false })
+    : "시각 미확인";
+  const price = candidate?.price && Number(candidate.price) > 0
+    ? `${Number(candidate.price).toLocaleString("ko-KR")}원`
+    : "가격 없음";
+  const parent = candidate?.original_provider_order_id
+    ? ` · 원주문 ${candidate.original_provider_order_id}`
+    : " · 원주문 관계 미제공";
+  return `후보 ${candidate?.provider_order_id || "번호 미확인"} · ${orderedAt} · ${candidate?.status || "상태 미확인"} · ${candidate?.requested_quantity || "-"}주 · ${candidate?.order_type || "유형 미확인"} ${price}${parent}`;
+}
+
+function openOrderResolution(row, candidates = []) {
+  state.resolvingOrder = row;
+  state.orderResolutionCandidates = Array.isArray(candidates) ? candidates : [];
+  const request = row.request || {};
+  const side = request.side === "SELL" ? "매도" : "매수";
+  const created = row.created_at
+    ? new Date(row.created_at).toLocaleString("ko-KR", { hour12: false })
+    : "시각 미확인";
+  const detail = unknownOrderDetail(row);
+  elements.orderResolutionSummary.replaceChildren();
+  const title = document.createElement("strong");
+  title.textContent = `${request.code || "종목 미확인"} · ${side} ${request.quantity || "-"}주`;
+  const requestLine = document.createElement("span");
+  requestLine.textContent = `${created} · ${orderTypeLabel(request.order_type, `지정가 ${request.price || "-"}원`)} · ${request.route || "AUTO"}`;
+  const accountLine = document.createElement("span");
+  const selectedStrategyId = state.strategySummary?.strategy_id
+    || state.strategyPermission?.strategy_id;
+  accountLine.textContent = `계좌: ${row.account_alias || "미확인"}${
+    row.strategy_id && row.strategy_id !== selectedStrategyId
+      ? " · 다른 전략에서 발생" : ""
+  }`;
+  const errorLine = document.createElement("span");
+  errorLine.textContent = `원인: ${detail.origin}${detail.technical ? ` · ${detail.technical}` : ""}`;
+  const reconcileLine = document.createElement("span");
+  reconcileLine.textContent = `최근 대조: ${detail.lastChecked} · 일치 후보 ${detail.candidateCount}`;
+  elements.orderResolutionSummary.append(title, requestLine, accountLine, errorLine, reconcileLine);
+  const modificationKind = row.provider_order_id
+    ? String(row.provider_metadata?.uncertain_modification || "")
+    : "";
+  const uncertainModification = Boolean(modificationKind);
+  const uncertainAmendment = modificationKind === "amend";
+  if (uncertainModification) {
+    const pending = row.provider_metadata?.pending_modification;
+    const modificationLine = document.createElement("span");
+    if (pending && typeof pending === "object") {
+      const pendingPrice = pending.price && Number(pending.price) > 0
+        ? `${Number(pending.price).toLocaleString("ko-KR")}원`
+        : "가격 없음";
+      modificationLine.textContent = `요청한 ${uncertainAmendment ? "정정" : "취소"}: ${pending.quantity || "-"}주 · ${pending.order_type || request.order_type || "유형 미확인"} ${pendingPrice} · ${pending.route || request.route || "AUTO"}`;
+    } else {
+      modificationLine.textContent = `요청한 ${uncertainAmendment ? "정정" : "취소"}: 구버전 기록이라 상세값 없음 · HTS 원주문 ${row.provider_order_id}`;
+    }
+    elements.orderResolutionSummary.append(modificationLine);
+  }
+  if (state.orderResolutionCandidates.length) {
+    const heading = document.createElement("span");
+    heading.textContent = `이번 대조 후보 ${state.orderResolutionCandidates.length}건 — 주문번호와 원주문 관계를 각각 확인하세요.`;
+    elements.orderResolutionSummary.append(heading);
+    state.orderResolutionCandidates.forEach(candidate => {
+      const candidateLine = document.createElement("span");
+      candidateLine.textContent = orderResolutionCandidateLine(candidate);
+      elements.orderResolutionSummary.append(candidateLine);
+    });
+  } else if (Number(row.provider_metadata?.candidate_count || 0) > 0) {
+    const candidateHint = document.createElement("span");
+    candidateHint.textContent = "저장된 후보가 있습니다. 다시 대조를 누르면 현재 HTS 후보 상세를 표시합니다.";
+    elements.orderResolutionSummary.append(candidateHint);
+  }
+  elements.orderResolutionLinkSection.hidden = uncertainModification && !uncertainAmendment;
+  elements.orderResolutionLinkTitle.textContent = uncertainAmendment
+    ? "2. 새 정정 주문번호와 연결"
+    : "2. HTS 주문번호와 연결";
+  elements.orderResolutionLinkDescription.textContent = uncertainAmendment
+    ? "HTS의 정정 주문내역에 새 주문번호가 있다면 입력하세요. 원주문과 정정 내용이 일치할 때만 연결됩니다."
+    : "HTS에 주문이 있다면 표시된 주문번호를 입력하세요. 종목·방향·수량이 일치할 때만 연결됩니다.";
+  elements.orderResolutionProviderLabel.textContent = uncertainAmendment
+    ? "새 정정 주문번호"
+    : "증권사 주문번호";
+  elements.orderResolutionProviderId.placeholder = uncertainAmendment
+    ? "HTS 새 정정 주문번호"
+    : "HTS 주문번호";
+  elements.orderResolutionLink.textContent = uncertainAmendment
+    ? "정정 주문과 연결"
+    : "주문과 연결";
+  elements.orderResolutionRejectTitle.textContent = uncertainModification
+    ? "3. HTS에서 정정·취소 미접수 확인"
+    : "3. HTS에서 미접수 확인";
+  elements.orderResolutionRejectDescription.textContent = uncertainModification
+    ? "원주문은 조회되지만 해당 정정·취소 요청이 없고 원주문이 유지 중일 때만 선택하세요."
+    : "주문·미체결·체결내역 어디에도 해당 주문이 없을 때만 선택하세요.";
+  elements.orderResolutionConfirmText.textContent = uncertainModification
+    ? "HTS에서 정정·취소 요청이 접수되지 않았고 원주문이 유지 중임을 직접 확인했습니다."
+    : "HTS에서 해당 주문이 접수되지 않았음을 직접 확인했습니다.";
+  elements.orderResolutionNotAccepted.textContent = uncertainModification
+    ? "원주문 상태로 복원"
+    : "미접수로 확정";
+  elements.orderResolutionProviderId.value = "";
+  elements.orderResolutionNotAcceptedConfirm.checked = false;
+  elements.orderResolutionNotAccepted.disabled = true;
+  elements.orderResolutionModal.hidden = false;
+  if (elements.orderResolutionLinkSection.hidden) {
+    elements.orderResolutionNotAcceptedConfirm.focus();
+  } else {
+    elements.orderResolutionProviderId.focus();
+  }
+}
+
+function closeOrderResolution() {
+  elements.orderResolutionModal.hidden = true;
+  state.resolvingOrder = null;
+  state.orderResolutionCandidates = [];
+}
+
+async function reconcileSelectedOrder() {
+  const row = state.resolvingOrder;
+  if (!row) return;
+  const result = await api(`/api/runtime/orders/${encodeURIComponent(row.id)}/reconcile`, { method: "POST" });
+  const reconciledOrder = result.order || row;
+  if (result.resolved || reconciledOrder.status !== "UNKNOWN_RECONCILING") {
+    closeOrderResolution();
+    notify("증권사 주문내역과 자동으로 연결했습니다.");
+  } else {
+    state.resolvingOrder = reconciledOrder;
+    openOrderResolution(reconciledOrder, result.candidates || []);
+    notify("일치하는 주문을 하나로 확정하지 못했습니다. HTS 내역을 확인해 주세요.", true);
+  }
+  await Promise.all([refreshOrders(), refreshStatus()]);
+}
+
+async function linkSelectedBrokerOrder() {
+  const row = state.resolvingOrder;
+  if (!row) return;
+  const uncertainAmendment = Boolean(
+    row.provider_order_id && row.provider_metadata?.uncertain_modification === "amend"
+  );
+  const providerOrderId = elements.orderResolutionProviderId.value.trim();
+  if (!providerOrderId) {
+    elements.orderResolutionProviderId.focus();
+    notify(
+      uncertainAmendment
+        ? "HTS에 표시된 새 정정 주문번호를 입력하세요."
+        : "HTS에 표시된 증권사 주문번호를 입력하세요.",
+      true,
+    );
+    return;
+  }
+  await api(`/api/runtime/orders/${encodeURIComponent(row.id)}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({
+      action: "LINK",
+      provider_order_id: providerOrderId,
+      confirmation: "HTS_LINK_CONFIRMED",
+    }),
+  });
+  closeOrderResolution();
+  await Promise.all([refreshOrders(), refreshStatus()]);
+  notify(
+    uncertainAmendment
+      ? "HTS 정정 주문과 연결하여 주문 상태를 복구했습니다."
+      : "HTS 주문과 연결하여 주문 상태를 복구했습니다.",
+  );
+}
+
+async function markSelectedOrderNotAccepted() {
+  const row = state.resolvingOrder;
+  if (!row || !elements.orderResolutionNotAcceptedConfirm.checked) return;
+  const uncertainModification = Boolean(
+    row.provider_order_id && row.provider_metadata?.uncertain_modification
+  );
+  await api(`/api/runtime/orders/${encodeURIComponent(row.id)}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({
+      action: "NOT_ACCEPTED",
+      provider_order_id: null,
+      confirmation: "HTS_NOT_ACCEPTED",
+    }),
+  });
+  closeOrderResolution();
+  await Promise.all([refreshOrders(), refreshStatus()]);
+  notify(uncertainModification
+    ? "HTS 확인에 따라 정정·취소 미접수로 처리하고 원주문 상태를 복원했습니다."
+    : "HTS 확인에 따라 미접수 주문으로 확정했습니다.");
+}
+
 function renderOrders(rows) {
   elements.orders.replaceChildren();
   if (!rows.length) {
@@ -7479,7 +7747,7 @@ function renderOrders(rows) {
     }) : "";
     const route = request.route || "AUTO";
     const left = document.createElement("span");
-    left.textContent = `${orderType} · ${route}`;
+    left.textContent = `${orderType} · ${route} · 계좌 ${row.account_alias || "미확인"}`;
     const right = document.createElement("time");
     right.textContent = created;
     meta.append(left, right);
@@ -7491,16 +7759,64 @@ function renderOrders(rows) {
       message.textContent = row.message;
       item.append(message);
     }
+    if (row.status === "UNKNOWN_RECONCILING") {
+      const detail = unknownOrderDetail(row);
+      const unknown = document.createElement("div");
+      unknown.className = "order-unknown-detail";
+      const heading = document.createElement("strong");
+      heading.textContent = detail.origin;
+      const body = document.createElement("span");
+      body.textContent = `${detail.technical ? `${detail.technical} · ` : ""}최근 대조 ${detail.lastChecked} · 일치 후보 ${detail.candidateCount}`;
+      unknown.append(heading, body);
+      const actions = document.createElement("div");
+      actions.className = "order-item-actions";
+      const resolve = document.createElement("button");
+      resolve.className = "button quiet";
+      resolve.type = "button";
+      resolve.textContent = "주문 확인·해결";
+      resolve.addEventListener("click", () => openOrderResolution(row));
+      actions.append(resolve);
+      item.append(unknown, actions);
+    }
+    const selectedStrategyId = state.strategySummary?.strategy_id
+      || state.strategyPermission?.strategy_id;
+    if (
+      row.strategy_id
+      && selectedStrategyId
+      && row.strategy_id !== selectedStrategyId
+    ) {
+      const owner = document.createElement("div");
+      owner.className = "order-owner-note";
+      owner.textContent = `계좌 ${row.account_alias || "미확인"} · 다른 전략에서 발생한 확인 필요 주문`;
+      item.append(owner);
+    }
     elements.orders.append(item);
   }
 }
 
 async function refreshOrders() {
   const query = new URLSearchParams({ limit: "100" });
-  if (state.strategyPermission?.strategy_id) {
-    query.set("strategy_id", state.strategyPermission.strategy_id);
+  const selectedStrategyId = state.strategySummary?.strategy_id
+    || state.strategyPermission?.strategy_id;
+  if (selectedStrategyId) {
+    query.set("strategy_id", selectedStrategyId);
   }
-  const rows = await api(`/api/runtime/orders?${query}`);
+  const accountAlias = state.strategySummary?.trading_account;
+  const accountUnknownQuery = new URLSearchParams({
+    unknown_only: "true",
+    limit: "1000",
+  });
+  if (accountAlias) accountUnknownQuery.set("account_alias", accountAlias);
+  const [strategyRows, accountUnknown] = await Promise.all([
+    api(`/api/runtime/orders?${query}`),
+    accountAlias ? api(`/api/runtime/orders?${accountUnknownQuery}`) : Promise.resolve([]),
+  ]);
+  const seen = new Set();
+  const rows = [...accountUnknown, ...strategyRows].filter(row => {
+    if (!row?.id || seen.has(row.id)) return false;
+    seen.add(row.id);
+    return true;
+  });
   renderOrders(rows);
 }
 
@@ -8552,6 +8868,29 @@ document.querySelector("#account-balance-close").addEventListener("click", close
 elements.accountBalanceModal.addEventListener("click", event => {
   if (event.target === elements.accountBalanceModal) closeAccountBalance();
 });
+document.querySelector("#order-resolution-close").addEventListener("click", closeOrderResolution);
+document.querySelector("#order-resolution-retry").addEventListener("click", event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  reconcileSelectedOrder().catch(error => notify(error.message, true)).finally(() => { button.disabled = false; });
+});
+document.querySelector("#order-resolution-link").addEventListener("click", event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  linkSelectedBrokerOrder().catch(error => notify(error.message, true)).finally(() => { button.disabled = false; });
+});
+elements.orderResolutionNotAcceptedConfirm.addEventListener("change", event => {
+  elements.orderResolutionNotAccepted.disabled = !event.currentTarget.checked;
+});
+elements.orderResolutionNotAccepted.addEventListener("click", event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  markSelectedOrderNotAccepted().catch(error => notify(error.message, true)).finally(() => {
+    if (!elements.orderResolutionModal.hidden) {
+      button.disabled = !elements.orderResolutionNotAcceptedConfirm.checked;
+    }
+  });
+});
 document.querySelectorAll("[data-settings-tab]").forEach(button => {
   button.addEventListener("click", () => activateSettingsTab(button.dataset.settingsTab));
 });
@@ -8653,6 +8992,10 @@ document.querySelector("#account-form").addEventListener("submit", async event =
 });
 
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !elements.orderResolutionModal.hidden) {
+    closeOrderResolution();
+    return;
+  }
   if (event.key === "Escape" && !elements.accountBalanceModal.hidden) {
     closeAccountBalance();
     return;

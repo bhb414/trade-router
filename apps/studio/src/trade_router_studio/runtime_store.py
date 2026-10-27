@@ -871,18 +871,46 @@ class RuntimeStore:
         strategy_id: str | None = None,
         account_alias: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self.orders(
-            strategy_id=strategy_id,
-            account_alias=account_alias,
-            statuses=(
-                OrderStatus.SUBMITTING,
-                OrderStatus.ACKNOWLEDGED,
-                OrderStatus.PARTIALLY_FILLED,
-                OrderStatus.CANCEL_PENDING,
-                OrderStatus.UNKNOWN_RECONCILING,
-            ),
-            limit=1_000,
+        statuses = (
+            OrderStatus.SUBMITTING.value,
+            OrderStatus.ACKNOWLEDGED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+            OrderStatus.CANCEL_PENDING.value,
+            OrderStatus.UNKNOWN_RECONCILING.value,
         )
+        clauses = ["status IN (" + ",".join("?" for _ in statuses) + ")"]
+        values: list[object] = list(statuses)
+        if strategy_id:
+            clauses.append("strategy_id = ?")
+            values.append(strategy_id)
+        if account_alias:
+            clauses.append("account_alias = ?")
+            values.append(account_alias)
+        rows = self._fetchall(
+            "SELECT rowid AS accounting_sequence, * FROM order_ledger WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC, rowid DESC",
+            values,
+        )
+        return [self._order_row(row) for row in rows]
+
+    def unresolved_order_account_aliases(self) -> tuple[str, ...]:
+        """Return every account with unresolved orders, without a row limit."""
+
+        statuses = (
+            OrderStatus.SUBMITTING.value,
+            OrderStatus.ACKNOWLEDGED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+            OrderStatus.CANCEL_PENDING.value,
+            OrderStatus.UNKNOWN_RECONCILING.value,
+        )
+        rows = self._fetchall(
+            "SELECT DISTINCT account_alias FROM order_ledger "
+            "WHERE status IN (" + ",".join("?" for _ in statuses) + ") "
+            "ORDER BY account_alias",
+            statuses,
+        )
+        return tuple(str(row["account_alias"]) for row in rows)
 
     def _accounting_fill_events(self, *, account_alias: str | None = None) -> list[dict[str, Any]]:
         clauses = ["CAST(filled_quantity AS REAL) > 0"]
@@ -1171,17 +1199,30 @@ class RuntimeStore:
         return self._order_row(row) if row is not None else None
 
     def order_by_provider_id(
-        self, account_alias: str, provider_order_id: str
+        self,
+        account_alias: str,
+        provider_order_id: str,
+        *,
+        business_date: str | None = None,
     ) -> dict[str, Any] | None:
-        row = self._fetchone(
+        if business_date is None:
+            query = """
+                SELECT ledger.* FROM order_provider_ids AS aliases
+                JOIN order_ledger AS ledger ON ledger.id = aliases.order_id
+                WHERE aliases.account_alias = ? AND aliases.provider_order_id = ?
+                ORDER BY ledger.created_at DESC LIMIT 1
             """
-            SELECT ledger.* FROM order_provider_ids AS aliases
-            JOIN order_ledger AS ledger ON ledger.id = aliases.order_id
-            WHERE aliases.account_alias = ? AND aliases.provider_order_id = ?
-            ORDER BY ledger.created_at DESC LIMIT 1
-            """,
-            (account_alias, provider_order_id),
-        )
+            parameters: tuple[object, ...] = (account_alias, provider_order_id)
+        else:
+            query = """
+                SELECT ledger.* FROM order_provider_ids AS aliases
+                JOIN order_ledger AS ledger ON ledger.id = aliases.order_id
+                WHERE aliases.account_alias = ? AND aliases.provider_order_id = ?
+                  AND substr(ledger.created_at, 1, 10) = ?
+                ORDER BY ledger.created_at DESC LIMIT 1
+            """
+            parameters = (account_alias, provider_order_id, business_date)
+        row = self._fetchone(query, parameters)
         return self._order_row(row) if row is not None else None
 
     def set_order_permission(

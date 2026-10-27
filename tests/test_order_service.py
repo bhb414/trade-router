@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+import json
+from dataclasses import replace
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from trade_router import (
     AccountOrder,
@@ -22,7 +26,11 @@ from trade_router import (
     RouterError,
     RouterErrorCode,
 )
-from trade_router_studio.orders import OrderService
+from trade_router_studio.orders import (
+    OrderService,
+    _broker_order_matches_unknown,
+    _provider_notice_event_key,
+)
 from trade_router_studio.runtime_store import RuntimeStore
 from trade_router_studio.sessions import StrategyManifest
 
@@ -244,6 +252,169 @@ def market_buy(client_order_id: str = "005930-buy-1") -> OrderRequest:
     )
 
 
+def _unknown_request_payload(code: str = "005930") -> dict[str, object]:
+    return {
+        "code": code,
+        "country": "KR",
+        "asset": "EQUITY",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "quantity": "1",
+        "price": None,
+        "route": "AUTO",
+        "provider_options": {},
+    }
+
+
+def _unknown_candidate(
+    provider_order_id: str,
+    ordered_at: datetime,
+    *,
+    code: str = "005930",
+    quantity: str = "1",
+) -> AccountOrder:
+    return AccountOrder(
+        provider_order_id=provider_order_id,
+        account_alias="broker-account",
+        instrument=InstrumentId(code),
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        status=OrderStatus.ACKNOWLEDGED,
+        requested_quantity=Decimal(quantity),
+        filled_quantity=Decimal("0"),
+        remaining_quantity=Decimal(quantity),
+        ordered_at=ordered_at,
+        provider="contract-simulation",
+        route=OrderRoute.KRX,
+    )
+
+
+class HistoricalOrderGateway(SimulationGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.history: dict[date, tuple[AccountOrder, ...]] = {}
+        self.order_queries: list[tuple[str, date | None]] = []
+        self.fresh_queries: list[bool] = []
+
+    async def account_orders(
+        self, *_: object, **kwargs: object
+    ) -> tuple[AccountOrder, ...]:
+        state = str(kwargs.get("state") or "all")
+        business_date = kwargs.get("business_date")
+        assert business_date is None or isinstance(business_date, date)
+        self.order_queries.append((state, business_date))
+        self.fresh_queries.append(bool(kwargs.get("fresh")))
+        if state == "open":
+            return ()
+        return self.history.get(
+            business_date or datetime.now(SEOUL).date(), ()
+        )
+
+
+def test_unknown_match_allows_sor_execution_venue_but_keeps_explicit_routes_exact() -> None:
+    submitted_at = datetime.now(SEOUL).replace(microsecond=0)
+    row = {
+        "id": "route-match",
+        "created_at": submitted_at.isoformat(),
+        "updated_at": submitted_at.isoformat(),
+        "provider_metadata": {"first_unknown_at": submitted_at.isoformat()},
+        "request": {**_unknown_request_payload(), "route": "SOR"},
+    }
+    krx = replace(
+        _unknown_candidate("krx-child", submitted_at), route=OrderRoute.KRX
+    )
+    nxt = replace(
+        _unknown_candidate("nxt-child", submitted_at), route=OrderRoute.NXT
+    )
+    assert _broker_order_matches_unknown(row, krx, enforce_time_window=True)
+    assert _broker_order_matches_unknown(row, nxt, enforce_time_window=True)
+
+    explicit_krx = {**row, "request": {**row["request"], "route": "KRX"}}
+    assert not _broker_order_matches_unknown(
+        explicit_krx, nxt, enforce_time_window=True
+    )
+
+
+def test_legacy_unknown_without_first_unknown_does_not_use_late_updated_at() -> None:
+    submitted_at = datetime.now(SEOUL).replace(microsecond=0)
+    row = {
+        "id": "legacy-time-window",
+        "created_at": submitted_at.isoformat(),
+        "updated_at": (submitted_at + timedelta(hours=4)).isoformat(),
+        "provider_metadata": {},
+        "request": _unknown_request_payload(),
+    }
+    for seconds in (30, 90):
+        candidate = _unknown_candidate(
+            f"manual-{seconds}", submitted_at + timedelta(seconds=seconds)
+        )
+        assert not _broker_order_matches_unknown(
+            row, candidate, enforce_time_window=True
+        )
+
+
+def test_legacy_unknown_first_reconcile_keeps_submission_time_window(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "legacy-reconcile-window.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(day, time(9, 0), tzinfo=SEOUL)
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="legacy-reconcile-window",
+                request=_unknown_request_payload(),
+            )
+            row = store.update_order(
+                str(row["id"]), status=OrderStatus.UNKNOWN_RECONCILING
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (
+                        submitted_at.isoformat(),
+                        (submitted_at + timedelta(hours=4)).isoformat(),
+                        row["id"],
+                    ),
+                )
+
+            first = await service.reconcile_unknown_order(str(row["id"]))
+            assert first["match_result"] == "none"
+            after_first = store.order(str(row["id"]))
+            assert after_first["provider_metadata"]["first_unknown_at"] == submitted_at.isoformat()
+
+            gateway.history[day] = tuple(
+                _unknown_candidate(
+                    f"late-{seconds}", submitted_at + timedelta(seconds=seconds)
+                )
+                for seconds in (30, 90)
+            )
+            second = await service.reconcile_unknown_order(str(row["id"]))
+            assert second["match_result"] == "none"
+            assert second["candidate_count"] == 0
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_provider_notice_event_key_is_scoped_to_business_date() -> None:
+    notice = {
+        "provider_order_id": "000123",
+        "execution_code": "2",
+        "time": "093001",
+    }
+    first = _provider_notice_event_key(notice, "2026-10-26")
+    repeated = _provider_notice_event_key(notice, "2026-10-26")
+    next_day = _provider_notice_event_key(notice, "2026-10-27")
+    assert first == repeated
+    assert first != next_day
+
+
 def test_provider_neutral_order_pipeline_is_idempotent(tmp_path: Path) -> None:
     async def run(provider: str) -> None:
         store = RuntimeStore(tmp_path / f"{provider}.sqlite3")
@@ -367,6 +538,111 @@ def test_startup_reconciliation_persists_fill_quantity_for_ownership(
             assert store.strategy_position_quantities("neutral-strategy") == {
                 "005930": Decimal("1")
             }
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_startup_reconciliation_publishes_unknown_resolution_before_gate(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "startup-unknown-publish.sqlite3")
+        gateway = SimulationGateway()
+        published: list[dict[str, object]] = []
+
+        async def publish(
+            _strategy_id: str,
+            event: dict[str, object],
+            _strategy_name: str | None,
+        ) -> None:
+            published.append(event)
+
+        service = OrderService(store, gateway, event_publisher=publish)
+        try:
+            submitted_at = datetime.now(SEOUL).replace(microsecond=0)
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="startup-unknown-publish",
+                request=_unknown_request_payload(),
+            )
+            row = store.update_order(
+                str(row["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), submitted_at.isoformat(), row["id"]),
+                )
+            gateway.orders = (
+                replace(
+                    _unknown_candidate("startup-provider", submitted_at),
+                    status=OrderStatus.FILLED,
+                    filled_quantity=Decimal("1"),
+                    remaining_quantity=Decimal("0"),
+                    average_fill_price=Decimal("73000"),
+                ),
+            )
+
+            result = await service.reconcile_account("broker-account")
+
+            assert result["reconciled"] is True
+            assert [event["event_type"] for event in published] == ["order", "fill"]
+            stored = store.order(str(row["id"]))
+            assert stored["status"] == "FILLED"
+            assert store.events(event_types=("order.reconciled",), limit=1)[0][
+                "details"
+            ]["order_id"] == row["id"]
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_account_reconciliation_does_not_cap_unresolved_rows_at_one_thousand(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unbounded-account-reconcile.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            broker_orders: list[AccountOrder] = []
+            for index in range(1_001):
+                code = f"{index + 1:06d}"
+                row, _ = store.reserve_order(
+                    strategy_id="neutral-strategy",
+                    account_alias="broker-account",
+                    client_order_id=f"unbounded-{index}",
+                    request={
+                        **_unknown_request_payload(),
+                        "code": code,
+                    },
+                )
+                provider_id = f"provider-{index}"
+                store.update_order(
+                    str(row["id"]),
+                    status=OrderStatus.ACKNOWLEDGED,
+                    provider_order_id=provider_id,
+                )
+                broker_orders.append(
+                    _unknown_candidate(
+                        provider_id,
+                        datetime.now(SEOUL),
+                        code=code,
+                    )
+                )
+            gateway.orders = tuple(broker_orders)
+
+            result = await service.reconcile_account("broker-account")
+
+            assert result["reconciled"] is True
+            assert result["broker_order_count"] == 1_001
+            assert len(store.unresolved_orders(account_alias="broker-account")) == 1_001
         finally:
             store.close()
 
@@ -858,6 +1134,728 @@ def test_realtime_fill_notice_is_idempotent(tmp_path: Path) -> None:
             assert store.order(order.id)["filled_quantity"] == "1"
             assert len(store.fills(order_id=order.id)) == 1
             assert [event["event_type"] for event in events].count("fill") == 1
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_unknown_submit_metadata_and_historical_unique_match_excludes_linked_order(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unknown-historical.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            gateway.fail_with = RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                "response lost",
+                details={
+                    "unknown_origin": "transport_error",
+                    "exception_type": "ReadTimeout",
+                    "winerror": 10060,
+                },
+            )
+            unknown = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="150000"),
+                request=market_buy("historical-unknown"),
+            )
+            unknown_row = store.order(unknown.id)
+            assert unknown_row is not None
+            metadata = unknown_row["provider_metadata"]
+            assert metadata["unknown_origin"] == "transport_error"
+            assert metadata["exception_type"] == "ReadTimeout"
+            assert metadata["winerror"] == 10060
+            assert metadata["first_unknown_at"]
+            assert metadata["match_result"] == "not_checked"
+            unknown_event = store.events(
+                event_types=("order.unknown",), limit=1
+            )[0]
+            assert "response lost" not in unknown_event["message"]
+            assert unknown_event["details"] == {
+                "order_id": unknown.id,
+                "unknown_origin": "transport_error",
+                "failure_phase": "submit",
+                "provider_id_present": False,
+                "exception_type": "ReadTimeout",
+                "winerror": 10060,
+                "code": "ORDER_STATUS_UNKNOWN",
+            }
+
+            linked, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="already-linked",
+                request=_unknown_request_payload(),
+            )
+            store.update_order(
+                str(linked["id"]),
+                status=OrderStatus.ACKNOWLEDGED,
+                provider_order_id="broker-linked",
+            )
+            previous_day = datetime.now(SEOUL).date() - timedelta(days=1)
+            submitted_at = datetime.combine(
+                previous_day, time(9, 42, 35), tzinfo=SEOUL
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), submitted_at.isoformat(), unknown.id),
+                )
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (
+                        (submitted_at - timedelta(minutes=5)).isoformat(),
+                        (submitted_at - timedelta(minutes=5)).isoformat(),
+                        linked["id"],
+                    ),
+                )
+            gateway.fail_with = None
+            gateway.history[previous_day] = (
+                _unknown_candidate(
+                    "broker-linked", submitted_at - timedelta(seconds=9)
+                ),
+                _unknown_candidate(
+                    "broker-recovered", submitted_at + timedelta(seconds=2)
+                ),
+            )
+
+            refreshed = await service.refresh_unresolved_orders("broker-account")
+
+            assert [row["id"] for row in refreshed] == [unknown.id]
+            recovered = store.order(unknown.id)
+            assert recovered is not None
+            assert recovered["status"] == OrderStatus.ACKNOWLEDGED.value
+            assert recovered["provider_order_id"] == "broker-recovered"
+            assert recovered["provider_metadata"]["resolution"] == "auto_linked"
+            assert ("all", previous_day) in gateway.order_queries
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_unknown_auto_match_keeps_zero_and_multiple_candidates_unresolved(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unknown-candidates.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(day, time(10, 0), tzinfo=SEOUL)
+            rows: dict[str, dict[str, object]] = {}
+            for code in ("005930", "000660"):
+                row, _ = store.reserve_order(
+                    strategy_id="neutral-strategy",
+                    account_alias="broker-account",
+                    client_order_id=f"unknown-{code}",
+                    request=_unknown_request_payload(code),
+                )
+                row = store.update_order(
+                    str(row["id"]),
+                    status=OrderStatus.UNKNOWN_RECONCILING,
+                    provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+                )
+                with store._connection:
+                    store._connection.execute(
+                        "UPDATE order_ledger SET created_at = ? WHERE id = ?",
+                        (submitted_at.isoformat(), row["id"]),
+                    )
+                rows[code] = row
+            gateway.history[day] = (
+                # Identical but five minutes before the router submit: it can
+                # be linked manually by id, never by the automatic matcher.
+                _unknown_candidate(
+                    "early-manual",
+                    submitted_at - timedelta(minutes=5),
+                    code="005930",
+                ),
+                _unknown_candidate(
+                    "late-manual-30s",
+                    submitted_at + timedelta(seconds=30),
+                    code="005930",
+                ),
+                _unknown_candidate(
+                    "late-manual-90s",
+                    submitted_at + timedelta(seconds=90),
+                    code="005930",
+                ),
+                _unknown_candidate("candidate-a", submitted_at, code="000660"),
+                _unknown_candidate(
+                    "candidate-b", submitted_at + timedelta(seconds=1), code="000660"
+                ),
+            )
+
+            none_result = await service.reconcile_unknown_order(
+                str(rows["005930"]["id"])
+            )
+            ambiguous_result = await service.reconcile_unknown_order(
+                str(rows["000660"]["id"])
+            )
+
+            assert none_result["resolved"] is False
+            assert none_result["match_result"] == "none"
+            assert none_result["candidate_count"] == 0
+            assert ambiguous_result["resolved"] is False
+            assert ambiguous_result["match_result"] == "ambiguous"
+            assert ambiguous_result["candidate_count"] == 2
+            assert all(
+                store.order(str(row["id"]))["provider_order_id"] is None
+                for row in rows.values()
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_provider_order_id_conflicts_are_scoped_to_business_date(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "provider-id-business-date.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            today = datetime.now(SEOUL).date()
+            previous_day = today - timedelta(days=1)
+            submitted_at = datetime.combine(today, time(9, 10), tzinfo=SEOUL)
+
+            prior, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="prior-day-reused-id",
+                request=_unknown_request_payload(),
+            )
+            store.update_order(
+                str(prior["id"]),
+                status=OrderStatus.ACKNOWLEDGED,
+                provider_order_id="reused-id",
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (
+                        datetime.combine(previous_day, time(9, 0), tzinfo=SEOUL).isoformat(),
+                        datetime.combine(previous_day, time(9, 0), tzinfo=SEOUL).isoformat(),
+                        prior["id"],
+                    ),
+                )
+
+            current, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="current-reused-id",
+                request=_unknown_request_payload(),
+            )
+            current = store.update_order(
+                str(current["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), submitted_at.isoformat(), current["id"]),
+                )
+            gateway.history[today] = (
+                _unknown_candidate("reused-id", submitted_at + timedelta(seconds=1)),
+            )
+
+            result = await service.reconcile_unknown_order(str(current["id"]))
+            assert result["resolved"] is True
+            assert store.order(str(current["id"]))["provider_order_id"] == "reused-id"
+
+            same_day_linked, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="same-day-linked",
+                request=_unknown_request_payload("000660"),
+            )
+            store.update_order(
+                str(same_day_linked["id"]),
+                status=OrderStatus.ACKNOWLEDGED,
+                provider_order_id="same-day-id",
+            )
+            same_day_unknown, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="same-day-unknown",
+                request=_unknown_request_payload("000660"),
+            )
+            same_day_unknown = store.update_order(
+                str(same_day_unknown["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), submitted_at.isoformat(), same_day_unknown["id"]),
+                )
+            gateway.history[today] = (
+                _unknown_candidate(
+                    "same-day-id",
+                    submitted_at + timedelta(seconds=1),
+                    code="000660",
+                ),
+            )
+
+            blocked = await service.reconcile_unknown_order(
+                str(same_day_unknown["id"])
+            )
+            assert blocked["resolved"] is False
+            assert blocked["candidate_count"] == 0
+            assert store.order(str(same_day_unknown["id"]))["provider_order_id"] is None
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_missing_broker_order_time_requires_manual_link_and_vetoes_not_accepted(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "missing-broker-time.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(day, time(9, 5), tzinfo=SEOUL)
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="kis-missing-time",
+                request=_unknown_request_payload(),
+            )
+            row = store.update_order(
+                str(row["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), submitted_at.isoformat(), row["id"]),
+                )
+            gateway.history[day] = (
+                replace(
+                    _unknown_candidate(
+                        "kis-no-time",
+                        datetime.combine(day, time(), tzinfo=SEOUL),
+                    ),
+                    provider="kis",
+                ),
+            )
+
+            automatic = await service.reconcile_unknown_order(str(row["id"]))
+            assert automatic["resolved"] is False
+            assert automatic["match_result"] == "manual_required_no_order_time"
+            assert automatic["candidate_count"] == 1
+            assert gateway.fresh_queries[-1] is True
+
+            with pytest.raises(RouterError) as vetoed:
+                await service.resolve_unknown_order(
+                    str(row["id"]),
+                    action="NOT_ACCEPTED",
+                    confirmation="HTS_NOT_ACCEPTED",
+                )
+            assert vetoed.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+            assert store.order(str(row["id"]))["provider_metadata"]["match_result"] == (
+                "manual_required_no_order_time"
+            )
+
+            linked = await service.resolve_unknown_order(
+                str(row["id"]),
+                action="LINK",
+                provider_order_id="kis-no-time",
+                confirmation="HTS_LINK_CONFIRMED",
+            )
+            assert linked["resolved"] is True
+            assert store.order(str(row["id"]))["provider_order_id"] == "kis-no-time"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_background_unknown_reconcile_backs_off_without_delaying_tracked_orders(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unknown-backoff.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="unknown-backoff",
+                request=_unknown_request_payload(),
+            )
+            row = store.update_order(
+                str(row["id"]), status=OrderStatus.UNKNOWN_RECONCILING
+            )
+
+            first = await service.refresh_unresolved_orders("broker-account")
+            first_query_count = len(gateway.order_queries)
+            first_stored = store.order(str(row["id"]))
+            assert first and first_query_count == 1
+            assert first_stored["provider_metadata"]["reconcile_attempt_count"] == 1
+
+            second = await service.refresh_unresolved_orders("broker-account")
+            second_stored = store.order(str(row["id"]))
+            assert second == []
+            assert len(gateway.order_queries) == first_query_count
+            assert second_stored["updated_at"] == first_stored["updated_at"]
+
+            due_metadata = dict(second_stored["provider_metadata"])
+            due_metadata["last_reconcile_at"] = (
+                datetime.now(SEOUL) - timedelta(seconds=6)
+            ).isoformat()
+            store.update_order(
+                str(row["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata=due_metadata,
+            )
+            await service.refresh_unresolved_orders("broker-account")
+            due_stored = store.order(str(row["id"]))
+            assert len(gateway.order_queries) == first_query_count + 1
+            assert due_stored["provider_metadata"]["reconcile_attempt_count"] == 2
+
+            tracked, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="tracked-order",
+                request=_unknown_request_payload("000660"),
+            )
+            store.update_order(
+                str(tracked["id"]),
+                status=OrderStatus.ACKNOWLEDGED,
+                provider_order_id="tracked-provider",
+            )
+            before_tracked_poll = len(gateway.order_queries)
+            await service.refresh_unresolved_orders("broker-account")
+            assert len(gateway.order_queries) > before_tracked_poll
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_background_uncertain_modification_with_provider_id_also_backs_off(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unknown-modification-backoff.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="uncertain-cancel-backoff",
+                request=_unknown_request_payload(),
+            )
+            row = store.update_order(
+                str(row["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_order_id="original-provider",
+                provider_metadata={
+                    "uncertain_modification": "cancel",
+                    "pending_modification": {
+                        "kind": "cancel",
+                        "previous_status": "ACKNOWLEDGED",
+                        "requested_at": str(row["created_at"]),
+                        "quantity": "1",
+                        "route": "AUTO",
+                    },
+                    "first_unknown_at": str(row["updated_at"]),
+                },
+            )
+            day = datetime.fromisoformat(str(row["created_at"])).astimezone(SEOUL).date()
+            gateway.history[day] = (
+                _unknown_candidate(
+                    "original-provider",
+                    datetime.fromisoformat(str(row["created_at"])),
+                ),
+            )
+
+            first = await service.refresh_unresolved_orders("broker-account")
+            first_query_count = len(gateway.order_queries)
+            first_stored = store.order(str(row["id"]))
+            assert first and first_query_count == 1
+            assert first_stored["status"] == "UNKNOWN_RECONCILING"
+            assert first_stored["provider_metadata"]["reconcile_attempt_count"] == 1
+
+            assert await service.refresh_unresolved_orders("broker-account") == []
+            assert len(gateway.order_queries) == first_query_count
+            assert store.order(str(row["id"]))["updated_at"] == first_stored["updated_at"]
+
+            due_metadata = dict(first_stored["provider_metadata"])
+            due_metadata["last_reconcile_at"] = (
+                datetime.now(SEOUL) - timedelta(seconds=6)
+            ).isoformat()
+            store.update_order(
+                str(row["id"]),
+                status=OrderStatus.UNKNOWN_RECONCILING,
+                provider_metadata=due_metadata,
+            )
+            await service.refresh_unresolved_orders("broker-account")
+            assert len(gateway.order_queries) == first_query_count + 1
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_unknown_manual_link_and_not_accepted_confirmation_are_guarded(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unknown-manual.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(day, time(9, 0), tzinfo=SEOUL)
+            link_row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="manual-link",
+                request=_unknown_request_payload(),
+            )
+            link_row = store.update_order(
+                str(link_row["id"]), status=OrderStatus.UNKNOWN_RECONCILING
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ? WHERE id = ?",
+                    (submitted_at.isoformat(), link_row["id"]),
+                )
+            # Outside the narrow automatic window, but still verifiable as
+            # an exact same-day request when the user supplies its broker id.
+            gateway.history[day] = (
+                _unknown_candidate(
+                    "manual-provider", submitted_at + timedelta(hours=2)
+                ),
+            )
+            automatic = await service.reconcile_unknown_order(str(link_row["id"]))
+            assert automatic["match_result"] == "none"
+            for missing_confirmation in ("", "WRONG_CONFIRMATION"):
+                try:
+                    await service.resolve_unknown_order(
+                        str(link_row["id"]),
+                        action="LINK",
+                        provider_order_id="manual-provider",
+                        confirmation=missing_confirmation,
+                    )
+                except RouterError as exc:
+                    assert exc.code is RouterErrorCode.INVALID_REQUEST
+                else:
+                    raise AssertionError("unconfirmed broker id was linked")
+            try:
+                await service.resolve_unknown_order(
+                    str(link_row["id"]),
+                    action="LINK",
+                    provider_order_id="does-not-exist",
+                    confirmation="HTS_LINK_CONFIRMED",
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.INVALID_REQUEST
+            else:
+                raise AssertionError("unknown broker id was linked")
+            linked = await service.resolve_unknown_order(
+                str(link_row["id"]),
+                action="LINK",
+                provider_order_id="manual-provider",
+                confirmation="HTS_LINK_CONFIRMED",
+            )
+            assert linked["resolved"] is True
+            assert store.order(str(link_row["id"]))["provider_order_id"] == "manual-provider"
+
+            rejected_row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="manual-not-accepted",
+                request=_unknown_request_payload("035420"),
+            )
+            rejected_row = store.update_order(
+                str(rejected_row["id"]), status=OrderStatus.UNKNOWN_RECONCILING
+            )
+            try:
+                await service.resolve_unknown_order(
+                    str(rejected_row["id"]), action="NOT_ACCEPTED"
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.INVALID_REQUEST
+            else:
+                raise AssertionError("missing confirmation marked order rejected")
+            rejected = await service.resolve_unknown_order(
+                str(rejected_row["id"]),
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+            assert rejected["resolved"] is True
+            stored_rejected = store.order(str(rejected_row["id"]))
+            assert stored_rejected["status"] == OrderStatus.REJECTED.value
+            assert (
+                stored_rejected["provider_metadata"]["resolution"]
+                == "manual_not_accepted"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_unexpected_submit_exception_records_safe_unknown_event(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "unexpected-unknown.sqlite3")
+        gateway = SimulationGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            gateway.fail_with = RuntimeError("secret response body")  # type: ignore[assignment]
+            unknown = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_order_amount="150000"),
+                request=market_buy("unexpected-unknown"),
+            )
+            assert unknown.status is OrderStatus.UNKNOWN_RECONCILING
+            event = store.events(event_types=("order.unknown",), limit=1)[0]
+            assert event["details"] == {
+                "order_id": unknown.id,
+                "unknown_origin": "unexpected_adapter_error",
+                "failure_phase": "submit",
+                "provider_id_present": False,
+                "exception_type": "RuntimeError",
+            }
+            assert "secret" not in json.dumps(event["details"])
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_restart_submitting_does_not_link_a_later_same_day_order(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "restart-submitting.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(day, time(9, 0), tzinfo=SEOUL)
+            row, _ = store.reserve_order(
+                strategy_id="neutral-strategy",
+                account_alias="broker-account",
+                client_order_id="crashed-submit",
+                request=_unknown_request_payload(),
+            )
+            with store._connection:
+                store._connection.execute(
+                    "UPDATE order_ledger SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (
+                        submitted_at.isoformat(),
+                        (submitted_at + timedelta(hours=3)).isoformat(),
+                        row["id"],
+                    ),
+                )
+            gateway.history[day] = (
+                _unknown_candidate(
+                    "later-manual", submitted_at + timedelta(hours=1)
+                ),
+            )
+
+            changed = await service.refresh_unresolved_orders("broker-account")
+
+            assert changed and changed[0]["status"] == "UNKNOWN_RECONCILING"
+            stored = store.order(str(row["id"]))
+            assert stored["provider_order_id"] is None
+            assert stored["provider_metadata"]["unknown_origin"] == "restart_submitting"
+            assert stored["provider_metadata"]["first_unknown_at"] == submitted_at.isoformat()
+            assert stored["provider_metadata"]["candidate_count"] == 0
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_not_accepted_ignores_far_order_but_vetoes_near_candidate(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "not-accepted-window.sqlite3")
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            day = datetime.now(SEOUL).date()
+            submitted_at = datetime.combine(day, time(9, 0), tzinfo=SEOUL)
+
+            async def unknown(code: str, suffix: str) -> dict[str, object]:
+                row, _ = store.reserve_order(
+                    strategy_id="neutral-strategy",
+                    account_alias="broker-account",
+                    client_order_id=f"not-accepted-{suffix}",
+                    request=_unknown_request_payload(code),
+                )
+                row = store.update_order(
+                    str(row["id"]),
+                    status=OrderStatus.UNKNOWN_RECONCILING,
+                    provider_metadata={"first_unknown_at": submitted_at.isoformat()},
+                )
+                with store._connection:
+                    store._connection.execute(
+                        "UPDATE order_ledger SET created_at = ? WHERE id = ?",
+                        (submitted_at.isoformat(), row["id"]),
+                    )
+                return row
+
+            far_row = await unknown("005930", "far")
+            near_row = await unknown("000660", "near")
+            gateway.history[day] = (
+                _unknown_candidate(
+                    "far-independent",
+                    submitted_at + timedelta(hours=2),
+                    code="005930",
+                ),
+                _unknown_candidate(
+                    "near-accepted",
+                    submitted_at + timedelta(seconds=2),
+                    code="000660",
+                ),
+            )
+
+            far_result = await service.resolve_unknown_order(
+                str(far_row["id"]),
+                action="NOT_ACCEPTED",
+                confirmation="HTS_NOT_ACCEPTED",
+            )
+            assert far_result["resolved"] is True
+            assert store.order(str(far_row["id"]))["status"] == "REJECTED"
+
+            try:
+                await service.resolve_unknown_order(
+                    str(near_row["id"]),
+                    action="NOT_ACCEPTED",
+                    confirmation="HTS_NOT_ACCEPTED",
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+                assert exc.details["candidate_count"] == 1
+            else:
+                raise AssertionError("near accepted order was marked not accepted")
+            assert store.order(str(near_row["id"]))["status"] == "UNKNOWN_RECONCILING"
         finally:
             store.close()
 

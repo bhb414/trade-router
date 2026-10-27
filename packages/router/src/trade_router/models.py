@@ -87,6 +87,10 @@ class AccountOrder:
     price: Decimal | None = None
     average_fill_price: Decimal | None = None
     route: OrderRoute = OrderRoute.AUTO
+    # Broker history can expose the parent order number for amend/cancel
+    # children.  Reconciliation must preserve this relation instead of
+    # inferring parentage from coincidentally identical order fields.
+    original_provider_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.provider_order_id.strip():
@@ -106,6 +110,10 @@ class AccountOrder:
             raise ValueError("Order price cannot be negative.")
         if self.average_fill_price is not None and self.average_fill_price < 0:
             raise ValueError("Average fill price cannot be negative.")
+        if self.original_provider_order_id is not None and not str(
+            self.original_provider_order_id
+        ).strip():
+            raise ValueError("Original provider order id cannot be blank.")
 
 
 @dataclass(frozen=True, slots=True)

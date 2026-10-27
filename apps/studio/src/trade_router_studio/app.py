@@ -203,6 +203,37 @@ class OrderPermissionRegistration(BaseModel):
     confirmation: str = ""
 
 
+class UnknownOrderResolutionRegistration(BaseModel):
+    action: Literal["LINK", "NOT_ACCEPTED"]
+    provider_order_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[^\s]+$",
+    )
+    confirmation: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_resolution_confirmation(
+        self,
+    ) -> "UnknownOrderResolutionRegistration":
+        if self.action == "LINK":
+            if self.provider_order_id is None:
+                raise ValueError("주문 연결에는 증권사 주문번호가 필요합니다.")
+            if self.confirmation != "HTS_LINK_CONFIRMED":
+                raise ValueError(
+                    "주문 연결에는 HTS_LINK_CONFIRMED 확인 문구가 필요합니다."
+                )
+        else:
+            if self.provider_order_id is not None:
+                raise ValueError("미접수 확정에는 증권사 주문번호를 보내지 마세요.")
+            if self.confirmation != "HTS_NOT_ACCEPTED":
+                raise ValueError(
+                    "미접수 확정에는 HTS_NOT_ACCEPTED 확인 문구가 필요합니다."
+                )
+        return self
+
+
 def _ast_value(
     node: ast.AST | None,
     bindings: dict[str, ast.AST] | None = None,
@@ -2255,12 +2286,125 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
     async def runtime_orders(
         limit: int = Query(default=200, ge=1, le=1_000),
         strategy_id: str | None = None,
+        account_alias: str | None = None,
         unresolved_only: bool = False,
+        unknown_only: bool = False,
     ) -> list[dict[str, object]]:
+        if unknown_only:
+            return journal().orders(
+                strategy_id=strategy_id,
+                account_alias=account_alias,
+                statuses=(OrderStatus.UNKNOWN_RECONCILING,),
+                limit=limit,
+            )
         if unresolved_only:
-            rows = journal().unresolved_orders(strategy_id=strategy_id)
+            rows = journal().unresolved_orders(
+                strategy_id=strategy_id,
+                account_alias=account_alias,
+            )
             return rows[:limit]
-        return journal().orders(strategy_id=strategy_id, limit=limit)
+        return journal().orders(
+            strategy_id=strategy_id,
+            account_alias=account_alias,
+            limit=limit,
+        )
+
+    def require_runtime_order(order_id: str) -> str:
+        normalized = order_id.strip()
+        if not normalized or len(normalized) > 128:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_ORDER_ID",
+                    "message": "주문 ID가 올바르지 않습니다.",
+                },
+            )
+        if journal().order(normalized) is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ORDER_NOT_FOUND",
+                    "message": "주문을 찾지 못했습니다.",
+                },
+            )
+        return normalized
+
+    def unknown_order_http_error(exc: RouterError) -> HTTPException:
+        if exc.code is RouterErrorCode.INVALID_REQUEST:
+            status_code = 400
+        else:
+            status_code = 409
+        return HTTPException(status_code=status_code, detail=exc.as_dict())
+
+    def record_unknown_order_api_failure(
+        *,
+        order_id: str,
+        operation: str,
+        exc: Exception,
+    ) -> None:
+        journal().record(
+            source="system",
+            event_type="order.unknown_resolution_error",
+            message="미확정 주문 확인 중 내부 오류가 발생했습니다.",
+            details={
+                "source_kind": "system",
+                "order_id": order_id,
+                "operation": operation,
+                "exception_type": type(exc).__name__,
+            },
+        )
+
+    @app.post("/api/runtime/orders/{order_id}/reconcile")
+    async def reconcile_unknown_runtime_order(order_id: str) -> dict[str, object]:
+        normalized = require_runtime_order(order_id)
+        try:
+            return await order_engine().reconcile_unknown_order(normalized)
+        except RouterError as exc:
+            raise unknown_order_http_error(exc) from exc
+        except Exception as exc:
+            record_unknown_order_api_failure(
+                order_id=normalized,
+                operation="reconcile",
+                exc=exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "UNKNOWN_ORDER_RECONCILIATION_FAILED",
+                    "message": "미확정 주문을 다시 대조하지 못했습니다.",
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
+
+    @app.post("/api/runtime/orders/{order_id}/resolve")
+    async def resolve_unknown_runtime_order(
+        order_id: str,
+        body: UnknownOrderResolutionRegistration,
+    ) -> dict[str, object]:
+        normalized = require_runtime_order(order_id)
+        try:
+            return await order_engine().resolve_unknown_order(
+                normalized,
+                action=body.action,
+                provider_order_id=body.provider_order_id,
+                confirmation=body.confirmation,
+            )
+        except RouterError as exc:
+            raise unknown_order_http_error(exc) from exc
+        except Exception as exc:
+            record_unknown_order_api_failure(
+                order_id=normalized,
+                operation="resolve",
+                exc=exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "UNKNOWN_ORDER_RESOLUTION_FAILED",
+                    "message": "미확정 주문을 해결하지 못했습니다.",
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
 
     @app.get("/api/runtime/order-permissions")
     async def runtime_order_permissions() -> list[dict[str, object]]:
@@ -3486,6 +3630,7 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             "orders": [
                 {
                     "provider_order_id": order.provider_order_id,
+                    "original_provider_order_id": order.original_provider_order_id,
                     "account_alias": order.account_alias,
                     "instrument": {
                         "code": order.instrument.code,

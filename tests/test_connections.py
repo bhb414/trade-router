@@ -7,6 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
 
 from decimal import Decimal
 
@@ -28,6 +29,8 @@ from trade_router_studio.connections import (
     _is_market_minute,
     _parse_period_row,
     _parse_kis_account_order,
+    _normalize_kis_account_orders,
+    _normalize_namuh_account_orders,
 )
 from trade_router_studio.paths import WorkspacePaths
 from trade_router_studio.settings import SettingsStore
@@ -125,6 +128,7 @@ def test_kis_best_limit_history_keeps_type_with_zero_or_assigned_price() -> None
     ):
         order = _parse_kis_account_order({
             "odno": "000123", "pdno": "005930", "sll_buy_dvsn_cd": "01",
+            "orgn_odno": "000122",
             "ord_dvsn_cd": division, "ord_dvsn_name": name,
             "ord_qty": "3", "tot_ccld_qty": "1", "rmn_qty": "2",
             "ord_unpr": price, "avg_prvs": "73000",
@@ -136,6 +140,33 @@ def test_kis_best_limit_history_keeps_type_with_zero_or_assigned_price() -> None
         assert order.status is OrderStatus.PARTIALLY_FILLED
         assert order.remaining_quantity == 2
         assert order.route is OrderRoute.NXT
+        assert order.original_provider_order_id == "000122"
+
+
+def test_kis_amendment_child_without_time_preserves_parent_relation() -> None:
+    order = _parse_kis_account_order(
+        {
+            "odno": "000124",
+            "orgn_odno": "000123",
+            "pdno": "005930",
+            "sll_buy_dvsn_cd": "02",
+            "ord_dvsn_cd": "03",
+            "ord_qty": "2",
+            "tot_ccld_qty": "0",
+            "rmn_qty": "2",
+            "ord_unpr": "0",
+            "ord_dt": "20261027",
+            # Some KIS history responses omit ord_tmd. Midnight is an
+            # explicit sentinel and must force manual rather than auto link.
+            "excg_id_dvsn_cd": "KRX",
+        },
+        "paper-account",
+        datetime(2026, 10, 27).date(),
+    )
+
+    assert order is not None
+    assert order.original_provider_order_id == "000123"
+    assert order.ordered_at.strftime("%H%M%S") == "000000"
 
 
 def test_namuh_best_limit_rejected_before_any_broker_request(tmp_path: Path) -> None:
@@ -1115,6 +1146,9 @@ def test_namuh_paper_account_orders_and_order_changes_use_official_contract(
                         "Output_0": [
                             {
                                 "itg_orr_no": "0000000030",
+                                "org_mkt_orr_no": "0000000029",
+                                "orr_dt": datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d"),
+                                "orr_tm": "101530",
                                 "iem_cd": "005930",
                                 "sby_dit_cd_nm": "매수",
                                 "nmn_pr_tp_cd_nm": "보통가",
@@ -1198,6 +1232,8 @@ def test_namuh_paper_account_orders_and_order_changes_use_official_contract(
             assert balance.positions[0].available_quantity == 1
             orders = await runtime.account_orders("nh-paper-account", state="open")
             assert orders[0].status is OrderStatus.PARTIALLY_FILLED
+            assert orders[0].ordered_at.strftime("%H%M%S") == "101530"
+            assert orders[0].original_provider_order_id == "29"
             power = await runtime.buying_power(
                 "nh-paper-account", "005930", order_type=OrderType.MARKET
             )
@@ -1235,6 +1271,170 @@ def test_namuh_paper_account_orders_and_order_changes_use_official_contract(
                 "/krstock/order/v1/modify",
                 "/krstock/order/v1/cancel",
             ]
+        finally:
+            await runtime.close()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("cancel_quantity", "expected_remaining", "expected_status"),
+    (
+        ("2", Decimal("5"), OrderStatus.PARTIALLY_FILLED),
+        ("7", Decimal("0"), OrderStatus.CANCELLED),
+    ),
+)
+def test_namuh_cancel_child_folds_into_original_order(
+    cancel_quantity: str,
+    expected_remaining: Decimal,
+    expected_status: OrderStatus,
+) -> None:
+    day = datetime(2026, 10, 27).date()
+    rows = [
+        {
+            "itg_orr_no": "0000000030",
+            "orr_dt": "20261027",
+            "orr_tm": "101500",
+            "iem_cd": "005930",
+            "sby_dit_cd_nm": "매수",
+            "nmn_pr_tp_cd_nm": "보통가",
+            "orr_qty": "10",
+            "orr_pr": "73000",
+            "tot_cns_qty": "3",
+            "cns_avg_uit_pr": "72900",
+            "ny_cns_qty": "7",
+            "can_qty": "0",
+            "orr_rjt_rsn_cd_nm": "",
+            "rmt_mkt_cd": "KRX",
+        },
+        {
+            "itg_orr_no": "0000000031",
+            "org_mkt_orr_no": "0000000030",
+            "orr_dt": "20261027",
+            "orr_tm": "101600",
+            "iem_cd": "005930",
+            "sby_dit_cd_nm": "매수",
+            "nmn_pr_tp_cd_nm": "취소",
+            "orr_qty": cancel_quantity,
+            "orr_pr": "0",
+            "tot_cns_qty": "0",
+            "ny_cns_qty": "0",
+            "can_qty": cancel_quantity,
+            "orr_rjt_rsn_cd_nm": "",
+            "rmt_mkt_cd": "KRX",
+        },
+    ]
+
+    orders = _normalize_namuh_account_orders(rows, "nh-account", day)
+
+    assert [item.provider_order_id for item in orders] == ["30"]
+    assert orders[0].filled_quantity == 3
+    assert orders[0].remaining_quantity == expected_remaining
+    assert orders[0].status is expected_status
+    assert orders[0].ordered_at.strftime("%H%M%S") == "101500"
+
+
+def test_namuh_rejected_cancel_child_does_not_reduce_original_order() -> None:
+    day = datetime(2026, 10, 27).date()
+    rows = [
+        {
+            "itg_orr_no": "30",
+            "orr_dt": "20261027",
+            "orr_tm": "101500",
+            "iem_cd": "005930",
+            "sby_dit_cd_nm": "매수",
+            "nmn_pr_tp_cd_nm": "보통가",
+            "orr_qty": "10",
+            "orr_pr": "73000",
+            "tot_cns_qty": "3",
+            "cns_avg_uit_pr": "72900",
+            "ny_cns_qty": "7",
+            "can_qty": "0",
+            "orr_rjt_rsn_cd_nm": "",
+            "rmt_mkt_cd": "KRX",
+        },
+        {
+            "itg_orr_no": "31",
+            "org_mkt_orr_no": "30",
+            "orr_dt": "20261027",
+            "orr_tm": "101600",
+            "iem_cd": "005930",
+            "sby_dit_cd_nm": "매수",
+            "nmn_pr_tp_cd_nm": "취소",
+            "orr_qty": "7",
+            "orr_pr": "0",
+            "tot_cns_qty": "0",
+            "ny_cns_qty": "0",
+            "can_qty": "0",
+            "orr_rjt_rsn_cd_nm": "거절",
+            "rmt_mkt_cd": "KRX",
+        },
+    ]
+
+    orders = _normalize_namuh_account_orders(rows, "nh-account", day)
+    original = next(item for item in orders if item.provider_order_id == "30")
+    assert original.remaining_quantity == 7
+    assert original.status is OrderStatus.PARTIALLY_FILLED
+
+
+def test_namuh_order_http_server_error_is_unknown_not_rejected(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "namuh-http-unknown"))
+        connection = settings.add_connection(
+            provider="namuh",
+            target="PAPER",
+            label="nh-paper-source",
+            app_key="nh-paper-key",
+            app_secret="nh-paper-secret",
+        )
+        settings.add_account(
+            alias="nh-paper-account",
+            connection_id=connection["id"],
+            account_number="12345678901",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/oauth2/token":
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "nh-paper-token",
+                        "token_type": "Bearer",
+                        "expires_in": 86400,
+                    },
+                )
+            if request.url.path.endswith("/cashBuy"):
+                return httpx.Response(
+                    503,
+                    json={"rsp_cd": "SERVER", "rsp_msg": "PRIVATE_SERVER_BODY"},
+                )
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConnectionRuntime(settings, http_client=client)
+        try:
+            with pytest.raises(RouterError) as ambiguous:
+                await runtime.submit_order(
+                    "nh-paper-account",
+                    OrderRequest(
+                        instrument=InstrumentId("005930"),
+                        side=OrderSide.BUY,
+                        order_type=OrderType.MARKET,
+                        quantity=Decimal("1"),
+                        client_order_id="nh-http-unknown",
+                        route=OrderRoute.AUTO,
+                    ),
+                )
+            assert ambiguous.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+            assert ambiguous.value.details == {
+                "unknown_origin": "http_status_unknown",
+                "exception_type": "HTTPStatusError",
+                "http_status": 503,
+            }
+            assert "PRIVATE_SERVER_BODY" not in ambiguous.value.message
         finally:
             await runtime.close()
             await client.aclose()
@@ -1374,6 +1574,283 @@ def test_kis_account_orders_and_buying_power_are_normalized(tmp_path: Path) -> N
     asyncio.run(run())
 
 
+def test_kis_fresh_order_history_bypasses_existing_one_second_cache(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "fresh-order-history"))
+        connection = settings.add_connection(
+            provider="kis",
+            target="PAPER",
+            label="fresh-orders",
+            app_key="unit-app-key",
+            app_secret="unit-app-secret",
+        )
+        settings.add_account(
+            alias="paper-account",
+            connection_id=connection["id"],
+            account_number="12345678",
+            product_code="01",
+        )
+        order_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal order_calls
+            if request.url.path == "/oauth2/tokenP":
+                expiry = (datetime.now().astimezone() + timedelta(hours=24)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "fresh-token",
+                        "token_type": "Bearer",
+                        "access_token_token_expired": expiry,
+                    },
+                )
+            if request.url.path.endswith("/inquire-daily-ccld"):
+                order_calls += 1
+                output = []
+                if order_calls > 1:
+                    output = [
+                        {
+                            "odno": "fresh-order",
+                            "pdno": "005930",
+                            "sll_buy_dvsn_cd": "02",
+                            "ord_dvsn_name": "시장가",
+                            "ord_qty": "1",
+                            "tot_ccld_qty": "0",
+                            "rmn_qty": "1",
+                            "ord_dt": "20261015",
+                            "ord_tmd": "090001",
+                        }
+                    ]
+                return httpx.Response(
+                    200,
+                    headers={"tr_cont": ""},
+                    json={"rt_cd": "0", "output1": output},
+                )
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConnectionRuntime(settings, http_client=client)
+        try:
+            day = datetime(2026, 10, 15).date()
+            assert await runtime.account_orders(
+                "paper-account", state="all", business_date=day
+            ) == ()
+            fresh = await runtime.account_orders(
+                "paper-account", state="all", business_date=day, fresh=True
+            )
+            assert order_calls == 2
+            assert [item.provider_order_id for item in fresh] == ["fresh-order"]
+        finally:
+            await runtime.close()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provider", ("kis", "namuh"))
+def test_order_history_transport_error_retains_only_safe_root_cause(
+    tmp_path: Path, provider: str,
+) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / f"{provider}-history-timeout"))
+        connection = settings.add_connection(
+            provider=provider,
+            target="PAPER",
+            label=f"{provider}-history-timeout",
+            app_key="test-key",
+            app_secret="test-secret",
+        )
+        settings.add_account(
+            alias="history-account",
+            connection_id=connection["id"],
+            account_number=("12345678" if provider == "kis" else "12345678901"),
+            **({"product_code": "01"} if provider == "kis" else {}),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path in {"/oauth2/tokenP", "/oauth2/token"}:
+                if provider == "kis":
+                    return httpx.Response(
+                        200,
+                        json={
+                            "access_token": "mock-token",
+                            "token_type": "Bearer",
+                            "access_token_token_expired": (
+                                datetime.now().astimezone() + timedelta(hours=24)
+                            ).strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "mock-token",
+                        "token_type": "Bearer",
+                        "expires_in": 86400,
+                    },
+                )
+            if request.url.path.endswith(
+                ("/inquire-daily-ccld", "/dailyOrderExecution")
+            ):
+                raise httpx.ReadTimeout(
+                    "PRIVATE_TOKEN_SENTINEL C:\\Users\\PRIVATE_USER",
+                    request=request,
+                )
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runtime = ConnectionRuntime(settings, http_client=client)
+        try:
+            with pytest.raises(RouterError) as failure:
+                await runtime.account_orders(
+                    "history-account",
+                    state="all",
+                    business_date=datetime(2026, 10, 27).date(),
+                    fresh=True,
+                )
+            assert failure.value.code is RouterErrorCode.INVALID_REQUEST
+            assert failure.value.details == {
+                "unknown_origin": "transport_error",
+                "exception_type": "ReadTimeout",
+            }
+            assert "PRIVATE_TOKEN_SENTINEL" not in json.dumps(
+                failure.value.details
+            )
+            assert "PRIVATE_USER" not in failure.value.message
+        finally:
+            await runtime.close()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_kis_unknown_submission_errors_include_only_safe_classification(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        settings = SettingsStore(workspace(tmp_path / "unknown-order-details"))
+        connection = settings.add_connection(
+            provider="kis",
+            target="PAPER",
+            label="unknown-order-mock",
+            app_key="test-key",
+            app_secret="test-secret",
+        )
+        settings.add_account(
+            alias="unknown-order-account",
+            connection_id=connection["id"],
+            account_number="12345678",
+            product_code="01",
+        )
+        failure_mode = "missing-id"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal failure_mode
+            if request.url.path == "/oauth2/tokenP":
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "mock-token",
+                        "token_type": "Bearer",
+                        "access_token_token_expired": (
+                            datetime.now().astimezone() + timedelta(hours=24)
+                        ).strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                )
+            if request.url.path.endswith("/order-cash"):
+                if failure_mode == "transport":
+                    raise httpx.ReadTimeout(
+                        "contains-sensitive-request-data", request=request
+                    )
+                if failure_mode == "http-500":
+                    return httpx.Response(
+                        500,
+                        json={"rt_cd": "1", "msg1": "PRIVATE_SERVER_BODY"},
+                    )
+                return httpx.Response(
+                    200,
+                    headers={"x-correlation-id": "safe-correlation"},
+                    json={"rt_cd": "0", "msg1": "accepted", "output": {}},
+                )
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            runtime = ConnectionRuntime(settings, http_client=client)
+            request = OrderRequest(
+                instrument=InstrumentId("005930"),
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("1"),
+                client_order_id="unknown-details-1",
+                route=OrderRoute.AUTO,
+            )
+            try:
+                try:
+                    await runtime.submit_order("unknown-order-account", request)
+                except RouterError as exc:
+                    assert exc.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+                    assert exc.details["unknown_origin"] == "success_without_order_id"
+                    assert exc.details["exception_type"] == "MissingProviderOrderId"
+                else:
+                    raise AssertionError("missing provider order id was accepted")
+
+                failure_mode = "transport"
+                try:
+                    await runtime.submit_order(
+                        "unknown-order-account",
+                        OrderRequest(
+                            instrument=request.instrument,
+                            side=request.side,
+                            order_type=request.order_type,
+                            quantity=request.quantity,
+                            client_order_id="unknown-details-2",
+                            route=request.route,
+                        ),
+                    )
+                except RouterError as exc:
+                    assert exc.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+                    assert exc.details == {
+                        "unknown_origin": "transport_error",
+                        "exception_type": "ReadTimeout",
+                    }
+                    assert "sensitive" not in json.dumps(exc.details)
+                else:
+                    raise AssertionError("transport ambiguity was accepted")
+
+                failure_mode = "http-500"
+                try:
+                    await runtime.submit_order(
+                        "unknown-order-account",
+                        OrderRequest(
+                            instrument=request.instrument,
+                            side=request.side,
+                            order_type=request.order_type,
+                            quantity=request.quantity,
+                            client_order_id="unknown-details-3",
+                            route=request.route,
+                        ),
+                    )
+                except RouterError as exc:
+                    assert exc.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+                    assert exc.details == {
+                        "unknown_origin": "http_status_unknown",
+                        "exception_type": "HTTPStatusError",
+                        "http_status": 500,
+                    }
+                    assert "PRIVATE_SERVER_BODY" not in exc.message
+                else:
+                    raise AssertionError("HTTP 500 ambiguity was treated as rejection")
+            finally:
+                await runtime.close()
+
+    asyncio.run(run())
+
+
 def test_kis_manual_cancel_child_closes_the_original_order(tmp_path: Path) -> None:
     async def run() -> None:
         settings = SettingsStore(workspace(tmp_path / "workspace"))
@@ -1456,6 +1933,7 @@ def test_kis_manual_cancel_child_closes_the_original_order(tmp_path: Path) -> No
             assert all_orders[0].provider_order_id == "0018533300"
             assert all_orders[0].status is OrderStatus.CANCELLED
             assert all_orders[0].remaining_quantity == 0
+            assert all_orders[0].ordered_at.strftime("%H%M%S") == "143001"
 
             open_orders = await runtime.account_orders(
                 "live-account",
@@ -1468,6 +1946,86 @@ def test_kis_manual_cancel_child_closes_the_original_order(tmp_path: Path) -> No
             await client.aclose()
 
     asyncio.run(run())
+
+
+def test_kis_rejected_cancel_child_does_not_close_original_order() -> None:
+    day = datetime(2026, 10, 15).date()
+    rows = [
+        {
+            "odno": "0018533300",
+            "pdno": "032685",
+            "sll_buy_dvsn_cd": "02",
+            "ord_dvsn_name": "지정가",
+            "ord_qty": "6",
+            "tot_ccld_qty": "0",
+            "rmn_qty": "6",
+            "ord_unpr": "7160",
+            "ord_dt": "20261015",
+            "ord_tmd": "143001",
+        },
+        {
+            "odno": "0018534400",
+            "orgn_odno": "0018533300",
+            "pdno": "032685",
+            "sll_buy_dvsn_cd": "02",
+            "rvse_cncl_dvsn_cd": "02",
+            "cncl_yn": "Y",
+            "ord_dvsn_name": "취소",
+            "ord_qty": "6",
+            "rjct_qty": "6",
+            "tot_ccld_qty": "0",
+            "rmn_qty": "0",
+            "ord_dt": "20261015",
+            "ord_tmd": "144512",
+        },
+    ]
+
+    orders = _normalize_kis_account_orders(rows, "live-account", day)
+
+    original = next(
+        item for item in orders if item.provider_order_id == "0018533300"
+    )
+    assert original.status is OrderStatus.ACKNOWLEDGED
+    assert original.remaining_quantity == Decimal("6")
+
+
+def test_kis_partial_cancel_rejection_folds_only_confirmed_quantity() -> None:
+    day = datetime(2026, 10, 15).date()
+    rows = [
+        {
+            "odno": "original",
+            "pdno": "032685",
+            "sll_buy_dvsn_cd": "02",
+            "ord_dvsn_name": "지정가",
+            "ord_qty": "6",
+            "tot_ccld_qty": "0",
+            "rmn_qty": "6",
+            "ord_unpr": "7160",
+            "ord_dt": "20261015",
+            "ord_tmd": "143001",
+        },
+        {
+            "odno": "cancel-child",
+            "orgn_odno": "original",
+            "pdno": "032685",
+            "sll_buy_dvsn_cd": "02",
+            "rvse_cncl_dvsn_cd": "02",
+            "cncl_yn": "Y",
+            "ord_dvsn_name": "취소",
+            "ord_qty": "6",
+            "rjct_qty": "2",
+            "tot_ccld_qty": "0",
+            "rmn_qty": "0",
+            "ord_dt": "20261015",
+            "ord_tmd": "144512",
+        },
+    ]
+
+    orders = _normalize_kis_account_orders(rows, "live-account", day)
+
+    original = next(item for item in orders if item.provider_order_id == "original")
+    assert original.status is OrderStatus.ACKNOWLEDGED
+    assert original.remaining_quantity == Decimal("2")
 
 
 def test_kis_read_retries_a_transient_broker_rate_limit(tmp_path: Path) -> None:

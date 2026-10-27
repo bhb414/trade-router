@@ -11,7 +11,15 @@ import pytest
 
 from trade_router_studio.app import create_app
 from trade_router_studio.block_packages import DEFAULT_CONDITION_BOLLINGER_SETTINGS, compile_block_strategy
-from trade_router_studio.diagnostics import build_diagnostics, MAX_LOGS, SEOUL, _reason, _number, _cost_projection, _sell_settings
+from trade_router_studio.diagnostics import (
+    MAX_LOGS,
+    SEOUL,
+    _cost_projection,
+    _number,
+    _reason,
+    _sell_settings,
+    build_diagnostics,
+)
 from test_studio import workspace
 
 
@@ -86,6 +94,7 @@ def test_export_allowlist_excludes_all_raw_credentials_and_financial_values():
     content, filename = build_diagnostics(**arguments)
     data, text = unpack(content)
     assert filename == "trade-router-diagnostics-20261022-131000.zip"
+    assert data["schema_version"] == 2
     for secret in SECRETS:
         assert secret not in text
         assert json.dumps(secret, ensure_ascii=False)[1:-1] not in text
@@ -128,6 +137,215 @@ def test_history_is_bounded_and_unknown_text_never_passes_through():
     assert data["history"]["events"][0]["event"] == "UNKNOWN"
     assert data["history"]["events"][0]["reason"] == "UNCLASSIFIED"
     assert data["coverage"]["strategy_logs"]["strategy-1"]["older_entries_unavailable_or_omitted"] is True
+
+
+def test_critical_order_history_survives_busy_general_event_window():
+    arguments, _, _, _ = fixture_input()
+    critical = {
+        "source": SECRETS[5],
+        "occurred_at": (NOW - timedelta(hours=2)).isoformat(),
+        "event_type": "order.unknown",
+        "message": SECRETS[0],
+        "details": {
+            "order_id": SECRETS[7],
+            "error_code": "ORDER_STATUS_UNKNOWN",
+            "unknown_origin": "transport_error",
+            "failure_phase": "submit",
+            "provider_id_present": False,
+        },
+    }
+    busy = [{
+        "source": SECRETS[5],
+        "occurred_at": NOW.isoformat(),
+        "event_type": "service.market.quote.success",
+        "message": "ok",
+        "details": {},
+    } for _ in range(1000)]
+
+    def events(limit, event_types=None):
+        rows = [critical, *busy]
+        if event_types is not None:
+            rows = [row for row in rows if row["event_type"] in event_types]
+        return rows[-limit:]
+
+    arguments["store"].events = events
+    data, text = unpack(build_diagnostics(**arguments)[0])
+    assert all(row["event"] != "order.unknown" for row in data["history"]["events"])
+    incident = data["history"]["critical_order_events"][0]
+    assert incident["event"] == "order.unknown"
+    assert incident["reason"] == "ORDER_STATUS_UNKNOWN"
+    assert incident["unknown_origin"] == "transport_error"
+    assert incident["provider_id_present"] is False
+    assert SECRETS[0] not in text
+
+
+def test_unresolved_order_exports_only_allowlisted_unknown_metadata():
+    arguments, _, orders, _ = fixture_input()
+    order = orders[0]
+    order.update({
+        "provider_order_id": None,
+        "status": "UNKNOWN_RECONCILING",
+        "created_at": (NOW - timedelta(minutes=1)).isoformat(),
+        "provider_metadata": {
+            "unknown_origin": "unexpected_adapter_error",
+            "failure_phase": "submit",
+            "exception_type": "TimeoutError",
+            "winerror": 10060,
+            "http_status": 503,
+            "first_unknown_at": NOW.isoformat(),
+            "reconcile_attempt_count": 7,
+            "last_reconcile_at": NOW.isoformat(),
+            "candidate_count": 2,
+            "match_result": "ambiguous",
+            "resolution": "manual_linked",
+            "raw_exception": SECRETS[0],
+            "account": SECRETS[2],
+        },
+        "message": SECRETS[0],
+    })
+    arguments["store"].unresolved_orders = lambda: [order]
+    data, text = unpack(build_diagnostics(**arguments)[0])
+    projected = data["current_snapshot"]["unresolved_orders"][0]
+    assert projected["instrument"] == "instrument-1"
+    assert projected["created_at"] == order["created_at"]
+    assert projected["updated_at"] == order["updated_at"]
+    assert projected["side"] == "SELL"
+    assert projected["order_type"] == "MARKET"
+    assert projected["route"] == "KRX"
+    assert projected["provider_id_present"] is False
+    assert projected["unknown_origin"] == "unexpected_adapter_error"
+    assert projected["failure_phase"] == "submit"
+    assert projected["exception_type"] == "TimeoutError"
+    assert projected["winerror"] == 10060
+    assert projected["http_status"] == 503
+    assert projected["reconcile_attempt_count"] == 7
+    assert projected["candidate_count"] == 2
+    assert projected["match_result"] == "ambiguous"
+    assert projected["resolution"] == "manual_linked"
+    assert SECRETS[0] not in text
+    assert SECRETS[2] not in text
+
+
+def test_legacy_modified_unknown_and_resolution_events_are_preserved_safely():
+    arguments, _, orders, events = fixture_input()
+    order = orders[0]
+    order.update({
+        "status": "UNKNOWN_RECONCILING",
+        "provider_metadata": {
+            "unknown_origin": "legacy_unknown",
+            "failure_phase": "modify",
+            "match_result": "not_checked",
+        },
+    })
+    arguments["store"].unresolved_orders = lambda: [order]
+    events[:] = [{
+        "source": SECRETS[5],
+        "occurred_at": NOW.isoformat(),
+        "event_type": "order.manually_resolved",
+        "message": SECRETS[0],
+        "details": {
+            "order_id": SECRETS[7],
+            "resolution": "manual_not_accepted",
+            "secret": SECRETS[1],
+        },
+    }]
+    data, text = unpack(build_diagnostics(**arguments)[0])
+    unresolved = data["current_snapshot"]["unresolved_orders"][0]
+    assert unresolved["unknown_origin"] == "legacy_unknown"
+    assert unresolved["failure_phase"] == "modify"
+    critical = data["history"]["critical_order_events"][0]
+    assert critical["event"] == "order.manually_resolved"
+    assert critical["resolution"] == "manual_not_accepted"
+    assert SECRETS[0] not in text and SECRETS[1] not in text
+
+
+@pytest.mark.parametrize(
+    ("match_result", "resolution"),
+    [
+        ("ambiguous_modification", "auto_amendment_linked"),
+        ("modification_pending", "broker_terminal"),
+        ("linked_modification", "manual_modification_not_accepted"),
+        ("manual_required_no_order_time", "realtime_rejected"),
+        ("amendment_successor_missing", "broker_terminal"),
+        ("manual_required_missing_parent_relation", "manual_amendment_linked"),
+        ("manual_linked_modification", "auto_cancel_reconciled"),
+        ("broker_amendment_rejected", "broker_amendment_rejected"),
+        ("manual_required_legacy_modification", "broker_terminal"),
+        ("legacy_modification_pending", "manual_modification_not_accepted"),
+        ("amendment_rejected_parent_missing", "broker_amendment_rejected"),
+    ],
+)
+def test_uncertain_modification_outcomes_are_preserved_safely(
+    match_result, resolution,
+):
+    arguments, _, orders, _ = fixture_input()
+    order = orders[0]
+    order.update({
+        "status": "UNKNOWN_RECONCILING",
+        "provider_metadata": {
+            "unknown_origin": "amend_exception",
+            "failure_phase": "modify",
+            "match_result": match_result,
+            "modification_resolution": resolution,
+            "pending_modification": {"secret": SECRETS[0]},
+        },
+    })
+    arguments["store"].unresolved_orders = lambda: [order]
+
+    data, text = unpack(build_diagnostics(**arguments)[0])
+
+    projected = data["current_snapshot"]["unresolved_orders"][0]
+    assert projected["match_result"] == match_result
+    assert projected["resolution"] == resolution
+    assert SECRETS[0] not in text
+
+
+def test_account_reconcile_event_uses_account_alias_namespace():
+    arguments, _, _, events = fixture_input()
+    events[:] = [{
+        "source": SECRETS[4],
+        "occurred_at": NOW.isoformat(),
+        "event_type": "order.reconcile_error",
+        "message": SECRETS[0],
+        "details": {
+            "source_kind": "account",
+            "error_code": "ORDER_STATUS_UNKNOWN",
+            "failure_phase": "reconcile",
+            "exception_type": "RouterError",
+            "secret": SECRETS[1],
+        },
+    }]
+    data, text = unpack(build_diagnostics(**arguments)[0])
+    projected = data["history"]["events"][0]
+    assert projected["source_kind"] == "account"
+    assert projected["account"] == data["current_snapshot"]["accounts"][0]["account"]
+    assert projected["strategy"] is None
+    assert projected["reason"] == "ORDER_RECONCILE_ERROR"
+    assert projected["failure_phase"] == "reconcile"
+    assert projected["exception_type"] == "RouterError"
+    assert SECRETS[0] not in text and SECRETS[1] not in text
+
+
+def test_internal_unknown_resolution_event_does_not_create_strategy_alias():
+    arguments, _, _, events = fixture_input()
+    events[:] = [{
+        "source": "order-resolution",
+        "occurred_at": NOW.isoformat(),
+        "event_type": "order.unknown_resolution_error",
+        "message": SECRETS[0],
+        "details": {
+            "order_id": SECRETS[7],
+            "error_type": "TimeoutError",
+            "secret": SECRETS[1],
+        },
+    }]
+    data, text = unpack(build_diagnostics(**arguments)[0])
+    projected = data["history"]["events"][0]
+    assert projected["source_kind"] == "system"
+    assert projected["strategy"] is None
+    assert projected["account"] is None
+    assert projected["reason"] == "ORDER_RECONCILE_ERROR"
+    assert SECRETS[0] not in text and SECRETS[1] not in text
 
 
 def test_malformed_block_source_is_not_attached_or_executed():

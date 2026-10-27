@@ -1392,6 +1392,7 @@ def _account_order_from_payload(payload: dict[str, Any]) -> AccountOrder:
         route=OrderRoute(payload.get("route", "AUTO")),
         ordered_at=datetime.fromisoformat(payload["ordered_at"]),
         provider=payload["provider"],
+        original_provider_order_id=payload.get("original_provider_order_id"),
     )
 
 

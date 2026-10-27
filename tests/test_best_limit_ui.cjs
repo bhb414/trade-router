@@ -102,12 +102,16 @@ test("both order history presentations distinguish BEST_LIMIT from market and fi
   const { context } = harness();
   assert.equal(context.tradeHistoryTable([{ order_type: "BEST_LIMIT", quantity: 7 }]), "최유리지정가 7주");
   context.renderOrders([
-    { status: "ACKNOWLEDGED", request: { order_type: "BEST_LIMIT", route: "NXT", quantity: 7 } },
-    { status: "ACKNOWLEDGED", request: { order_type: "LIMIT", route: "NXT", price: 12300, quantity: 7 } },
-    { status: "ACKNOWLEDGED", request: { order_type: "MARKET", route: "KRX", quantity: 7 } },
+    { status: "ACKNOWLEDGED", account_alias: "계좌A", request: { order_type: "BEST_LIMIT", route: "NXT", quantity: 7 } },
+    { status: "ACKNOWLEDGED", account_alias: "계좌A", request: { order_type: "LIMIT", route: "NXT", price: 12300, quantity: 7 } },
+    { status: "ACKNOWLEDGED", account_alias: "계좌A", request: { order_type: "MARKET", route: "KRX", quantity: 7 } },
   ]);
   const labels = context.elements.orders.children.map(item => item.children[1].children[0].textContent);
-  assert.deepEqual(labels, ["최유리지정가 · NXT", "지정가 12300원 · NXT", "시장가 · KRX"]);
+  assert.deepEqual(labels, [
+    "최유리지정가 · NXT · 계좌 계좌A",
+    "지정가 12300원 · NXT · 계좌 계좌A",
+    "시장가 · KRX · 계좌 계좌A",
+  ]);
   assert.equal(context.orderTypeLabel("OTHER"), "OTHER");
   assert.equal(context.orderTypeLabel(null), "주문 방식 미확인");
 });
