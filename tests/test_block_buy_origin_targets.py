@@ -238,7 +238,11 @@ def test_confirmed_preflight_rejection_releases_only_its_own_sell_reservation(pa
     attempts = []
     async def rejected(**kwargs):
         attempts.append(kwargs)
-        raise RouterError(error_code, "test preflight failure")
+        raise RouterError(
+            error_code,
+            "test preflight failure",
+            details={"submission_started": False},
+        )
     harness.ctx.orders.market_sell = rejected
     async def exercise():
         await harness.prepare_live_position()
@@ -249,9 +253,8 @@ def test_confirmed_preflight_rejection_releases_only_its_own_sell_reservation(pa
                 await harness.strategy.on_bar(harness.ctx, SimpleNamespace(
                     schedule_id="test-sell", scheduled_at=harness.now, kind=ScheduleKind.INTERVAL))
     asyncio.run(exercise())
-    ambiguous = error_code is RouterErrorCode.ORDER_STATUS_UNKNOWN
-    assert ("005930" in harness.strategy._live_sell_pending) is ambiguous
-    assert len(attempts) == (1 if ambiguous else 2)
+    assert "005930" not in harness.strategy._live_sell_pending
+    assert len(attempts) == 2
 
 
 @pytest.mark.parametrize("path", ["quote", "bar"])

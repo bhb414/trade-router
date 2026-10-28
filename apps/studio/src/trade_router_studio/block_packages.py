@@ -2238,6 +2238,17 @@ class ManagedBlockStrategy(Strategy):
         if not hasattr(self, "_buy_submit_pending"):
             self._buy_submit_pending = set()
 
+    @staticmethod
+    def _order_error_releases_local_pending(exc):
+        """True only when retry safety is established without broker guessing."""
+        details = dict(getattr(exc, "details", {}) or {})
+        if details.get("submission_started") is False:
+            return True
+        return exc.code.value in {
+            "ORDER_REJECTED", "ORDER_PERMISSION_REQUIRED", "RISK_LIMIT_EXCEEDED",
+            "UNSUPPORTED_CAPABILITY", "IDEMPOTENCY_CONFLICT",
+        }
+
     def _load_buy_submit_pending(self, ctx):
         """Load restart-safe buy reservations and refresh the in-memory index."""
         self._ensure_live_state()
@@ -2308,7 +2319,7 @@ class ManagedBlockStrategy(Strategy):
         self._save_buy_submit_pending(ctx, records)
         return True
 
-    def _reconcile_buy_submit_pending(self, ctx, open_orders, positions):
+    async def _reconcile_buy_submit_pending(self, ctx, open_orders, positions):
         """Reconcile restart-safe buy reservations with fresh broker snapshots."""
         records = self._load_buy_submit_pending(ctx)
         held_codes = {
@@ -2335,6 +2346,42 @@ class ManagedBlockStrategy(Strategy):
                     or ""
                 ),
             }
+        # Older runtimes could reserve locally even when the central order API
+        # rejected the request before creating a ledger row.  Compare the exact
+        # client id, not merely account snapshots: no central row is definitive
+        # evidence that this local-only reservation can be removed.  Lookup
+        # failures and real UNKNOWN/open rows remain fail-closed.  FILLED also
+        # remains reserved until the position snapshot catches up.
+        exact_lookup = getattr(ctx.orders, "order_by_client_id", None)
+        if callable(exact_lookup):
+            for code, current in tuple(records.items()):
+                if code in held_codes or code in broker_orders:
+                    continue
+                client_order_id = str(current.get("client_order_id") or "")
+                if not client_order_id:
+                    continue
+                try:
+                    central_order = await exact_lookup(client_order_id)
+                except RouterError as exc:
+                    ctx.log.warning(
+                        f"{self._instrument_label(ctx, code)} 매수 대기 중앙 원장 확인 보류 "
+                        f"[{exc.code.value}]: {exc.message}"
+                    )
+                    continue
+                except Exception as exc:
+                    # A malformed response or an SDK regression must never
+                    # drop a potentially real order reservation or terminate
+                    # the managed strategy process.
+                    ctx.log.warning(
+                        f"{self._instrument_label(ctx, code)} 매수 대기 중앙 원장 확인 보류 "
+                        f"[{type(exc).__name__}]"
+                    )
+                    continue
+                if central_order is None:
+                    records.pop(code, None)
+                    continue
+                if central_order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED}:
+                    records.pop(code, None)
         # Absence from an open-order snapshot is not terminal evidence. Broker
         # snapshots can lag both acknowledgement and balance updates, so keep
         # the reservation until a held position or matching terminal event is
@@ -2555,7 +2602,7 @@ class ManagedBlockStrategy(Strategy):
         })
         ctx.state.set("instrument_names", names)
         tracked = self._sync_tracked_positions(ctx, balance)
-        self._reconcile_buy_submit_pending(ctx, open_orders, positions)
+        await self._reconcile_buy_submit_pending(ctx, open_orders, positions)
         sell_targets = self._sell_target_quantities(balance, tracked)
         desired = {
             code
@@ -3075,10 +3122,10 @@ class ManagedBlockStrategy(Strategy):
                         **self._buy_origin_options(flow, matched_conditions, action),
                     )
             except RouterError as exc:
-                if exc.code.value == "ORDER_REJECTED":
-                    # An explicit broker rejection is terminal. Other errors
-                    # can be ambiguous transport failures and must remain
-                    # reserved until broker reconciliation proves otherwise.
+                if self._order_error_releases_local_pending(exc):
+                    # Explicit pre-submit failures and broker rejections are
+                    # terminal. Transport failures remain ambiguous until the
+                    # central ledger or broker reconciliation proves otherwise.
                     self._clear_buy_submit_pending(
                         ctx, code, client_order_id=order_id,
                     )
@@ -3270,10 +3317,7 @@ class ManagedBlockStrategy(Strategy):
                         **self._sell_scope_options(flow),
                     )
             except RouterError as exc:
-                if reserved and exc.code.value in {
-                    "ORDER_REJECTED", "ORDER_PERMISSION_REQUIRED", "RISK_LIMIT_EXCEEDED",
-                    "INVALID_REQUEST", "UNSUPPORTED_CAPABILITY", "IDEMPOTENCY_CONFLICT",
-                }:
+                if reserved and self._order_error_releases_local_pending(exc):
                     self._clear_live_sell_pending(code)
                 failure_at = datetime.now(SEOUL)
                 if self._is_non_retryable_sell_rejection(exc.message):
@@ -3585,10 +3629,7 @@ class ManagedBlockStrategy(Strategy):
                     **self._sell_scope_options(matched_flow),
                 )
         except RouterError as exc:
-            if reserved and exc.code.value in {
-                "ORDER_REJECTED", "ORDER_PERMISSION_REQUIRED", "RISK_LIMIT_EXCEEDED",
-                "INVALID_REQUEST", "UNSUPPORTED_CAPABILITY", "IDEMPOTENCY_CONFLICT",
-            }:
+            if reserved and self._order_error_releases_local_pending(exc):
                 self._clear_live_sell_pending(code)
             failure_at = datetime.now(SEOUL)
             if self._is_non_retryable_sell_rejection(exc.message):

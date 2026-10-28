@@ -1804,6 +1804,106 @@ def test_open_orders_api_reconciles_and_only_exposes_owned_actionable_orders(tmp
         assert cancel["status"] == "CANCEL_PENDING"
 
 
+def test_submit_api_marks_pre_submit_rejections_without_masking_broker_boundary(
+    tmp_path: Path,
+) -> None:
+    app = create_app(workspace(tmp_path / "submit-phase-api"))
+    with TestClient(app) as client:
+        token = app.state.sessions.issue("owned.py")
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "code": "005930",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "quantity": "1",
+            "client_order_id": "phase-test",
+            "route": "KRX",
+        }
+
+        no_manifest = client.post("/api/v1/orders", headers=headers, json=payload)
+        assert no_manifest.status_code == 409
+        assert no_manifest.json()["detail"]["details"]["submission_started"] is False
+
+        app.state.sessions.register_manifest("owned.py", manifest())
+        invalid = client.post(
+            "/api/v1/orders",
+            headers=headers,
+            json={**payload, "quantity": "0"},
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["detail"]["details"]["submission_started"] is False
+
+        async def blocked_before_submit(**_kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_STATUS_UNKNOWN,
+                "older unresolved order",
+                details={"order_ids": ["older"]},
+            )
+
+        app.state.order_service.submit = blocked_before_submit
+        blocked = client.post("/api/v1/orders", headers=headers, json=payload)
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["details"] == {
+            "order_ids": ["older"],
+            "submission_started": False,
+        }
+
+        async def rejected_by_broker(**_kwargs):
+            raise RouterError(
+                RouterErrorCode.ORDER_REJECTED,
+                "broker rejected",
+                details={"submission_started": True},
+            )
+
+        app.state.order_service.submit = rejected_by_broker
+        rejected = client.post("/api/v1/orders", headers=headers, json=payload)
+        assert rejected.status_code == 422
+        assert rejected.json()["detail"]["details"]["submission_started"] is True
+
+
+def test_exact_client_order_lookup_includes_unknown_and_terminal_rows(tmp_path: Path) -> None:
+    app = create_app(workspace(tmp_path / "exact-order-api"))
+    with TestClient(app) as client:
+        owner = manifest()
+        token = app.state.sessions.issue("owned.py")
+        app.state.sessions.register_manifest("owned.py", owner)
+        headers = {"Authorization": f"Bearer {token}"}
+        row, _ = app.state.runtime_store.reserve_order(
+            strategy_id=owner.strategy_id,
+            account_alias=owner.trading_account,
+            client_order_id="legacy-local-pending",
+            request={
+                "code": "005930",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "quantity": "1",
+                "price": None,
+                "route": "KRX",
+                "reserved_amount": "100000",
+            },
+        )
+        app.state.runtime_store.update_order(
+            row["id"],
+            status=OrderStatus.UNKNOWN_RECONCILING,
+        )
+
+        found = client.get(
+            "/api/v1/orders/by-client-id",
+            headers=headers,
+            params={"client_order_id": "legacy-local-pending"},
+        )
+        assert found.status_code == 200
+        assert found.json()["order"]["status"] == "UNKNOWN_RECONCILING"
+
+        missing = client.get(
+            "/api/v1/orders/by-client-id",
+            headers=headers,
+            params={"client_order_id": "not-in-ledger"},
+        )
+        assert missing.status_code == 200
+        assert missing.json() == {"order": None}
+
+
 @pytest.mark.parametrize("synchronous", (False, True))
 def test_open_orders_sdk_returns_router_orders(synchronous: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:

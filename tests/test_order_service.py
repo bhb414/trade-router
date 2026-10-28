@@ -113,6 +113,7 @@ class SimulationGateway:
         self.changes: list[tuple[str, str, Decimal | None]] = []
         self.cost_rates: dict[str, str | None] = {}
         self.buying_power_routes: list[OrderRoute] = []
+        self.balance_fresh_queries: list[bool] = []
 
     def capabilities(self, _: str) -> BrokerCapabilities:
         return BrokerCapabilities(
@@ -131,7 +132,8 @@ class SimulationGateway:
     def account_cost_rates(self, _: str) -> dict[str, str | None]:
         return dict(self.cost_rates)
 
-    async def balance(self, _: str) -> Balance:
+    async def balance(self, _: str, *, fresh: bool = False) -> Balance:
+        self.balance_fresh_queries.append(fresh)
         return Balance(
             cash=Decimal("1000000"),
             withdrawable_cash=Decimal("1000000"),
@@ -252,6 +254,17 @@ def market_buy(client_order_id: str = "005930-buy-1") -> OrderRequest:
     )
 
 
+def market_sell(client_order_id: str = "005930-sell-1") -> OrderRequest:
+    return OrderRequest(
+        instrument=InstrumentId("005930"),
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("1"),
+        client_order_id=client_order_id,
+        route=OrderRoute.AUTO,
+    )
+
+
 def _unknown_request_payload(code: str = "005930") -> dict[str, object]:
     return {
         "code": code,
@@ -264,6 +277,27 @@ def _unknown_request_payload(code: str = "005930") -> dict[str, object]:
         "route": "AUTO",
         "provider_options": {},
     }
+
+
+def _seed_unknown_order(
+    store: RuntimeStore,
+    *,
+    client_order_id: str,
+    code: str,
+    side: OrderSide = OrderSide.BUY,
+) -> dict[str, object]:
+    payload = {**_unknown_request_payload(code), "side": side.value}
+    row, _ = store.reserve_order(
+        strategy_id="neutral-strategy",
+        account_alias="broker-account",
+        client_order_id=client_order_id,
+        request=payload,
+    )
+    return store.update_order(
+        str(row["id"]),
+        status=OrderStatus.UNKNOWN_RECONCILING,
+        provider_metadata={"first_unknown_at": datetime.now(SEOUL).isoformat()},
+    )
 
 
 def _unknown_candidate(
@@ -305,10 +339,202 @@ class HistoricalOrderGateway(SimulationGateway):
         self.order_queries.append((state, business_date))
         self.fresh_queries.append(bool(kwargs.get("fresh")))
         if state == "open":
-            return ()
+            return self.open_orders or ()
         return self.history.get(
             business_date or datetime.now(SEOUL).date(), ()
         )
+
+
+def test_unrelated_unknown_buy_does_not_block_fresh_protective_sell(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "protective-sell.sqlite3")
+        gateway = HistoricalOrderGateway()
+        gateway.account_limits["max_open_orders"] = 1
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            _seed_unknown_order(
+                store,
+                client_order_id="unknown-other-buy",
+                code="000660",
+            )
+            service._reconciled_accounts.discard("broker-account")
+
+            submitted = await service.submit(
+                strategy_name="strategy.py",
+                manifest=manifest(max_open_orders=1),
+                request=market_sell("protective-sell"),
+            )
+
+            assert submitted.status is OrderStatus.ACKNOWLEDGED
+            assert gateway.submissions == 1
+            assert gateway.fresh_queries[-1] is True
+            assert gateway.balance_fresh_queries[-1] is True
+            event = store.events(
+                event_types=("order.protective_sell_allowed",), limit=1
+            )[0]
+            assert event["details"]["code"] == "005930"
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("unknown_side", "unknown_code", "request_side"),
+    (
+        (OrderSide.BUY, "005930", OrderSide.SELL),
+        (OrderSide.BUY, "", OrderSide.SELL),
+        (OrderSide.SELL, "000660", OrderSide.SELL),
+        (OrderSide.BUY, "000660", OrderSide.BUY),
+    ),
+)
+def test_protective_sell_bypass_keeps_unsafe_unknown_combinations_blocked(
+    tmp_path: Path,
+    unknown_side: OrderSide,
+    unknown_code: str,
+    request_side: OrderSide,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(
+            tmp_path
+            / f"blocked-{unknown_side.value}-{unknown_code}-{request_side.value}.sqlite3"
+        )
+        gateway = HistoricalOrderGateway()
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            _seed_unknown_order(
+                store,
+                client_order_id="blocking-unknown",
+                code=unknown_code,
+                side=unknown_side,
+            )
+            service._reconciled_accounts.discard("broker-account")
+            request = (
+                market_sell("blocked-sell")
+                if request_side is OrderSide.SELL
+                else market_buy("blocked-buy")
+            )
+
+            with pytest.raises(RouterError) as caught:
+                await service.submit(
+                    strategy_name="strategy.py",
+                    manifest=manifest(),
+                    request=request,
+                )
+
+            assert caught.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+            assert gateway.submissions == 0
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_fresh_same_symbol_broker_order_blocks_protective_sell(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "protective-sell-open-conflict.sqlite3")
+        gateway = HistoricalOrderGateway()
+        gateway.open_orders = (
+            _unknown_candidate(
+                "external-same-symbol",
+                datetime.now(SEOUL),
+                code="005930",
+            ),
+        )
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            _seed_unknown_order(
+                store,
+                client_order_id="unknown-other-buy",
+                code="000660",
+            )
+            service._reconciled_accounts.discard("broker-account")
+
+            with pytest.raises(RouterError) as caught:
+                await service.submit(
+                    strategy_name="strategy.py",
+                    manifest=manifest(),
+                    request=market_sell("blocked-by-broker-open"),
+                )
+
+            assert caught.value.code is RouterErrorCode.ORDER_STATUS_UNKNOWN
+            assert caught.value.details["provider_order_ids"] == [
+                "external-same-symbol"
+            ]
+            assert gateway.fresh_queries[-1] is True
+            assert gateway.submissions == 0
+        finally:
+            store.close()
+
+    asyncio.run(run())
+
+
+def test_protective_sell_bypass_still_enforces_fresh_sellable_quantity(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = RuntimeStore(tmp_path / "protective-sell-no-quantity.sqlite3")
+        gateway = HistoricalOrderGateway()
+
+        async def no_sellable_balance(
+            _account_reference: str,
+            *,
+            fresh: bool = False,
+        ) -> Balance:
+            gateway.balance_fresh_queries.append(fresh)
+            return Balance(
+                cash=Decimal("1000000"),
+                withdrawable_cash=Decimal("1000000"),
+                total_value=Decimal("1100000"),
+                positions=(
+                    Position(
+                        instrument=InstrumentId("005930"),
+                        quantity=Decimal("2"),
+                        available_quantity=Decimal("0"),
+                        average_price=Decimal("70000"),
+                        market_price=Decimal("75000"),
+                    ),
+                ),
+                as_of=datetime.now(SEOUL),
+            )
+
+        gateway.balance = no_sellable_balance  # type: ignore[method-assign]
+        service = OrderService(store, gateway)
+        try:
+            await service.arm_account("broker-account")
+            service.arm_strategy("neutral-strategy")
+            _seed_unknown_order(
+                store,
+                client_order_id="unknown-other-buy",
+                code="000660",
+            )
+            service._reconciled_accounts.discard("broker-account")
+
+            with pytest.raises(RouterError) as caught:
+                await service.submit(
+                    strategy_name="strategy.py",
+                    manifest=manifest(),
+                    request=market_sell("quantity-must-still-be-checked"),
+                )
+
+            assert caught.value.code is RouterErrorCode.RISK_LIMIT_EXCEEDED
+            assert "매도 가능한 보유 수량" in caught.value.message
+            assert gateway.balance_fresh_queries[-1] is True
+            assert gateway.submissions == 0
+        finally:
+            store.close()
+
+    asyncio.run(run())
 
 
 def test_unknown_match_allows_sor_execution_venue_but_keeps_explicit_routes_exact() -> None:

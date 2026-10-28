@@ -26,6 +26,8 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
@@ -975,6 +977,20 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         if callable(control):
             asyncio.get_running_loop().call_later(0.25, control, "restart")
         return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @app.exception_handler(RequestValidationError)
+    async def structured_order_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> Response:
+        if request.method == "POST" and request.url.path == "/api/v1/orders":
+            error = RouterError(
+                RouterErrorCode.INVALID_REQUEST,
+                "주문 요청 형식이 올바르지 않습니다.",
+                details={"submission_started": False},
+            )
+            return JSONResponse(status_code=422, content={"detail": error.as_dict()})
+        return await request_validation_exception_handler(request, exc)
 
     def journal() -> RuntimeStore:
         if runtime_store is None:
@@ -2673,7 +2689,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
             )
             raise HTTPException(
                 status_code=409,
-                detail="전략 실행 설정을 먼저 등록하세요.",
+                detail=RouterError(
+                    RouterErrorCode.INVALID_REQUEST,
+                    "전략 실행 설정을 먼저 등록하세요.",
+                    details={"submission_started": False},
+                ).as_dict(),
             )
         try:
             request = OrderRequest(
@@ -2706,7 +2726,14 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 started_at=started_at,
                 details={"code": body.code, "side": body.side.value},
             )
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=RouterError(
+                    RouterErrorCode.INVALID_REQUEST,
+                    str(exc),
+                    details={"submission_started": False},
+                ).as_dict(),
+            ) from exc
         except RouterError as exc:
             record_service_result(
                 session,
@@ -2729,7 +2756,11 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
                 RouterErrorCode.UNSUPPORTED_CAPABILITY: 422,
                 RouterErrorCode.ORDER_REJECTED: 422,
             }.get(exc.code, 502)
-            raise HTTPException(status_code=status_code, detail=exc.as_dict()) from exc
+            detail = exc.as_dict()
+            error_details = dict(detail.get("details") or {})
+            error_details.setdefault("submission_started", False)
+            detail["details"] = error_details
+            raise HTTPException(status_code=status_code, detail=detail) from exc
         record_service_result(
             session,
             service="order",
@@ -2758,6 +2789,20 @@ def create_app(paths: WorkspacePaths | None = None) -> FastAPI:
         except RouterError as exc:
             raise HTTPException(status_code=502, detail=exc.as_dict()) from exc
         return {"orders": [_order_payload(order) for order in orders]}
+
+    @app.get("/api/v1/orders/by-client-id")
+    async def strategy_order_by_client_id(
+        client_order_id: str = Query(min_length=1, max_length=128),
+        session: StrategySession = Depends(require_strategy_session),
+    ) -> dict[str, object | None]:
+        manifest = sessions.manifest(session.strategy_name)
+        if manifest is None:
+            raise HTTPException(status_code=409, detail="전략 실행 설정을 먼저 등록하세요.")
+        order = order_engine().order_by_client_id(
+            manifest=manifest,
+            client_order_id=client_order_id,
+        )
+        return {"order": _order_payload(order) if order is not None else None}
 
     @app.post("/api/v1/orders/{order_id}/amend")
     async def amend_strategy_order(

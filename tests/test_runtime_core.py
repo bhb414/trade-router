@@ -343,6 +343,67 @@ def test_async_order_sdk_uses_common_order_endpoint() -> None:
     asyncio.run(run())
 
 
+def test_async_order_post_transport_failure_marks_delivery_unknown() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("response lost", request=request)
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://router.test",
+        )
+        router = AsyncTradeRouter(
+            strategy=StrategyConfig(
+                id="sdk-order-transport",
+                trading_account="broker-account",
+            ),
+            http_client=http,
+        )
+        try:
+            try:
+                await router.orders.market_buy(
+                    "005930",
+                    Decimal("1"),
+                    client_order_id="005930-response-lost",
+                )
+            except RouterError as exc:
+                assert exc.code is RouterErrorCode.INVALID_REQUEST
+                assert exc.details == {"request_delivery_unknown": True}
+            else:  # pragma: no cover - contract guard
+                raise AssertionError("transport failure must raise RouterError")
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+
+
+def test_async_order_sdk_reads_exact_central_ledger_row() -> None:
+    async def run() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "GET"
+            assert request.url.path == "/api/v1/orders/by-client-id"
+            assert request.url.params["client_order_id"] == "legacy/buy"
+            return httpx.Response(200, json={"order": None})
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://router.test",
+        )
+        router = AsyncTradeRouter(
+            strategy=StrategyConfig(
+                id="sdk-order-lookup",
+                trading_account="broker-account",
+            ),
+            http_client=http,
+        )
+        try:
+            assert await router.orders.order_by_client_id("legacy/buy") is None
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+
+
 def test_async_discovery_sdk_normalizes_ranking_entries() -> None:
     async def run() -> None:
         def handler(request: httpx.Request) -> httpx.Response:

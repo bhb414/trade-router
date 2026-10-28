@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from trade_router import OrderStatus, ScheduleKind
+from trade_router import OrderStatus, RouterError, RouterErrorCode, ScheduleKind
 from trade_router_studio.block_packages import (
     DEFAULT_CONDITION_BOLLINGER_SETTINGS,
     BlockTradeCondition,
@@ -374,6 +374,37 @@ def test_active_overlapping_sell_flows_are_or_but_submit_only_one_order() -> Non
     asyncio.run(exercise())
     assert len(harness.orders) == 1
     assert any("second 매도" in message for message in harness.logs)
+
+
+@pytest.mark.parametrize(
+    ("details", "expected_pending"),
+    [
+        ({"submission_started": False}, False),
+        ({"request_delivery_unknown": True}, True),
+    ],
+)
+def test_realtime_sell_pending_distinguishes_pre_submit_from_lost_response(
+    details: dict[str, bool],
+    expected_pending: bool,
+) -> None:
+    harness = SellHarness(settings_for([sell_flow()]), now="09:30:00")
+
+    async def failed_sell(**kwargs):
+        harness.orders.append(kwargs)
+        raise RouterError(
+            RouterErrorCode.INVALID_REQUEST,
+            "controlled order failure",
+            details=details,
+        )
+
+    harness.ctx.orders.market_sell = failed_sell
+
+    async def exercise() -> None:
+        await harness.prepare_live_position()
+        await harness.strategy.on_quote(harness.ctx, harness.quote())
+
+    asyncio.run(exercise())
+    assert ("005930" in harness.strategy._live_sell_pending) is expected_pending
 
 
 def test_each_sell_flow_keeps_or_rows_and_and_groups() -> None:

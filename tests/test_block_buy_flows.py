@@ -730,6 +730,133 @@ def test_rejected_submission_is_not_retried_by_an_overlapping_flow_in_same_tick(
     assert len(attempts) == 2
 
 
+def test_pre_submit_unknown_error_releases_local_buy_reservation():
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+    # Reproduce the production failure shape: one account-wide gate rejects
+    # every candidate in a scan. None of those pre-submit attempts may remain
+    # as a local-only "broker reflection pending" reservation.
+    harness.matches_by_id["1"] = ["005930", "000660"]
+
+    async def blocked_before_submission(**kwargs):
+        harness.order_calls.append(kwargs)
+        raise RouterError(
+            RouterErrorCode.ORDER_STATUS_UNKNOWN,
+            "A previous unresolved order blocks this request.",
+            details={"submission_started": False, "order_ids": ["older-order"]},
+        )
+
+    harness.ctx.orders.market_buy = blocked_before_submission
+    asyncio.run(harness.tick(scheduled_at=at("09:30:00")))
+
+    assert [call["code"] for call in harness.order_calls] == ["005930", "000660"]
+    assert harness.ctx.state.get("pending_buy_submissions") == {}
+
+
+def test_post_transport_failure_keeps_local_buy_reservation_fail_closed():
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+
+    async def response_lost(**kwargs):
+        harness.order_calls.append(kwargs)
+        raise RouterError(
+            RouterErrorCode.INVALID_REQUEST,
+            "Local Trade Router connection was lost.",
+            details={"request_delivery_unknown": True},
+        )
+
+    harness.ctx.orders.market_buy = response_lost
+    asyncio.run(harness.tick(scheduled_at=at("09:30:00")))
+
+    reservation = harness.ctx.state.get("pending_buy_submissions")["005930"]
+    assert reservation["status"] == OrderStatus.UNKNOWN_RECONCILING.value
+
+
+@pytest.mark.parametrize(
+    ("central_status", "expected_reserved"),
+    [
+        (None, False),
+        (OrderStatus.REJECTED, False),
+        (OrderStatus.CANCELLED, False),
+        (OrderStatus.UNKNOWN_RECONCILING, True),
+        (OrderStatus.ACKNOWLEDGED, True),
+        (OrderStatus.FILLED, True),
+    ],
+)
+def test_legacy_buy_reservation_uses_exact_central_ledger_lookup(
+    central_status: OrderStatus | None,
+    expected_reserved: bool,
+):
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+    client_order_id = "legacy-local-only-buy"
+    harness.ctx.state.set("pending_buy_submissions", {
+        "005930": {
+            "client_order_id": client_order_id,
+            "status": OrderStatus.UNKNOWN_RECONCILING.value,
+            "submitted_at": at("09:00:00").isoformat(),
+        },
+    })
+
+    async def exact_lookup(value):
+        assert value == client_order_id
+        return (
+            None
+            if central_status is None
+            else SimpleNamespace(status=central_status)
+        )
+
+    harness.ctx.orders.order_by_client_id = exact_lookup
+
+    async def exercise():
+        await harness.strategy._refresh_live_positions(
+            harness.ctx,
+            await harness.balance(),
+            await harness.open_orders(),
+        )
+
+    asyncio.run(exercise())
+    records = harness.ctx.state.get("pending_buy_submissions")
+    assert ("005930" in records) is expected_reserved
+
+
+@pytest.mark.parametrize(
+    "lookup_error",
+    [
+        RouterError(RouterErrorCode.INVALID_REQUEST, "lookup unavailable"),
+        ValueError("malformed lookup response"),
+    ],
+)
+def test_legacy_buy_reservation_lookup_error_is_fail_closed(lookup_error):
+    harness = Harness(settings_for([
+        flow(buy_start_time="09:00", buy_end_time="15:00"),
+    ]))
+    harness.ctx.state.set("pending_buy_submissions", {
+        "005930": {
+            "client_order_id": "legacy-lookup-error",
+            "status": OrderStatus.UNKNOWN_RECONCILING.value,
+        },
+    })
+
+    async def unavailable(_client_order_id):
+        raise lookup_error
+
+    harness.ctx.orders.order_by_client_id = unavailable
+
+    async def exercise():
+        await harness.strategy._refresh_live_positions(
+            harness.ctx,
+            await harness.balance(),
+            await harness.open_orders(),
+        )
+
+    asyncio.run(exercise())
+    assert "005930" in harness.ctx.state.get("pending_buy_submissions")
+
+
 def test_aftermarket_market_buy_is_skipped_and_excluded_before_submission():
     harness = Harness(
         settings_for(
@@ -778,7 +905,7 @@ def test_buy_flows_share_actual_central_exposure_reservations(tmp_path):
         def account_cost_rates(self, account):
             return {}
 
-        async def balance(self, account):
+        async def balance(self, account, **_kwargs):
             return Balance(cash=Decimal("1000000"), withdrawable_cash=Decimal("1000000"),
                            total_value=Decimal("1000000"), positions=(), as_of=harness.now)
 

@@ -49,7 +49,9 @@ class OrderGateway(Protocol):
         route: OrderRoute = OrderRoute.AUTO,
     ) -> BuyingPower: ...
 
-    async def balance(self, account_reference: str) -> Balance: ...
+    async def balance(
+        self, account_reference: str, *, fresh: bool = False
+    ) -> Balance: ...
 
     async def account_orders(
         self,
@@ -1317,14 +1319,14 @@ class OrderService:
                 RouterErrorCode.UNSUPPORTED_CAPABILITY,
                 "이 거래 계좌는 잔고와 주문 조정 기능을 지원하지 않습니다.",
             )
-        await self._gateway.balance(account_alias)
+        await self._gateway.balance(account_alias, fresh=True)
         # Scope in SQL instead of filtering the globally limited result.  A
         # busy installation can have more than 1,000 unresolved rows across
         # accounts; reconciliation for this account must not silently miss
         # its older orders.
         unresolved = self._store.unresolved_orders(account_alias=account_alias)
         snapshots, open_provider_ids = await self._broker_order_snapshots(
-            account_alias, unresolved, include_today=True
+            account_alias, unresolved, include_today=True, fresh=True
         )
         still_unknown: list[str] = []
         for row in unresolved:
@@ -1718,6 +1720,27 @@ class OrderService:
                 if order.request.quantity > order.filled_quantity
             ]
 
+    def order_by_client_id(
+        self,
+        *,
+        manifest: StrategyManifest,
+        client_order_id: str,
+    ) -> Order | None:
+        """Read one exact central-ledger row without broker reconciliation.
+
+        This intentionally includes terminal and ``UNKNOWN_RECONCILING`` rows.
+        Managed strategies use it only to distinguish a legacy local reservation
+        that never reached the central ledger from a real unresolved order.
+        """
+
+        row = self._store.order_by_client_id(
+            manifest.strategy_id,
+            str(client_order_id).strip(),
+        )
+        if row is None or row.get("account_alias") != manifest.trading_account:
+            return None
+        return _order_from_row(row)
+
     async def apply_realtime_notice(
         self, account_alias: str, notice: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -1991,8 +2014,33 @@ class OrderService:
             self._require_permissions(manifest)
             capabilities = self._gateway.capabilities(account_alias)
             _require_order_capability(capabilities, request.route)
+            protective_sell_ignored_order_ids: frozenset[str] = frozenset()
             if account_alias not in self._reconciled_accounts:
-                await self._reconcile_account(account_alias)
+                try:
+                    await self._reconcile_account(account_alias)
+                except RouterError as exc:
+                    if not self._can_bypass_unknown_gate_for_protective_sell(
+                        account_alias, request, exc
+                    ):
+                        raise
+                    protective_sell_ignored_order_ids = frozenset(
+                        str(order_id)
+                        for order_id in exc.details.get("order_ids") or ()
+                    )
+                    self._store.record(
+                        source=strategy_name,
+                        event_type="order.protective_sell_allowed",
+                        message=(
+                            "다른 종목의 미확정 매수가 있지만 보유 위험을 줄이는 "
+                            "매도를 계속합니다."
+                        ),
+                        details={
+                            "code": request.instrument.code,
+                            "blocking_order_ids": sorted(
+                                protective_sell_ignored_order_ids
+                            ),
+                        },
+                    )
 
             conflicts = [
                 row
@@ -2010,6 +2058,7 @@ class OrderService:
                 broker_open_orders = await self._gateway.account_orders(
                     account_alias,
                     state="open",
+                    fresh=bool(protective_sell_ignored_order_ids),
                 )
                 broker_conflicts = [
                     item
@@ -2028,7 +2077,13 @@ class OrderService:
                         },
                     )
 
-            reserved_amount = await self._preflight(manifest, request)
+            reserved_amount = await self._preflight(
+                manifest,
+                request,
+                protective_sell_ignored_order_ids=(
+                    protective_sell_ignored_order_ids
+                ),
+            )
             payload = _request_payload(request, reserved_amount=reserved_amount)
             try:
                 row, created = self._store.reserve_order(
@@ -2113,6 +2168,10 @@ class OrderService:
                 )
                 if status is OrderStatus.UNKNOWN_RECONCILING:
                     return _order_from_row(row)
+                # The adapter was called and returned a terminal error.  Keep
+                # that boundary explicit so API clients do not mistake a
+                # broker-side rejection for a local pre-submit validation.
+                exc.details.setdefault("submission_started", True)
                 raise
             except Exception as exc:
                 # The adapter crossed the submission boundary. Never retry an
@@ -2621,10 +2680,59 @@ class OrderService:
                 "전략의 주문 허용 상태를 먼저 켜세요.",
             )
 
+    def _can_bypass_unknown_gate_for_protective_sell(
+        self,
+        account_alias: str,
+        request: OrderRequest,
+        error: RouterError,
+    ) -> bool:
+        """Allow only an unrelated position-reducing sell past a strict gate.
+
+        The strict reconciliation error supplies the complete set of rows it
+        could not resolve while the account submission lock is held. A sell
+        may continue only when every such row is a BUY for another symbol.
+        Same-symbol uncertainty, any uncertain SELL, and every new BUY remain
+        blocked. The caller still performs a fresh broker open-order check and
+        a fresh sellable-balance check before submitting the order.
+        """
+
+        if (
+            request.side is not OrderSide.SELL
+            or error.code is not RouterErrorCode.ORDER_STATUS_UNKNOWN
+        ):
+            return False
+        blocking_order_ids = {
+            str(order_id).strip()
+            for order_id in error.details.get("order_ids", ())
+            if str(order_id).strip()
+        }
+        if not blocking_order_ids:
+            return False
+        rows_by_id = {
+            str(row["id"]): row
+            for row in self._store.unresolved_orders(account_alias=account_alias)
+        }
+        blocking_rows = [
+            rows_by_id[order_id]
+            for order_id in blocking_order_ids
+            if order_id in rows_by_id
+        ]
+        if len(blocking_rows) != len(blocking_order_ids):
+            return False
+        return all(
+            str(row["request"].get("side") or "") == OrderSide.BUY.value
+            and bool(str(row["request"].get("code") or "").strip())
+            and str(row["request"].get("code") or "").strip()
+            != request.instrument.code
+            for row in blocking_rows
+        )
+
     async def _preflight(
         self,
         manifest: StrategyManifest,
         request: OrderRequest,
+        *,
+        protective_sell_ignored_order_ids: frozenset[str] = frozenset(),
     ) -> Decimal:
         if request.quantity != request.quantity.to_integral_value():
             raise RouterError(
@@ -2636,17 +2744,27 @@ class OrderService:
             manifest.trading_account
         )
         max_open_orders = _optional_int(limits.get("max_open_orders"))
-        if max_open_orders is not None and len(
-            self._store.unresolved_orders(strategy_id=manifest.strategy_id)
-        ) >= max_open_orders:
+        strategy_open_count = sum(
+            1
+            for row in self._store.unresolved_orders(
+                strategy_id=manifest.strategy_id
+            )
+            if str(row["id"]) not in protective_sell_ignored_order_ids
+        )
+        if max_open_orders is not None and strategy_open_count >= max_open_orders:
             raise RouterError(
                 RouterErrorCode.RISK_LIMIT_EXCEEDED,
                 "전략의 최대 미체결 주문 수를 초과합니다.",
             )
         account_max_open = _optional_int(account_limits.get("max_open_orders"))
-        if account_max_open is not None and len(
-            self._store.unresolved_orders(account_alias=manifest.trading_account)
-        ) >= account_max_open:
+        account_open_count = sum(
+            1
+            for row in self._store.unresolved_orders(
+                account_alias=manifest.trading_account
+            )
+            if str(row["id"]) not in protective_sell_ignored_order_ids
+        )
+        if account_max_open is not None and account_open_count >= account_max_open:
             raise RouterError(
                 RouterErrorCode.RISK_LIMIT_EXCEEDED,
                 "계좌의 최대 미체결 주문 수를 초과합니다.",
@@ -2805,7 +2923,10 @@ class OrderService:
                         },
                     )
         else:
-            balance = await self._gateway.balance(account_alias)
+            balance = await self._gateway.balance(
+                account_alias,
+                fresh=bool(protective_sell_ignored_order_ids),
+            )
             position = next(
                 (
                     item

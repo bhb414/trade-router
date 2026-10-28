@@ -950,11 +950,13 @@ class ConnectionRuntime:
                 "KIS 순위 조회는 실전 API 연결에서만 사용할 수 있습니다.",
             )
 
-    async def balance(self, account_reference: str) -> Balance:
+    async def balance(
+        self, account_reference: str, *, fresh: bool = False
+    ) -> Balance:
         account = self._settings.get_account(account_reference)
         connection = self._settings.get_connection(account["connection_id"])
         if connection["provider"] == "namuh":
-            return await self._namuh_balance(account, connection)
+            return await self._namuh_balance(account, connection, fresh=fresh)
         if connection["provider"] != "kis":
             raise RouterError(
                 RouterErrorCode.UNSUPPORTED_CAPABILITY,
@@ -983,8 +985,13 @@ class ConnectionRuntime:
             operation="account.balance",
             priority=RequestPriority.ACCOUNT,
             group="account",
-            dedupe_key=f"{connection['id']}:balance:{account['id']}",
-            cache_ttl=1.0,
+            dedupe_key=(
+                f"{connection['id']}:balance:{account['id']}"
+                f":fresh:{uuid4().hex}"
+                if fresh
+                else f"{connection['id']}:balance:{account['id']}"
+            ),
+            cache_ttl=0 if fresh else 1.0,
         )
         position_rows = payload.get("output1")
         summary_rows = payload.get("output2")
@@ -2120,7 +2127,11 @@ class ConnectionRuntime:
         )
 
     async def _namuh_balance(
-        self, account: dict[str, Any], connection: dict[str, Any]
+        self,
+        account: dict[str, Any],
+        connection: dict[str, Any],
+        *,
+        fresh: bool = False,
     ) -> Balance:
         payload, _ = await self._namuh_post(
             connection,
@@ -2136,8 +2147,13 @@ class ConnectionRuntime:
             operation="account.balance",
             priority=RequestPriority.ACCOUNT,
             group="account",
-            dedupe_key=f"{connection['id']}:balance:{account['id']}",
-            cache_ttl=1.0,
+            dedupe_key=(
+                f"{connection['id']}:balance:{account['id']}"
+                f":fresh:{uuid4().hex}"
+                if fresh
+                else f"{connection['id']}:balance:{account['id']}"
+            ),
+            cache_ttl=0 if fresh else 1.0,
         )
         summary = payload.get("Output_0")
         rows = payload.get("Output_1")

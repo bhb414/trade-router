@@ -137,6 +137,7 @@ class AsyncTradeRouter:
             raise RouterError(
                 RouterErrorCode.INVALID_REQUEST,
                 "로컬 Trade Router에 연결하지 못했습니다.",
+                details={"request_delivery_unknown": True},
             ) from exc
         try:
             result = response.json()
@@ -491,6 +492,11 @@ class SyncOrderClient:
 
     def open_orders(self) -> list[Order]:
         return self._router._call(self._router._async.orders.open_orders())
+
+    def order_by_client_id(self, client_order_id: str) -> Order | None:
+        return self._router._call(
+            self._router._async.orders.order_by_client_id(client_order_id)
+        )
 
     def cancel(self, *args: object, **kwargs: object) -> Any:
         return self._router._call(self._router._async.orders.cancel(*args, **kwargs))
@@ -1024,6 +1030,21 @@ class OrderClient:
         """Reconcile and return actionable orders owned by this strategy/account."""
         payload = await self._router._get("/api/v1/orders/open", {})
         return [_order_from_payload(item) for item in payload.get("orders", [])]
+
+    async def order_by_client_id(self, client_order_id: str) -> Order | None:
+        """Return the exact central-ledger row, including terminal/unknown states."""
+        normalized = str(client_order_id).strip()
+        if not normalized:
+            raise RouterError(
+                RouterErrorCode.INVALID_REQUEST,
+                "client_order_id를 입력하세요.",
+            )
+        payload = await self._router._get(
+            "/api/v1/orders/by-client-id",
+            {"client_order_id": normalized},
+        )
+        order = payload.get("order")
+        return _order_from_payload(order) if isinstance(order, dict) else None
 
     async def market_buy(
         self,
